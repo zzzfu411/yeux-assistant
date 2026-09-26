@@ -1,0 +1,111 @@
+import { readFile, readdir, stat, writeFile, realpath } from 'node:fs/promises';
+import { join, relative, resolve, sep } from 'node:path';
+import { TextDecoder } from 'node:util';
+import { AppError, canonical, digest, id, event, notify } from './common.js';
+import type { Store, Tx, Row } from '../../storage/src/index.js';
+import { SourceMetadata, type Citation } from '../../contracts/src/index.js';
+
+export function chunks(content: string, size = 1800, overlap = 200) {
+  if(size<2 || overlap<0 || overlap>=size-1)throw new Error('Invalid chunk size/overlap');
+  const result: Array<{start:number;end:number;content:string}> = [];
+  const splitPair=(offset:number)=>offset>0 && offset<content.length && /[\uD800-\uDBFF]/.test(content[offset-1]!) && /[\uDC00-\uDFFF]/.test(content[offset]!);
+  for (let start=0;start<content.length;) {
+    let end=Math.min(content.length,start+size);if(splitPair(end))end--;
+    result.push({start,end,content:content.slice(start,end)});if(end===content.length)break;
+    let next=end-overlap;if(splitPair(next))next--;start=Math.max(start+1,next);
+  }
+  return result;
+}
+export function terms(query: string) {
+  const result: string[] = [];
+  for (const token of query.toLowerCase().match(/[a-z0-9_]{2,}|[\p{Script=Han}]+/gu) || []) {
+    if (/\p{Script=Han}/u.test(token) && token.length>2) { for(let i=0;i<token.length-1;i++) result.push(token.slice(i,i+2)); }
+    else result.push(token);
+  }
+  return [...new Set(result)].slice(-48);
+}
+export async function putSource(tx: Tx, input: {id:string;title:string;content:string;path?:string;metadata?:SourceMetadata|null}) {
+  if (Buffer.byteLength(input.content)>2_000_000) throw new AppError('资料超过 2 MB，请拆成较小的文本。');
+  if(input.content.includes('\0') || Buffer.from(input.content,'utf8').toString('utf8')!==input.content)throw new AppError('资料包含无法保存的字符，请使用有效的 UTF-8 文本。');
+  await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-id:'+input.id]);
+  const hash=digest(input.content);
+  const prior=await tx.one('SELECT * FROM app.sources WHERE id=$1 FOR UPDATE',[input.id]);
+  const oldMetadata=prior ? (await tx.one('SELECT metadata FROM app.source_versions WHERE source_id=$1 AND version=$2',[input.id,prior.version]))?.metadata??null : null;
+  // A plain scanner may observe the same extracted file. Keep its metadata only while its text matches.
+  const metadata=input.metadata===undefined ? (prior?.digest===hash ? oldMetadata : null) : input.metadata===null ? null : SourceMetadata.parse(input.metadata);
+  if(metadata?.pages.some((page:SourceMetadata['pages'][number])=>page.end>input.content.length))throw new AppError('提取页码范围超出了资料正文，尚未保存。');
+  if (prior?.digest===hash && canonical(oldMetadata)===canonical(metadata)) return {id:input.id,version:prior.version};
+  const version=(prior?.version||0)+1;
+  await tx.exec('INSERT INTO app.sources(id,title,path,version,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET title=excluded.title,version=excluded.version,digest=excluded.digest,updated_at=now()', [input.id,input.title,input.path||null,version,hash]);
+  await tx.exec('INSERT INTO app.source_versions(source_id,version,content,digest,metadata) VALUES($1,$2,$3,$4,$5)',[input.id,version,input.content,hash,metadata===null?null:JSON.stringify(metadata)]);
+  for (const piece of chunks(input.content)) await tx.exec('INSERT INTO app.chunks(id,source_id,version,start_offset,end_offset,content) VALUES($1,$2,$3,$4,$5,$6)',[id(),input.id,version,piece.start,piece.end,piece.content]);
+  await event(tx,'source.updated',input.id,{version}); return {id:input.id,version};
+}
+export function citationFromRow(row:Row):Citation {
+  const citation:Citation={sourceId:row.source_id,version:row.version,title:row.title,start:row.start_offset,end:row.end_offset,quote:row.content,digest:row.digest};
+  const parsed=SourceMetadata.safeParse(row.metadata);
+  if(!parsed.success)return citation;
+  const metadata=parsed.data;
+  citation.course=metadata.course;citation.courseName=metadata.courseName;citation.originPath=metadata.originPath;
+  const pages=metadata.pages.filter(page=>page.end>citation.start && page.start<citation.end && page.end>page.start).map(page=>page.number);
+  if(pages.length){
+    const first=Math.min(...pages),last=Math.max(...pages),range=first===last?String(first):`${first}–${last}`;
+    citation.location=/^\.?(ppt|pptx|odp|slides)$/i.test(metadata.format)?`幻灯片 ${range}`:`第 ${range} 页`;
+  }
+  return citation;
+}
+export async function retrieve(tx: Tx, query: string, sourceIds: string[] = [], limit=6, course?:string): Promise<Citation[]> {
+  const words=terms(query); if (!words.length) return [];
+  const patterns=words.map(t=>'%'+t.replace(/[\\%_]/g,'\\$&')+'%');
+  const rows=await tx.rows(`SELECT c.*,s.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
+    JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
+    WHERE (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
+    AND ($4::text IS NULL OR ($4='unclassified' AND coalesce(v.metadata->>'course','')='') OR ($4<>'unclassified' AND v.metadata->>'course'=$4))
+    ORDER BY word_similarity($3,c.content) DESC,c.id LIMIT 80`,[sourceIds,patterns,query.slice(-300),course||null]);
+  return rows.map(row=>({row,score:words.reduce((n,t)=>n+Number(row.content.toLowerCase().includes(t)),0)}))
+    .sort((a,b)=>b.score-a.score).slice(0,limit).map(({row})=>citationFromRow(row));
+}
+export class Knowledge {
+  readonly seen=new Map<string, string>();
+  constructor(readonly store: Store, readonly folder: string) {}
+  async import(tx: Tx, key: string, title: string, content: string) {
+    const sourceId='source-'+digest(key).slice(0,24), path=sourceId+'.md';
+    if(Buffer.byteLength(content)>2_000_000 || content.includes('\0') || Buffer.from(content,'utf8').toString('utf8')!==content)throw new AppError('资料超过 2 MB 或包含无效字符。');
+    await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-path:'+path]);
+    const file=join(this.folder,'documents',path);
+    try { await writeFile(file,content,{flag:'wx',mode:0o600,flush:true}); }
+    catch(e: any) { if(e.code!=='EEXIST') throw e; if(await readFile(file,'utf8')!==content) throw new AppError('原始资料已被修改，不能覆盖。',409,'source_conflict'); }
+    const prior=await tx.one('SELECT id FROM app.sources WHERE path=$1',[path]);
+    return putSource(tx,{id:prior?.id||sourceId,title,content,path});
+  }
+  async scan() {
+    // macOS temporary/data directories may have a /var → /private/var alias.
+    // Compare canonical paths on both sides of the containment check.
+    const base=await realpath(resolve(this.folder,'documents'));
+    const visit=async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory,{withFileTypes:true})) {
+        const file=join(directory,entry.name); if(entry.isSymbolicLink()) continue;
+        if(entry.isDirectory()) {
+          // Legacy v1 stores generated results here; nested course archive folders are originals.
+          if(directory===base && entry.name==='archive') continue;
+          await visit(file); continue;
+        }
+        if(!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
+        const name=relative(base,file), info=await stat(file), stamp=info.mtimeMs+':'+info.size;
+        if(this.seen.get(name)===stamp) continue;
+        try {
+          const actual=await realpath(file); if(!actual.startsWith(base+sep)) throw new AppError('资料路径越界。');
+          if(info.size>2_000_000) throw new AppError('资料超过 2 MB，尚未索引。');
+          const content=new TextDecoder('utf-8',{fatal:true}).decode(await readFile(actual));
+          await this.store.transaction(async tx=>{
+            await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-path:'+name]);
+            const old=await tx.one('SELECT id,title FROM app.sources WHERE path=$1',[name]);
+            await putSource(tx,{id:old?.id||'file-'+digest(name).slice(0,24),title:old?.title||name,content,path:name});
+          });
+          this.seen.set(name,stamp);
+        } catch(error) { await this.store.transaction(tx=>notify(tx,'source-error:'+digest(name+stamp),null,'有一份资料尚未索引',name+'：'+(error instanceof AppError ? error.message : '请检查文件编码与读取权限。'))); }
+      }
+    };
+    await visit(base);
+  }
+}

@@ -1,0 +1,42 @@
+name: yeux-assitant
+x-app: &app
+  build: .
+  image: yeux-assitant:2
+  init: true
+  restart: "no"
+  environment:
+    DATABASE_URL: postgres://assistant:${POSTGRES_PASSWORD:?run pnpm start to initialize credentials}@db:5432/assistant
+    ASSISTANT_DATA: /app/private
+    HOST: 0.0.0.0
+    PORT: 8765
+  volumes:
+    - ${ASSISTANT_DATA_DIR:-./private}:/app/private
+  depends_on:
+    db:
+      condition: service_healthy
+services:
+  db:
+    image: postgres:18-bookworm
+    restart: "no"
+    environment:
+      POSTGRES_USER: assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run pnpm start to initialize credentials}
+      POSTGRES_DB: assistant
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U assistant -d assistant"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  api:
+    <<: *app
+    ports:
+      - "${ASSISTANT_BIND:-0.0.0.0}:${ASSISTANT_PORT:-8765}:8765"
+    command: [node, dist/apps/api/src/main.js]
+  worker:
+    <<: *app
+    stop_grace_period: 120s
+    command: [node, dist/apps/worker/src/main.js]
+volumes:
+  postgres-data:

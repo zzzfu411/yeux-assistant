@@ -1,0 +1,33 @@
+# Private data and credentials
+**/private/
+**/runtime/
+**/secrets/
+.env
+.env.*
+!.env.example
+config.json
+access-token
+runtime.env
+**/auth.json
+**/cookies.json
+**/storage-state.json
+*.pem
+*.key
+*.sqlite*
+*.db
+*.dump
+# Dependencies and generated output
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+playwright-report/
+test-results/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+*.tmp

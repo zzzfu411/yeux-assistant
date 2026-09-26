@@ -1,0 +1,14 @@
+{
+  "llm": {
+    "base_url": "",
+    "model": "",
+    "api_key": ""
+  },
+  "mail_user": "",
+  "mail_password": "",
+  "imap_host": "imap.exmail.qq.com",
+  "imap_port": 993,
+  "smtp_host": "smtp.exmail.qq.com",
+  "smtp_port": 465,
+  "poll_mail": false
+}

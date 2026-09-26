@@ -1,0 +1,14 @@
+private
+node_modules
+**/node_modules
+dist
+**/dist
+__pycache__
+**/__pycache__
+test-results
+playwright-report
+.git
+assistant
+static
+*.py
+*.sqlite3

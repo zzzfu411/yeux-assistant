@@ -27,38 +27,86 @@ import { registerDeviceBridgeManagement, registerDeviceBridgeRoutes } from './ro
 import { AgentAccess } from '../../../packages/core/src/agents.js';
 import { registerAgentManagement, registerAgentRoutes } from './routes/agents.js';
 
-export async function buildServer(options: { url?: string; folder?: string; assets?: boolean; publicOrigin?: string } = {}) {
+export async function buildServer(
+  options: { url?: string; folder?: string; assets?: boolean; publicOrigin?: string } = {},
+) {
   const externalOrigin = publicOrigin(options.publicOrigin ?? process.env.ASSISTANT_PUBLIC_ORIGIN);
   const folder = options.folder || dataFolder();
   const token = await initializeData(folder);
   const store = new Store(options.url);
   let boss: Awaited<ReturnType<typeof createBoss>> | undefined;
   let closing = false;
-  const server = Fastify({ logger: false, bodyLimit: 2_100_000, requestTimeout: 20000, connectionTimeout: 20000, keepAliveTimeout: 10000 }).withTypeProvider<ZodTypeProvider>();
+  const server = Fastify({
+    logger: false,
+    bodyLimit: 2_100_000,
+    requestTimeout: 20000,
+    connectionTimeout: 20000,
+    keepAliveTimeout: 10000,
+  }).withTypeProvider<ZodTypeProvider>();
   server.setValidatorCompiler(validatorCompiler);
   server.setSerializerCompiler(serializerCompiler);
-  server.addHook('preClose', async () => { closing = true; });
+  server.addHook('preClose', async () => {
+    closing = true;
+  });
   server.addHook('onClose', async () => {
     const results = await Promise.allSettled([boss?.stop(), store.close()]);
-    const failure = results.find(result => result.status === 'rejected');
+    const failure = results.find((result) => result.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
   });
-  server.addHook('onRequest', async request => { checkOrigin(request, externalOrigin); });
+  server.addHook('onRequest', async (request) => {
+    checkOrigin(request, externalOrigin);
+  });
   server.addHook('onSend', async (_request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
-    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    reply.header(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    );
     return payload;
   });
   server.setErrorHandler((error, _request, reply) => {
-    const err = error as { code?: string; cause?: { code?: string }; validation?: unknown; statusCode?: number; message?: string };
+    const err = error as {
+      code?: string;
+      cause?: { code?: string };
+      validation?: unknown;
+      statusCode?: number;
+      message?: string;
+    };
     const invalid = error instanceof ZodError || err.validation;
     const conflict = (err.code || err.cause?.code) === '23505';
-    const status = error instanceof AppError ? error.status : invalid ? 400 : conflict ? 409 : err.statusCode && err.statusCode < 500 ? err.statusCode : 500;
-    reply.code(status).send({ error: {
-      code: error instanceof AppError ? error.code : invalid ? 'invalid_request' : conflict ? 'conflict' : 'internal_error',
-      message: error instanceof AppError ? error.message : invalid ? '输入格式不正确，请检查填写内容。' : conflict ? '已有正在进行的记录，请载入最新状态。' : status === 500 ? '服务暂时无法完成操作，请重试。' : err.message,
-    } });
+    const status =
+      error instanceof AppError
+        ? error.status
+        : invalid
+          ? 400
+          : conflict
+            ? 409
+            : err.statusCode && err.statusCode < 500
+              ? err.statusCode
+              : 500;
+    reply.code(status).send({
+      error: {
+        code:
+          error instanceof AppError
+            ? error.code
+            : invalid
+              ? 'invalid_request'
+              : conflict
+                ? 'conflict'
+                : 'internal_error',
+        message:
+          error instanceof AppError
+            ? error.message
+            : invalid
+              ? '输入格式不正确，请检查填写内容。'
+              : conflict
+                ? '已有正在进行的记录，请载入最新状态。'
+                : status === 500
+                  ? '服务暂时无法完成操作，请重试。'
+                  : err.message,
+      },
+    });
   });
 
   try {
@@ -75,20 +123,31 @@ export async function buildServer(options: { url?: string; folder?: string; asse
       const expected = Buffer.from(token);
       return raw.startsWith('Bearer ') && supplied.length === expected.length && timingSafeEqual(supplied, expected);
     };
-    const administrator = async (request: FastifyRequest) => !request.headers.authorization && Boolean(await auth.username(sessionCookie(request.headers.cookie)));
+    const administrator = async (request: FastifyRequest) =>
+      !request.headers.authorization && Boolean(await auth.username(sessionCookie(request.headers.cookie)));
     // An explicit Bearer identity never inherits privileges from a browser Cookie.
-    const authorized = async (request: FastifyRequest) => request.headers.authorization !== undefined
-      ? bearerValid(request.headers.authorization) : administrator(request);
+    const authorized = async (request: FastifyRequest) =>
+      request.headers.authorization !== undefined ? bearerValid(request.headers.authorization) : administrator(request);
 
-    server.post('/api/v2/auth/login', { schema: { body: LoginInput }, bodyLimit: 4096,
-      onRequest: async (_request, reply) => { reply.header('Cache-Control', 'no-store'); },
-    }, async (request, reply) => {
-      const result = await auth.login(request.body.username, request.body.password);
-      reply.header('Set-Cookie', cookieHeader(result.token, secureSession(request.protocol, externalOrigin)));
-      return { username: result.username };
-    });
+    server.post(
+      '/api/v2/auth/login',
+      {
+        schema: { body: LoginInput },
+        bodyLimit: 4096,
+        onRequest: async (_request, reply) => {
+          reply.header('Cache-Control', 'no-store');
+        },
+      },
+      async (request, reply) => {
+        const result = await auth.login(request.body.username, request.body.password);
+        reply.header('Set-Cookie', cookieHeader(result.token, secureSession(request.protocol, externalOrigin)));
+        return { username: result.username };
+      },
+    );
     // Liveness is independent of dependencies. Readiness checks the database, not the model or Worker.
-    server.get('/healthz', async (_request, reply) => reply.code(closing ? 503 : 200).send({ ok: !closing, version: 2 }));
+    server.get('/healthz', async (_request, reply) =>
+      reply.code(closing ? 503 : 200).send({ ok: !closing, version: 2 }),
+    );
     server.get('/readyz', async (_request, reply) => {
       reply.header('Cache-Control', 'no-store');
       try {
@@ -96,41 +155,54 @@ export async function buildServer(options: { url?: string; folder?: string; asse
         const probe = { text: 'SELECT 1', query_timeout: 3000 };
         await store.pool.query(probe);
         return { ok: true };
-      } catch { return reply.code(503).send({ ok: false }); }
+      } catch {
+        return reply.code(503).send({ ok: false });
+      }
     });
 
     // Authentication belongs to this Fastify scope, independent of raw URL spelling.
     // Every new business route must be registered here; login and probes stay outside it.
-    await server.register(async scope => {
-      const api = scope.withTypeProvider<ZodTypeProvider>();
-      api.addHook('onRequest', async (request, reply) => {
-        reply.header('Cache-Control', 'no-store');
-        if (!await authorized(request)) return reply.code(401).send({ error: { code: 'unauthorized', message: '请登录管理员账号。' } });
-      });
-      api.get('/auth/session', async request => ({ username: await auth.username(sessionCookie(request.headers.cookie)) }));
-      api.post('/auth/logout', async (request, reply) => {
-        await auth.logout(sessionCookie(request.headers.cookie));
-        reply.header('Set-Cookie', cookieHeader('', secureSession(request.protocol, externalOrigin), true));
-        return { ok: true };
-      });
-      registerLearningRoutes(api, app);
-      registerSourceRoutes(api, app, folder);
-      registerOrganizationRoutes(api, app, store);
-      registerIntegrationRoutes(api, app, mail, folder);
-      registerDeviceRoutes(api, devices);
-      registerDeviceBridgeManagement(api, bridges, administrator);
-      registerStatusRoutes(api, store);
-      registerAgentManagement(api, agents, administrator);
-      registerEventRoutes(api, app, authorized);
-    }, { prefix: '/api/v2' });
+    await server.register(
+      async (scope) => {
+        const api = scope.withTypeProvider<ZodTypeProvider>();
+        api.addHook('onRequest', async (request, reply) => {
+          reply.header('Cache-Control', 'no-store');
+          if (!(await authorized(request)))
+            return reply.code(401).send({ error: { code: 'unauthorized', message: '请登录管理员账号。' } });
+        });
+        api.get('/auth/session', async (request) => ({
+          username: await auth.username(sessionCookie(request.headers.cookie)),
+        }));
+        api.post('/auth/logout', async (request, reply) => {
+          await auth.logout(sessionCookie(request.headers.cookie));
+          reply.header('Set-Cookie', cookieHeader('', secureSession(request.protocol, externalOrigin), true));
+          return { ok: true };
+        });
+        registerLearningRoutes(api, app);
+        registerSourceRoutes(api, app, folder);
+        registerOrganizationRoutes(api, app, store);
+        registerIntegrationRoutes(api, app, mail, folder);
+        registerDeviceRoutes(api, devices);
+        registerDeviceBridgeManagement(api, bridges, administrator);
+        registerStatusRoutes(api, store);
+        registerAgentManagement(api, agents, administrator);
+        registerEventRoutes(api, app, authorized);
+      },
+      { prefix: '/api/v2' },
+    );
 
     await registerAgentRoutes(server, app, agents);
     await registerDeviceBridgeRoutes(server, bridges);
 
     if (options.assets !== false && existsSync(resolve('dist/web/index.html'))) {
       await server.register(staticFiles, { root: resolve('dist/web'), index: 'index.html', wildcard: true });
-      server.setNotFoundHandler((request, reply) => request.url.startsWith('/api/') || request.url.startsWith('/assets/') || /\.[a-z0-9]+(?:\?|$)/i.test(request.url)
-        ? reply.code(404).send({ error: { code: 'not_found', message: '请求的内容不存在，请刷新页面。' } }) : reply.sendFile('index.html'));
+      server.setNotFoundHandler((request, reply) =>
+        request.url.startsWith('/api/') ||
+        request.url.startsWith('/assets/') ||
+        /\.[a-z0-9]+(?:\?|$)/i.test(request.url)
+          ? reply.code(404).send({ error: { code: 'not_found', message: '请求的内容不存在，请刷新页面。' } })
+          : reply.sendFile('index.html'),
+      );
     }
     return { server, app, store, boss, mail, devices, agents, bridges };
   } catch (error) {

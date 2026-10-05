@@ -9,12 +9,12 @@ import { Store } from '../packages/storage/src/index.js';
 
 const now = new Date('2026-10-04T01:00:00Z');
 const names = ['worker', 'scheduler', 'knowledge', 'exports', 'devices'];
-const healthy = () => names.map(name => ({ name, heartbeat: now, error: '' }));
+const healthy = () => names.map((name) => ({ name, heartbeat: now, error: '' }));
 
 describe('runtime diagnostics', () => {
   it('distinguishes not checked, healthy, stale, and failed checks without returning raw errors', () => {
     expect(runtimeStatus([], now).state).toBe('starting');
-    expect(runtimeStatus([], now).components.every(item => item.state === 'unknown')).toBe(true);
+    expect(runtimeStatus([], now).components.every((item) => item.state === 'unknown')).toBe(true);
     expect(runtimeStatus(healthy(), now).state).toBe('ok');
     const rows = healthy();
     rows[1]!.heartbeat = new Date(now.getTime() - 90_001);
@@ -28,8 +28,8 @@ describe('runtime diagnostics', () => {
     expect(value.components[2]!.message).toContain('读取权限');
   });
   it('uses a shorter freshness threshold for the Worker and clears recovered errors', () => {
-    const rows = healthy().map(row => ({ ...row, heartbeat: new Date(now.getTime() - 20_001) }));
-    expect(runtimeStatus(rows, now).components.map(item => item.state)).toEqual(['stale', 'ok', 'ok', 'ok', 'ok']);
+    const rows = healthy().map((row) => ({ ...row, heartbeat: new Date(now.getTime() - 20_001) }));
+    expect(runtimeStatus(rows, now).components.map((item) => item.state)).toEqual(['stale', 'ok', 'ok', 'ok', 'ok']);
     expect(runtimeStatus(healthy(), now).issueCount).toBe(0);
   });
 });
@@ -47,31 +47,50 @@ describe.skipIf(!url)('health and scoped API authentication', () => {
     built = await buildServer({ url, folder, assets: false });
     token = (await readFile(join(folder, 'access-token'), 'utf8')).trim();
   });
-  afterAll(async () => { await built?.server.close(); if (folder) await rm(folder, { recursive: true, force: true }); });
+  afterAll(async () => {
+    await built?.server.close();
+    if (folder) await rm(folder, { recursive: true, force: true });
+  });
 
   it('keeps liveness independent of readiness and exposes no database failure details', async () => {
     expect((await built.server.inject('/readyz')).statusCode).toBe(200);
-    const query = vi.spyOn(built.store.pool, 'query').mockRejectedValueOnce(new Error('synthetic-private-connection-string') as never);
+    const query = vi
+      .spyOn(built.store.pool, 'query')
+      .mockRejectedValueOnce(new Error('synthetic-private-connection-string') as never);
     try {
       const failed = await built.server.inject('/readyz');
       expect(failed.statusCode).toBe(503);
       expect(failed.json()).toEqual({ ok: false });
       expect((await built.server.inject('/healthz')).statusCode).toBe(200);
-    } finally { query.mockRestore(); }
+    } finally {
+      query.mockRestore();
+    }
     expect((await built.server.inject('/readyz')).json()).toEqual({ ok: true });
   });
   it.each([
-    ['GET', '/today/overview'], ['POST', '/goals'], ['GET', '/sources'],
-    ['POST', '/memories'], ['GET', '/schedules'], ['PATCH', '/settings/model'],
-    ['GET', '/devices'], ['POST', '/approvals/sample/decision'], ['GET', '/events'],
-    ['GET', '/status'], ['GET', '/auth/session'], ['POST', '/auth/logout'],
+    ['GET', '/today/overview'],
+    ['POST', '/goals'],
+    ['GET', '/sources'],
+    ['POST', '/memories'],
+    ['GET', '/schedules'],
+    ['PATCH', '/settings/model'],
+    ['GET', '/devices'],
+    ['POST', '/approvals/sample/decision'],
+    ['GET', '/events'],
+    ['GET', '/status'],
+    ['GET', '/auth/session'],
+    ['POST', '/auth/logout'],
   ])('requires authentication before %s %s runs or validates its body', async (method, path) => {
     const response = await built.server.inject({ method: method as 'GET', url: '/api/v2' + path });
     expect(response.statusCode).toBe(401);
     expect(response.headers['cache-control']).toBe('no-store');
   });
   it('shows an actionable background failure even while the Worker is alive, and clears it after recovery', async () => {
-    for (const name of names) await built.store.exec('INSERT INTO app.health(name,heartbeat,error) VALUES($1,now(),$2)', [name, name === 'knowledge' ? 'synthetic-private-path' : '']);
+    for (const name of names)
+      await built.store.exec('INSERT INTO app.health(name,heartbeat,error) VALUES($1,now(),$2)', [
+        name,
+        name === 'knowledge' ? 'synthetic-private-path' : '',
+      ]);
     const headers = { authorization: 'Bearer ' + token };
     const response = await built.server.inject({ url: '/api/v2/status', headers });
     expect(response.statusCode).toBe(200);

@@ -28,7 +28,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
-      - name: Types, build and isolated PostgreSQL tests
+      - name: Formatting, types, build and isolated PostgreSQL tests
         run: pnpm verify
       - name: Desktop and phone interactions
         run: pnpm exec playwright test tests/e2e/assistant.spec.ts tests/e2e/devices.spec.ts tests/e2e/sources.spec.ts tests/e2e/source-catalog.spec.ts

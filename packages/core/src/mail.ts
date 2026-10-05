@@ -10,7 +10,7 @@ import { Tx, type Store, type Row } from '../../storage/src/index.js';
 import { ApprovalDecision, ApprovalResolution } from '../../contracts/src/index.js';
 import { AppError, checkVersion, digest, event, id, notify, once, requireRow } from './common.js';
 import { config } from './config.js';
-import { createSession, lockSession } from './application.js';
+import { createSession, lockSession } from './sessions.js';
 import { putSource } from './knowledge.js';
 
 const address=z.string().regex(/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/);

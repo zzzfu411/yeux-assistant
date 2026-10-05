@@ -11,7 +11,8 @@ import { LEARNING_QUEUE } from './queue.js';
 import { openCheckpoints } from './learning.js';
 import { ArtifactExporter, Scheduler } from './scheduler.js';
 import { claimRun, failRun, publicRuntimeError, type RunIdentity } from './runtime-state.js';
-import { lockSession } from './application.js';
+import { DeviceActions, DEVICE_QUEUE } from './devices/service.js';
+import { lockSession } from './sessions.js';
 
 type ChildResult = { ok: boolean; error?: string; permanent?: boolean };
 const SLOT_LOCKS = [847392010, 847392011];
@@ -125,6 +126,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
   await recoverInterruptedRuns(store, boss);
   const supervisor = new RunSupervisor(store), scheduler = new Scheduler(store, boss), knowledge = new Knowledge(store, folder), exporter = new ArtifactExporter(store, folder), mail = new MailActions(store, boss, folder);
   await withLock(store, 847392005, () => mail.recover());
+  const devices=new DeviceActions(store,boss);await devices.recover();
   let stopping = false, heartbeatBusy = false, maintenanceError = '';
   let timer: ReturnType<typeof setInterval> | undefined, stopPromise: Promise<void> | undefined;
   const background = new Set<Promise<unknown>>();
@@ -134,9 +136,11 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
   await boss.work<{ runId: string }>(LEARNING_QUEUE, { localConcurrency: 2, batchSize: 1, pollingIntervalSeconds: 1 }, async jobs => {
     const job = jobs[0]; if (job) await supervisor.handle(job.data.runId, job.signal);
   });
+  await boss.work<{commandId:string}>(DEVICE_QUEUE,{localConcurrency:1,batchSize:1,pollingIntervalSeconds:1},async jobs=>{const job=jobs[0];if(job)await track(()=>devices.process(job.data.commandId,job.signal));});
   await boss.createQueue('mail-poll', { retryLimit: 1, expireInSeconds: 80, policy: 'exclusive' });
   await boss.work('maintenance', { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 }, async () => {
     await track(() => withLock(store, 847392006, async () => {
+      await operation('devices', () => devices.sweep());
       await operation('scheduler', () => scheduler.tick());
       await operation('knowledge', () => knowledge.scan());
       await operation('exports', () => exporter.tick());

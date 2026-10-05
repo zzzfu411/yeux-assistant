@@ -1,7 +1,9 @@
 import { Annotation, Command, END, START, StateGraph, interrupt } from '@langchain/langgraph';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
 import type { Store, Row } from '../../storage/src/index.js';
-import { ModelAssessment, ModelLesson, ModelPlan, type Citation } from '../../contracts/src/index.js';
+import { ModelLesson, ModelPlan, Citation } from '../../contracts/src/index.js';
+import { ModelAssessment } from '../../contracts/src/assessment.js';
+import { ASSESSMENT_INSTRUCTION, guardAssessment } from './assessment.js';
 import { AppError, digest, event, id, notify } from './common.js';
 import { citationFromRow, retrieve } from './knowledge.js';
 import { ModelGateway, type ModelContext } from './model.js';
@@ -23,24 +25,36 @@ export async function openCheckpoints(url: string, setup = false) {
   return saver;
 }
 
-async function contextFor(store: Store, identity: RunIdentity, stepId: string | null) {
+async function contextFor(store: Store, identity: RunIdentity, stepId: string | null, assessment=false) {
   return store.transaction(async tx => {
     const context = await fence(tx, identity);
     const plan = context.goal ? await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [context.goal.id]) : undefined;
     const steps = (plan?.steps || []) as Step[];
-    const step = steps.find(s => s.id === stepId) || steps.find(s => s.state !== 'practiced') || steps[0];
+    let step = steps.find(s => s.id === stepId) || steps.find(s => s.state !== 'practiced') || steps[0];
+    const delivered=await tx.one("SELECT id,run_id,content,citations FROM app.artifacts WHERE session_id=$1 AND kind IN ('lesson','response') ORDER BY created_at DESC,id DESC LIMIT 1",[context.session.id]);
+    const attempt = context.run.input.attemptId ? await tx.one('SELECT * FROM app.attempts WHERE id=$1 AND session_id=$2', [context.run.input.attemptId, context.session.id]) : undefined;
+    if (assessment && context.goal && attempt?.verdict === 'pending') {
+      // The graph's current choice can change after a failed run or another
+      // review. Grade the step that produced this session's delivered exercise.
+      const prepared = delivered?.run_id ? await tx.one(`SELECT s.value FROM app.settings s JOIN app.runs r ON s.key='runtime:' || r.id || ':prepare'
+        WHERE r.id=$1 AND r.session_id=$2`, [delivered.run_id, context.session.id]) : undefined;
+      const originalStep = typeof prepared?.value?.stepId === 'string' ? steps.find(item => item.id === prepared.value.stepId) : undefined;
+      if (!originalStep) throw new AppError('这份练习的学习步骤无法核对，回答已保留。请在目标页暂停后继续学习，重新准备练习。', 409, 'exercise_binding_missing');
+      step = originalStep;
+    }
     const query = [context.goal?.title, context.goal?.outcome, step?.title, step?.objective, context.session.prompt].filter(Boolean).join(' ');
-    // A goal uses only its selected sources; removing all must not widen to the whole library.
-    let citations = context.goal && !context.goal.source_ids.length ? [] : await retrieve(tx, query, context.goal?.source_ids || [], 6);
+    // Assessment belongs to the delivered exercise; later edits or archival cannot change its evidence.
+    // Preparing the next exercise uses current, active sources.
+    const savedCitations=assessment?Citation.array().safeParse(delivered?.citations??context.session.citations??[]):null;
+    let citations = assessment ? savedCitations?.success?savedCitations.data:[] : context.goal && !context.goal.source_ids.length ? [] : await retrieve(tx, query, context.goal?.source_ids || [], 6);
     // A goal's explicitly selected short document can be useful even without lexical overlap.
-    if (!citations.length && context.goal?.source_ids?.length) {
-      citations = (await tx.rows(`SELECT c.*,s.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
+    if (!assessment && !citations.length && context.goal?.source_ids?.length) {
+      citations = (await tx.rows(`SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
         JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
-        WHERE s.id=ANY($1::text[]) ORDER BY c.source_id,c.start_offset LIMIT 6`, [context.goal.source_ids])).map(citationFromRow);
+        WHERE s.id=ANY($1::text[]) AND s.archived_at IS NULL ORDER BY c.source_id,c.start_offset LIMIT 6`, [context.goal.source_ids])).map(citationFromRow);
     }
     const memories = await tx.rows("SELECT * FROM app.memories WHERE enabled AND (scope IN ('all','preference','fact','correction') OR scope=$1) ORDER BY updated_at DESC,key", [context.session.kind]);
-    const attempt = context.run.input.attemptId ? await tx.one('SELECT * FROM app.attempts WHERE id=$1 AND session_id=$2', [context.run.input.attemptId, context.session.id]) : undefined;
-    const previous = (await tx.one("SELECT content FROM app.artifacts WHERE session_id=$1 AND kind IN ('lesson','response') ORDER BY created_at DESC,id DESC LIMIT 1", [context.session.id]))?.content || context.session.content;
+    const previous = delivered?.content || context.session.content;
     const modelContext: ModelContext = {
       task: [context.goal?.title || context.session.title, context.goal?.outcome || context.session.prompt, step ? '当前学习点：' + step.title + '\n' + step.objective : ''].filter(Boolean).join('\n'),
       latest: attempt?.answer || context.run.input.answer || context.session.prompt,
@@ -52,7 +66,7 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
     const intent = context.goal ? digest({ title: context.goal.title, outcome: context.goal.outcome, sources: context.goal.source_ids }) : '';
     const savedIntent = context.goal ? (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['plan-intent:' + context.goal.id]))?.value : undefined;
     const reviewIndex = context.goal ? Number((await tx.one('SELECT value FROM app.settings WHERE key=$1', ['review-index:' + context.goal.id]))?.value || 0) : 0;
-    return { ...context, plan, steps, step, citations, attempt, modelContext, intent, savedIntent, reviewIndex };
+    return { ...context, plan, steps, step, citations, attempt, delivered, modelContext, intent, savedIntent, reviewIndex };
   });
 }
 
@@ -62,6 +76,7 @@ export function localLesson(title: string, citations: Citation[], feedback = '')
 }
 
 export function nextReview(stage: number, intervals: number[], verdict: string, now = Date.now()) {
+  if (verdict === 'unclear') return { stage, at: new Date(now + intervals[0]! * 1000) };
   const current = verdict === 'pass' ? Math.max(0, Math.min(stage, intervals.length - 1)) : 0;
   return { stage: verdict === 'pass' ? Math.min(current + 1, intervals.length - 1) : 0, at: new Date(now + intervals[current]! * 1000) };
 }
@@ -100,7 +115,7 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
         { ...ctx.modelContext, task: ctx.modelContext.task + (feedback ? '\n最近反馈：' + feedback : '') }) : { content: study ? localLesson(ctx.step?.title || ctx.session.title, ctx.citations, feedback) : ['尚未配置模型，已保存这项请求。', ctx.modelContext.latest, ...ctx.citations.slice(0, 3).map(c => `资料：${c.title}\n\n${c.quote}`)].join('\n\n'), sourceIds: ctx.citations.map(c => c.sourceId) };
       const provided = new Set(enabled ? model.providedSourceIds : ctx.citations.map(c => c.sourceId));
       if (result.sourceIds.some(source => !provided.has(source))) throw new AppError('模型引用了未提供的资料，已保留进度并重新核对。', 503, 'model_invalid_citation');
-      const citations = ctx.citations.filter(c => result.sourceIds.includes(c.sourceId));
+      const citations = (enabled ? model.providedCitations : ctx.citations).filter(c => result.sourceIds.includes(c.sourceId));
       return commitNode(store, identity, 'prepare', async (tx, current) => {
         if (ctx.plan && ctx.step && ctx.step.state !== 'practiced') {
           const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [ctx.goal!.id]);
@@ -124,24 +139,40 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
     })
     .addNode('assess', async state => {
       const saved = await nodeReceipt<Partial<State>>(store, identity, 'assess'); if (saved) return saved;
-      const ctx = await contextFor(store, identity, state.stepId);
+      const ctx = await contextFor(store, identity, state.stepId,true);
       if (!ctx.attempt || ctx.attempt.id !== state.attemptId) throw new AppError('没有找到这次回答，当前进度已保留。', 409, 'attempt_missing');
+      // A manual retry starts a new graph thread. The old answer must resume its
+      // committed continuation, never be reassessed against a newly selected step.
+      if (ctx.attempt.verdict !== 'pending') return store.transaction(async tx => {
+        await fence(tx, identity);
+        const receipt = await tx.one('SELECT value FROM app.settings WHERE key=$1', ['assessment:' + ctx.attempt!.id])
+          ?? await tx.one(`SELECT s.value FROM app.settings s JOIN app.runs r ON s.key='runtime:' || r.id || ':assess'
+            WHERE r.session_id=$1 AND r.input->>'attemptId'=$2 ORDER BY r.created_at LIMIT 1`, [ctx.session.id, ctx.attempt!.id]);
+        if (!receipt) throw new AppError('这次回答已评阅，但缺少恢复记录。已有判定已保留，请重新开始练习。', 409, 'assessment_receipt_missing');
+        return { stepId: receipt.value.stepId, done: receipt.value.done };
+      });
       const self = ctx.attempt.self_report;
       const enabled = await model.configured();
-      const assessment = self ? { verdict: self === 'understood' ? 'pass' as const : 'retry' as const, feedback: self === 'understood' ? '已记录你的自评：理解了这个知识点。后续会安排复习。' : '已记录你的自评：还需要练习。继续巩固当前知识点。', evidence: ctx.attempt.answer }
-        : enabled ? await model.json(ModelAssessment, '评阅最新用户回答相对于上一份已交付练习的表现。pass 需要具体、充分的回答证据；错误用 retry，证据不足或无可靠资料用 unclear。evidence 必须指出用户回答的具体内容及引用依据，不能由自己生成答案后当成用户掌握证据。反馈是模型估计，不能宣称课程完成。', ctx.modelContext)
-          : { verdict: 'unclear' as const, feedback: '回答已保存。尚未配置模型，因此没有自动评阅；可以继续练习，或提交“已理解 / 需要练习”的自评。', evidence: ctx.attempt.answer };
-      if (assessment.verdict === 'pass' && !assessment.evidence.trim()) {
-        assessment.verdict = 'unclear'; assessment.feedback = '模型没有提供可核对的回答证据，暂不判断掌握。\n\n' + assessment.feedback;
-      }
+      const proposed: ModelAssessment = self ? { verdict: self === 'understood' ? 'pass' : 'retry', feedback: self === 'understood' ? '已记录你的自评：理解了这个知识点。后续会安排复习。' : '已记录你的自评：还需要练习。继续巩固当前知识点。', evidence: ctx.attempt.answer,answerQuotes:[],citationRefs:[] }
+        : enabled ? await model.json(ModelAssessment, ASSESSMENT_INSTRUCTION, ctx.modelContext,{assessment:true})
+          : { verdict: 'unclear', feedback: '回答已保存。尚未配置模型，因此没有自动评阅；可以继续练习，或提交“已理解 / 需要练习”的自评。', evidence: ctx.attempt.answer,answerQuotes:[],citationRefs:[] };
+      const guarded = !self && enabled ? guardAssessment(proposed,{answer:ctx.attempt.answer,exerciseComplete:model.exerciseComplete,providedCitations:model.providedCitations}) : null;
+      const assessment = guarded?.assessment ?? proposed;
+      const audit = guarded ? {version:1,attemptId:ctx.attempt.id,stepId:ctx.step?.id??null,modelResponse:model.lastResponse,accepted:assessment,reasons:guarded.reasons,downgraded:guarded.downgraded,exercise:{artifactId:ctx.delivered?.id??null,digest:digest(ctx.modelContext.previous),characters:ctx.modelContext.previous.length,complete:model.exerciseComplete},providedCitations:model.providedCitations,scope:'仅保存结构有效且应用到本次回答的模型回复；证据可追溯性检查不代表语义判定已经验证。'} : null;
       const source = self ? 'user_report' : enabled ? 'model_estimate' : 'ungraded';
       return commitNode(store, identity, 'assess', async (tx, current) => {
         await tx.exec('UPDATE app.attempts SET verdict=$2,feedback=$3,evidence=$4,source=$5 WHERE id=$1 AND session_id=$6', [ctx.attempt!.id, assessment.verdict, assessment.feedback, assessment.evidence, source, current.session.id]);
         await tx.exec('INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(dedupe_key) DO NOTHING', [id(), current.session.id, current.run.id, 'feedback', assessment.feedback, source, `feedback:${ctx.attempt!.id}`]);
+        if(audit)await tx.exec('INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',[id(),current.session.id,current.run.id,'assessment_audit',JSON.stringify(audit,null,2),'model_estimate',JSON.stringify(model.providedCitations),`assessment-audit:${ctx.attempt!.id}`]);
         let nextStep = ctx.step?.id || null, done = assessment.verdict === 'pass' && !current.goal;
         if (current.goal) {
           const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [current.goal.id]);
           const steps = (latest?.steps || []) as Step[];
+          if(assessment.verdict==='retry' && ctx.step && steps.some(s=>s.id===ctx.step!.id && s.state==='practiced')){
+            const changed=steps.map(s=>s.id===ctx.step!.id?{...s,state:'practicing' as const}:s);
+            await tx.exec('INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',[id(),current.goal.id,latest!.version+1,JSON.stringify(changed),'复习中需要继续练习，保留此前的作答记录。',current.goal.revision]);
+            await event(tx,'plan.updated',current.goal.id,{version:latest!.version+1});
+          }
           if (assessment.verdict === 'pass' && ctx.step && steps.some(s => s.id === ctx.step!.id)) {
             const changed = steps.map(s => s.id === ctx.step!.id ? { ...s, state: 'practiced' as const } : s);
             await tx.exec('INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)', [id(), current.goal.id, latest!.version + 1, JSON.stringify(changed), assessment.feedback, current.goal.revision]);
@@ -160,6 +191,7 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
           await tx.exec("UPDATE app.sessions SET content=$2,state='running',revision=revision+1,updated_at=now() WHERE id=$1", [current.session.id, content]);
         }
         await event(tx, 'attempt.assessed', current.session.id, { attemptId: ctx.attempt!.id, verdict: assessment.verdict, source });
+        await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', ['assessment:' + ctx.attempt!.id, JSON.stringify({attemptId:ctx.attempt!.id,assessedStepId:ctx.step?.id??null,artifactId:ctx.delivered?.id??null,verdict:assessment.verdict,stepId:nextStep,done})]);
         return { stepId: nextStep, done };
       });
     })

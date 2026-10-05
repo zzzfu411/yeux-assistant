@@ -168,7 +168,7 @@ async function mapRows(tx:Tx,snapshot:LegacySnapshot) {
   for(const row of rows(snapshot,'documents')) {
     const sourceId='legacy-source-'+digest(row.path).slice(0,24);
     await tx.exec('INSERT INTO app.sources(id,title,path,version,digest,created_at,updated_at) VALUES($1,$2,$2,1,$3,$4,$4)',[sourceId,row.path,row.digest,exportedAt]);
-    await tx.exec('INSERT INTO app.source_versions(source_id,version,content,digest,created_at) VALUES($1,1,$2,$3,$4)',[sourceId,row.content,row.digest,exportedAt]);
+    await tx.exec('INSERT INTO app.source_versions(source_id,version,title,content,digest,created_at) VALUES($1,1,$2,$3,$4,$5)',[sourceId,row.path,row.content,row.digest,exportedAt]);
     for(const chunk of chunks(row.content)) await tx.exec('INSERT INTO app.chunks(id,source_id,version,start_offset,end_offset,content) VALUES($1,$2,1,$3,$4,$5)',[sourceId+':'+chunk.start,sourceId,chunk.start,chunk.end,chunk.content]);
   }
   for(const row of rows(snapshot,'memories')) await tx.exec('INSERT INTO app.memories(key,scope,content,version,confirmed,enabled,source_session,updated_at) VALUES($1,$2,$3,$4,true,$5,$6,$7)',[row.key,row.scope,row.content,row.version,Boolean(row.enabled),row.source_task,date(row.updated,'memories.updated')]);

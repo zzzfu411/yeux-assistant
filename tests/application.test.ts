@@ -1,11 +1,11 @@
-import { beforeAll, afterAll, describe, it, expect } from 'vitest';
+import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildServer } from '../apps/api/src/server.js';
 import { Store } from '../packages/storage/src/index.js';
 import { chunks } from '../packages/core/src/knowledge.js';
-import { digest } from '../packages/core/src/common.js';
+import { digest,notify } from '../packages/core/src/common.js';
 
 const url=process.env.API_TEST_DATABASE_URL;
 describe.skipIf(!url)('API and transactional application contracts',()=>{
@@ -20,6 +20,19 @@ describe.skipIf(!url)('API and transactional application contracts',()=>{
     const response=await built.server.inject({method:method as any,url:'/api/v2'+path,headers:{authorization:'Bearer '+token,...(key?{'idempotency-key':key}:{})},payload:body});
     return {status:response.statusCode,body:response.json()};
   };
+  it('probes the saved complete endpoint and rejects an empty model answer',async()=>{
+    const path=join(folder,'config.json');
+    await writeFile(path,JSON.stringify({llm:{base_url:'https://fixture.example/v1/chat/completions/',model:'fixture'}}));
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({choices:[{message:{content:'OK'}}]})));
+    try {
+      expect((await call('POST','/settings/model/test')).body.ok).toBe(true);
+      expect(mock).toHaveBeenCalledWith('https://fixture.example/v1/chat/completions',expect.objectContaining({redirect:'error'}));
+      mock.mockResolvedValueOnce(new Response(JSON.stringify({choices:[{message:{}}]})));
+      expect((await call('POST','/settings/model/test')).status).toBe(503);
+      await writeFile(path,JSON.stringify({llm:{base_url:'https://fixture.example/v1',model:''}}));
+      expect((await call('GET','/today')).body.modelConfigured).toBe(false);
+    } finally {mock.mockRestore();await rm(path,{force:true});}
+  });
   it('authenticates private APIs and validates runtime input',async()=>{
     expect((await built.server.inject({url:'/api/v2/today'})).statusCode).toBe(401);
     expect((await call('POST','/goals',{title:''},'invalid')).status).toBe(400);
@@ -53,6 +66,26 @@ describe.skipIf(!url)('API and transactional application contracts',()=>{
     const attempts=await built.store.rows('SELECT * FROM app.attempts WHERE session_id=$1',[s.id]);expect(attempts).toHaveLength(1);expect(attempts[0]!.verdict).toBe('pending');
     const run=await built.store.one('SELECT * FROM app.runs WHERE id=$1',[first.body.runId]);expect(run!.graph_thread).toBe(s.id);
     expect((await call('POST','/sessions/'+s.id+'/feedback',input,'answer-two')).status).toBe(409);
+  });
+  it.each(['completed','ready'])('rejects a new study answer in %s without creating facts or work',async state=>{
+    const created=await call('POST','/sessions',{prompt:'已结束的合成练习',kind:'study'},'closed-study-'+state),sid=created.body.sessionId;
+    await built.store.exec('UPDATE app.sessions SET state=$2 WHERE id=$1',[sid,state]);
+    const before=await built.store.one('SELECT * FROM app.sessions WHERE id=$1',[sid]);
+    const runs=await built.store.rows('SELECT * FROM app.runs WHERE session_id=$1',[sid]);
+    const response=await call('POST','/sessions/'+sid+'/feedback',{revision:before!.revision,answer:'对上一题补充回答',selfReport:'understood'},'closed-study-answer-'+state);
+    expect(response.status).toBe(409);expect(response.body.error.code).toBe('state_conflict');
+    expect(await built.store.one('SELECT * FROM app.sessions WHERE id=$1',[sid])).toEqual(before);
+    expect(await built.store.rows('SELECT * FROM app.runs WHERE session_id=$1',[sid])).toEqual(runs);
+    expect(await built.store.rows('SELECT * FROM app.attempts WHERE session_id=$1',[sid])).toEqual([]);
+  });
+  it.each(['work','manage'].flatMap(kind=>['ready','completed'].map(state=>({kind,state}))))('keeps $kind follow-up available in $state',async({kind,state})=>{
+    const created=await call('POST','/sessions',{prompt:'合成工作草稿',kind},'followup-'+kind+'-'+state),sid=created.body.sessionId;
+    await built.store.exec('UPDATE app.sessions SET state=$2 WHERE id=$1',[sid,state]);
+    const response=await call('POST','/sessions/'+sid+'/feedback',{revision:1,answer:'补充一个具体例子'},'followup-answer-'+kind+'-'+state);
+    expect(response.status).toBe(202);
+    expect((await built.store.one('SELECT state FROM app.sessions WHERE id=$1',[sid]))!.state).toBe('queued');
+    expect((await built.store.rows('SELECT * FROM app.attempts WHERE session_id=$1',[sid]))).toHaveLength(1);
+    expect((await built.store.one('SELECT input FROM app.runs WHERE id=$1',[response.body.runId]))!.input).toMatchObject({type:'followup',freshThread:true});
   });
   it('imports originals idempotently and retrieves short Chinese terms across long chunks',async()=>{
     const content='甲'.repeat(1799)+'原子性需要全部成功。'+'乙'.repeat(2100)+'持久保存证据。';
@@ -129,5 +162,24 @@ describe.skipIf(!url)('API and transactional application contracts',()=>{
     expect(indexed.some(row=>row.path===join('archive','old-result.md') || row.path===join('archive','old-run','another-result.txt'))).toBe(false);
     for(const [path,content] of files)expect(await readFile(path)).toEqual(content);
   });
+  it('links device notifications to exact historical commands without changing learning links',async()=>{
+    const created=await call('POST','/devices/simulated',{name:'通知验收灯'},'notice-device-create');
+    const command=(await call('POST','/devices/'+created.body.deviceId+'/commands',{revision:1,capability:'power.set',arguments:{power:true}},'notice-device-preview')).body;
+    expect((await call('POST','/device-commands/'+command.id+'/decision',{revision:command.revision,digest:command.digest,approve:true},'notice-device-approve')).status).toBe(200);
+    await built.devices.process(command.id);
+    const session=(await built.store.one('SELECT id FROM app.sessions LIMIT 1'))!;
+    await built.store.transaction(async tx=>{await notify(tx,'notice-learning',session.id,'学习步骤已准备');await notify(tx,'notice-general',null,'普通通知');});
+    await built.store.exec("INSERT INTO app.device_commands(id,device_id,payload,digest,summary,expires_at,state,created_at) SELECT gen_random_uuid()::text,device_id,payload,digest,summary,expires_at,'cancelled',now()+n*interval '1 millisecond' FROM app.device_commands CROSS JOIN generate_series(1,55) n WHERE id=$1",[command.id]);
+    expect((await call('GET','/device-commands')).body.some((row:any)=>row.id===command.id)).toBe(false);
+    const notifications=(await call('GET','/notifications')).body.items;
+    expect(notifications.find((row:any)=>row.dedupe_key==='notice-learning')).toMatchObject({session_id:session.id,deviceCommandId:null});
+    expect(notifications.find((row:any)=>row.dedupe_key==='notice-general')).toMatchObject({session_id:null,deviceCommandId:null});
+    const notice=notifications.find((row:any)=>row.deviceCommandId===command.id);expect(notice).toMatchObject({session_id:null,title:'演示 · 通知验收灯 · 操作已核验'});
+    expect((await call('GET','/device-commands/'+notice.deviceCommandId)).body).toMatchObject({id:command.id,state:'succeeded'});
+    expect((await call('GET','/device-commands/00000000-0000-4000-8000-000000000000')).status).toBe(404);
+    expect((await built.server.inject({url:'/api/v2/device-commands/'+command.id})).statusCode).toBe(401);
+    for(const other of notifications.filter((row:any)=>row.session_id))expect(other.deviceCommandId).toBe(null);
+  });
+
 });
 describe('source chunking',()=>{it('retains the complete tail of a long paragraph',()=>{const text='a'.repeat(5000)+'boundary';const parts=chunks(text);expect(parts.at(-1)?.content.endsWith('boundary')).toBe(true);for(const part of parts)expect(text.slice(part.start,part.end)).toBe(part.content);});});

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Tx, Row } from '../../storage/src/index.js';
 
 export class AppError extends Error { constructor(message: string, readonly status = 400, readonly code = 'invalid_request') { super(message); } }
+export type CommandBoundary = <T>(tx: Tx, key: string, operation: string, input: unknown, work: () => Promise<T>) => Promise<T>;
 export const id = () => randomUUID();
 export function canonical(value: unknown): string { if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']'; if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonical((value as Row)[k])).join(',') + '}'; return JSON.stringify(value) ?? 'null'; }
 export const digest = (value: unknown) => createHash('sha256').update(typeof value === 'string' ? value : canonical(value)).digest('hex');
@@ -21,5 +22,6 @@ export async function once<T>(tx: Tx, key: string, operation: string, input: unk
 }
 export function goalDTO(r: Row) { return { id:r.id, title:r.title, outcome:r.outcome, status:r.status, revision:r.revision, sourceIds:r.source_ids, intervals:r.intervals, reviewStage:r.review_stage, nextReview:r.next_review ? iso(r.next_review) : null, createdAt:iso(r.created_at), updatedAt:iso(r.updated_at) }; }
 export function sessionDTO(r: Row) { return { id:r.id, goalId:r.goal_id, title:r.title, kind:r.kind, prompt:r.prompt, state:r.state, revision:r.revision, currentRunId:r.current_run_id, content:r.content, citations:r.citations, error:r.error, recipient:r.recipient, createdAt:iso(r.created_at), updatedAt:iso(r.updated_at) }; }
+export function sessionSummaryDTO(r: Row) { return {id:r.id,goalId:r.goal_id,title:r.title,kind:r.kind,state:r.state,promptPreview:r.prompt_preview,errorPreview:r.error_preview,createdAt:iso(r.created_at),updatedAt:iso(r.updated_at)}; }
 export function attemptDTO(r: Row) { return { id:r.id, sessionId:r.session_id, answer:r.answer, verdict:r.verdict, feedback:r.feedback, evidence:r.evidence, source:r.source, createdAt:iso(r.created_at) }; }
 export function planDTO(r: Row | undefined) { return r ? { id:r.id, goalId:r.goal_id, version:r.version, steps:r.steps, rationale:r.rationale, createdAt:iso(r.created_at) } : null; }

@@ -1,0 +1,36 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Types, build and isolated PostgreSQL tests
+        run: pnpm verify
+      - name: Desktop and phone interactions
+        run: pnpm exec playwright test tests/e2e/assistant.spec.ts tests/e2e/devices.spec.ts tests/e2e/sources.spec.ts tests/e2e/source-catalog.spec.ts
+      - name: API, Worker and complete backup restore
+        run: pnpm verify:e2e

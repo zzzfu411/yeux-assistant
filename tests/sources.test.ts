@@ -49,9 +49,9 @@ describe.skipIf(!url)('versioned original-source metadata with PostgreSQL',()=>{
     const goalBefore=(await store.one("SELECT * FROM app.goals WHERE id='legacy-goal'"))!;
     await store.migrate();await store.migrate();
     const after=(await store.one("SELECT * FROM app.source_versions WHERE source_id='legacy-source'"))!;
-    expect(after).toEqual({...before,metadata:null});
+    expect(after).toEqual({...before,metadata:null,title:'原始讲义'});
     expect(await store.one("SELECT * FROM app.goals WHERE id='legacy-goal'")).toEqual(goalBefore);
-    expect((await store.rows('SELECT version FROM app.migrations ORDER BY version')).map(row=>row.version)).toEqual([1,2]);
+    expect((await store.rows('SELECT version FROM app.migrations ORDER BY version')).map(row=>row.version)).toEqual([1,2,3,4,5,6,7,8]);
     expect((await app.source('legacy-source')).metadata).toBeNull();
   });
   it('versions metadata independently and returns the requested historic metadata',async()=>{
@@ -61,7 +61,7 @@ describe.skipIf(!url)('versioned original-source metadata with PostgreSQL',()=>{
     expect(await put({id:'versioned',title:'课程讲义',content:text,metadata:second})).toEqual({id:'versioned',version:2});
     expect((await app.source('versioned',1)).metadata).toEqual(first);
     expect((await app.source('versioned',2)).metadata).toEqual(second);
-    expect((await app.sources())[0]).toMatchObject({id:'versioned',version:2,metadata:second});
+    expect((await app.sources())[0]).toMatchObject({id:'versioned',version:2,metadata:{course:second.course,courseName:second.courseName,format:second.format}});
     const versions=await store.rows("SELECT version,digest,content,metadata FROM app.source_versions WHERE source_id='versioned' ORDER BY version");
     expect(versions).toHaveLength(2);expect(versions[0]!.digest).toBe(versions[1]!.digest);
     expect(versions[0]!.content).toBe(text);expect(versions[0]!.metadata).toEqual(first);
@@ -122,6 +122,35 @@ describe.skipIf(!url)('versioned original-source metadata with PostgreSQL',()=>{
       expect(detail.statusCode).toBe(200);expect(detail.json()).toMatchObject({version:1,content:'compatibilityneedle 原始内容',metadata:null});
       const searched=await built.server.inject({url:'/api/v2/search?q=compatibilityneedle',headers});
       expect(searched.statusCode).toBe(200);expect(searched.json()[0]).toMatchObject({sourceId:identity,version:1});expect(Citation.safeParse(searched.json()[0]).success).toBe(true);
+    } finally {await built.server.close();}
+  });
+  it('supports authenticated source maintenance, duplicate receipts and historic API links',async()=>{
+    const built=await buildServer({url,folder,assets:false});
+    try {
+      const headers={authorization:'Bearer '+(await readFile(join(folder,'access-token'),'utf8')).trim()};
+      const post=(key:string,payload:unknown)=>built.server.inject({method:'POST',url:'/api/v2/sources',headers:{...headers,'idempotency-key':key},payload});
+      const first=await post('api-first',{title:'API 原标题',content:'apineedle 原始材料'});expect(first.statusCode).toBe(200);
+      const identity=first.json().id,base='/api/v2/sources/'+identity;
+      const duplicate=await post('api-duplicate',{title:'另一标题',content:'apineedle 原始材料'});
+      expect(duplicate.json()).toMatchObject({id:identity,duplicate:true,version:1});
+      expect((await post('api-duplicate',{title:'另一标题',content:'apineedle 原始材料'})).json()).toEqual(duplicate.json());
+      expect((await built.server.inject({method:'PATCH',url:base,payload:{revision:1,title:'未经授权'}})).statusCode).toBe(401);
+      const patch=await built.server.inject({method:'PATCH',url:base,headers:{...headers,'idempotency-key':'api-update'},payload:{revision:1,title:'API 新标题',content:'apineedle 新材料'}});
+      expect(patch.statusCode).toBe(200);expect(patch.json()).toMatchObject({version:2,revision:2});
+      const old=await built.server.inject({url:base+'?version=1',headers});
+      expect(old.json()).toMatchObject({title:'API 原标题',content:'apineedle 原始材料',current_version:2,editableText:true});
+      expect((await built.server.inject({method:'PATCH',url:base,headers:{...headers,'idempotency-key':'api-stale'},payload:{revision:1,title:'过期编辑'}})).statusCode).toBe(409);
+      const archived=await built.server.inject({method:'PATCH',url:base+'/archive',headers:{...headers,'idempotency-key':'api-archive'},payload:{revision:2,archived:true}});
+      expect(archived.statusCode).toBe(200);expect(archived.json().revision).toBe(3);
+      expect((await built.server.inject({url:'/api/v2/sources',headers})).json()).toEqual([]);
+      expect((await built.server.inject({url:'/api/v2/sources?archived=false',headers})).json()).toEqual([]);
+      expect((await built.server.inject({url:'/api/v2/sources?archived=true',headers})).json()).toHaveLength(1);
+      expect((await built.server.inject({url:'/api/v2/sources?archived=yes',headers})).statusCode).toBe(400);
+      expect((await built.server.inject({url:'/api/v2/search?q=apineedle',headers})).json()).toEqual([]);
+      const restored=await built.server.inject({method:'PATCH',url:base+'/archive',headers:{...headers,'idempotency-key':'api-restore'},payload:{revision:3,archived:false}});
+      expect(restored.statusCode).toBe(200);expect(restored.json()).toMatchObject({revision:4,archivedAt:null});
+      expect((await built.server.inject({url:'/api/v2/search?q=apineedle',headers})).json()[0]).toMatchObject({sourceId:identity,version:2,title:'API 新标题'});
+      expect((await built.server.inject({url:base+'?version=99',headers})).statusCode).toBe(404);
     } finally {await built.server.close();}
   });
 });

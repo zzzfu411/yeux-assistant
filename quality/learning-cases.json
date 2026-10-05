@@ -1,0 +1,171 @@
+[
+  {
+    "id": "gse-correct",
+    "course": "GSE",
+    "kind": "correct",
+    "material": "可验收的需求应说明使用条件、操作和可观察的结果。",
+    "question": "把‘保存要快’改成一个可检验的需求。",
+    "answer": "在本地已登录且网络正常时，点击保存后两秒内显示保存成功。",
+    "expected": "pass",
+    "proposed": "pass",
+    "rubric": "需要条件、动作、可观察结果与阈值，不能把阈值说成课程规定。"
+  },
+  {
+    "id": "gse-wrong",
+    "course": "GSE",
+    "kind": "wrong",
+    "material": "生成测试代码不等于运行测试。通过结论需要对应版本的实际运行结果。",
+    "question": "模型写好了测试并说全部通过，可以据此报告验收完成吗？",
+    "answer": "可以，模型能预测结果，不必真的执行。",
+    "expected": "retry",
+    "proposed": "retry",
+    "rubric": "指出生成与执行的区别，并要求可复现运行记录。"
+  },
+  {
+    "id": "gse-partial",
+    "course": "GSE",
+    "kind": "partial",
+    "material": "需求验收要同时覆盖成功路径和需求中明确的失败情形。",
+    "question": "登录需求包含正确密码登录与错误密码拒绝，你的验收覆盖哪些行为？",
+    "answer": "我会检查正确密码能登录。",
+    "expected": "unclear",
+    "proposed": "unclear",
+    "rubric": "回答只覆盖成功路径，应指出缺少错误密码情形，不能宣布完全掌握。"
+  },
+  {
+    "id": "gse-generic",
+    "course": "GSE",
+    "kind": "generic",
+    "material": "需求应当描述可观察行为，而不是只写抽象愿望。",
+    "question": "为资料上传失败写一条可观察的验收标准。",
+    "answer": "明白了，我完全懂了。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "fault": "fabricated_answer",
+    "rubric": "套话没有验收行为；守卫夹具故意伪造回答摘录，必须拦住。"
+  },
+  {
+    "id": "gse-no-source",
+    "course": "GSE",
+    "kind": "no_source",
+    "material": "",
+    "question": "本课程最新一次实验规定的全部提交文件是什么？",
+    "answer": "我认为只提交一个链接。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "rubric": "没有题面，不能编造当前课程要求或给出通过判定。"
+  },
+  {
+    "id": "db-correct",
+    "course": "数据库",
+    "kind": "correct",
+    "material": "事务原子性要求同一事务的更新要么全部生效，要么全部不生效。",
+    "question": "转账扣款完成但入账失败，原子性要求什么？",
+    "answer": "应回滚该事务的扣款，使这次转账的更新全部不生效。",
+    "expected": "pass",
+    "proposed": "pass",
+    "rubric": "必须指出同一事务回滚扣款，不能只重试入账后声称原子性。"
+  },
+  {
+    "id": "db-wrong",
+    "course": "数据库",
+    "kind": "wrong",
+    "material": "本案例的读已提交隔离级别不读取未提交数据，但两次查询仍可能出现幻读。",
+    "question": "读已提交是否在本案例中排除了幻读？",
+    "answer": "排除了，禁止脏读就等于禁止幻读。",
+    "expected": "retry",
+    "proposed": "retry",
+    "rubric": "区分脏读与幻读；错误复习需要返回练习状态。"
+  },
+  {
+    "id": "db-partial",
+    "course": "数据库",
+    "kind": "partial",
+    "material": "本案例中WHERE仅保留TRUE；与NULL的普通等值比较得到UNKNOWN，应使用IS NULL判断空值。",
+    "question": "解释为什么WHERE x = NULL不适合筛选空值，并给出写法。",
+    "answer": "应该写x IS NULL。",
+    "expected": "unclear",
+    "proposed": "unclear",
+    "rubric": "写法正确但没有解释UNKNOWN与WHERE筛选规则，需补充解释。"
+  },
+  {
+    "id": "db-generic",
+    "course": "数据库",
+    "kind": "generic",
+    "material": "事务隔离要讨论并发执行之间可观察的影响。",
+    "question": "用一个并发读写例子解释不可重复读。",
+    "answer": "数据库保证安全，反正都一样。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "fault": "no_anchors",
+    "rubric": "缺少并发场景；非空自由文本evidence不构成可核对证据。"
+  },
+  {
+    "id": "db-no-source",
+    "course": "数据库",
+    "kind": "no_source",
+    "material": "",
+    "question": "给定的未知数据库版本在默认配置下使用哪一种隔离级别？",
+    "answer": "肯定是可串行化。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "rubric": "产品、版本和配置都未给出，需说明不足而不是猜测。"
+  },
+  {
+    "id": "se-correct",
+    "course": "软件工程",
+    "kind": "correct",
+    "material": "测试用例应包含前置条件、输入或动作，以及能比较的预期结果。",
+    "question": "为‘空标题不能保存笔记’写一个测试用例。",
+    "answer": "打开新建笔记表单，标题留空并点击保存，预期不创建笔记并显示标题必填。",
+    "expected": "pass",
+    "proposed": "pass",
+    "rubric": "具备条件、操作和可比较的拒绝保存结果；不可只描述实现细节。"
+  },
+  {
+    "id": "se-wrong",
+    "course": "软件工程",
+    "kind": "wrong",
+    "material": "代码覆盖率反映测试执行过的代码范围，不证明程序不存在缺陷。",
+    "question": "100%覆盖率能否证明没有缺陷？",
+    "answer": "可以，代码每一行执行过就说明完全正确。",
+    "expected": "retry",
+    "proposed": "retry",
+    "rubric": "必须指出执行覆盖与断言充分性、输入空间之间的差别。"
+  },
+  {
+    "id": "se-partial",
+    "course": "软件工程",
+    "kind": "partial",
+    "material": "本案例采用需求追踪表，连接需求、对应测试以及测试结果，以检查遗漏。",
+    "question": "需求追踪表应连接哪些信息，用来做什么？",
+    "answer": "我先把需求列出来。",
+    "expected": "unclear",
+    "proposed": "unclear",
+    "rubric": "回答已有需求列表，但尚未说明对应测试、测试结果及检查遗漏的用途；没有声称仅列需求已经足够，应要求补充而非认定明确错误。"
+  },
+  {
+    "id": "se-generic",
+    "course": "软件工程",
+    "kind": "generic",
+    "material": "需求变化后应重新核对受影响的测试与验收条件。",
+    "question": "界面增加必填字段后，原测试需要核对什么？",
+    "answer": "已经理解，照着做即可。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "fault": "wrong_version",
+    "rubric": "套话没有具体核对项；守卫夹具给错版本引用，必须拦住。"
+  },
+  {
+    "id": "se-no-source",
+    "course": "软件工程",
+    "kind": "no_source",
+    "material": "",
+    "question": "判断这次修改是否满足全部项目需求。",
+    "answer": "看上去没问题，应该都满足。",
+    "expected": "unclear",
+    "proposed": "pass",
+    "exerciseComplete": false,
+    "rubric": "缺少完整需求和修改上下文，不得自动通过；保留用户回答。"
+  }
+]

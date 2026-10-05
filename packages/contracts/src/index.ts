@@ -33,7 +33,6 @@ export const CreateGoal = z.object({ title: z.string().trim().min(1).max(200), o
 export const UpdateGoal = z.object({ revision: Version, status: GoalStatus.optional(), title: z.string().trim().min(1).max(200).optional(), outcome: z.string().max(4000).optional(), sourceIds: z.array(Id).max(100).optional(), intervals: z.array(z.number().int().min(3600).max(31536000)).min(1).max(10).optional() }).strict();
 export const Feedback = z.object({ revision: Revision, answer: Text, selfReport: z.enum(['understood', 'need_practice']).optional() }).strict();
 export const CreateSession = z.object({ title: z.string().max(200).default(''), prompt: Text, kind: z.enum(['study', 'work', 'manage']).default('study') }).strict();
-export const SourceInput = z.object({ title: z.string().trim().min(1).max(200), content: z.string().min(1).max(2000000) }).strict();
 export const MemoryInput = z.object({ key: z.string().min(1).max(100), content: Text, scope: z.enum(['preference', 'fact', 'correction', 'all', 'study', 'work', 'manage']).default('preference'), confirmed: z.boolean().default(true), enabled: z.boolean().default(true), revision: z.number().int().nonnegative() }).strict();
 export const ScheduleInput = z.object({ title: z.string().min(1).max(200), prompt: Text, kind: z.enum(['study', 'work', 'manage']).default('study'), intervalSeconds: z.number().int().min(0).max(31536000), nextRun: z.iso.datetime(), enabled: z.boolean().default(true), revision: z.number().int().nonnegative().default(0) }).strict();
 export const DraftInput = z.object({ revision: Revision, content: z.string().max(100000), recipient: z.string().max(320).default('') }).strict();
@@ -42,9 +41,17 @@ export const ApprovalDecision = z.object({ digest: z.string().length(64), approv
 export const ApprovalResolution = z.object({ sent: z.boolean(), note: z.string().trim().min(1).max(2000) }).strict();
 export const ModelPlan = z.object({ steps: z.array(z.object({ title: z.string().min(1).max(200), objective: z.string().min(1).max(2000) })).min(1).max(6), rationale: z.string().max(2000) });
 export const ModelLesson = z.object({ content: z.string().min(1).max(12000), sourceIds: z.array(z.string()).max(8) });
-export const ModelAssessment = z.object({ verdict: z.enum(['pass', 'retry', 'unclear']), feedback: z.string().min(1).max(4000), evidence: z.string().max(4000) });
+export { ModelAssessment, AssessmentCitation } from './assessment.js';
 
 export type GoalDetail = { goal: Goal; plan: PlanRevision | null; sessions: LearningSession[]; attempts: Attempt[] };
 export type SessionDetail = { session: LearningSession; attempts: Attempt[]; artifacts: Array<{id: string; content: string; kind: string; provenance: string; createdAt: string}>; approvals: Array<{id: string; state: string; digest: string; payload: Record<string, unknown>; error: string}>; legacy: Record<string, unknown> | null };
-export type SourceSummary = { id: string; title: string; version: number; digest: string; updatedAt: string; metadata?: SourceMetadata | null };
+export type SourceSummary = { id: string; title: string; version: number; digest: string; updatedAt: string; metadata?: Pick<SourceMetadata,'course'|'courseName'|'format'> | null; revision?:number; archivedAt?:string|null; managed?:boolean };
+export type SourceDetail = {id:string;title:string;version:number;current_version:number;content:string;digest:string;metadata?:SourceMetadata|null;revision:number;archivedAt:string|null;managed:boolean;editableText:boolean;versions:Array<{version:number;title:string;createdAt:string}>};
 export type Today = { goals: Goal[]; sessions: LearningSession[]; unread: number; modelConfigured: boolean; workerOnline: boolean };
+
+export const LoginInput = z.object({ username: z.string().trim().min(1).max(80), password: z.string().min(1).max(1024) }).strict();
+
+export * from './devices.js';
+export * from './source-inputs.js';
+
+export * from './pagination.js';

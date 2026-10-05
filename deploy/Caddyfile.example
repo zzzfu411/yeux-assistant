@@ -1,0 +1,8 @@
+# Run Caddy on the VPS host. Replace the reserved example domain before use.
+# ASSISTANT_PUBLIC_ORIGIN must be https://assistant.example.com in runtime.env.
+assistant.example.com {
+	reverse_proxy 127.0.0.1:8765 {
+		# Deliver browser SSE events immediately; MCP requests return JSON.
+		flush_interval -1
+	}
+}

@@ -100,8 +100,8 @@ export async function importCourses(store: Store | undefined, bundlePath: string
     const results: Array<{ key: string; sourceId: string; version: number; action: string }> = [];
     for (const document of bundle.documents) {
       const sourceId = 'course-' + digest(document.key).slice(0, 32);
-      const prior = await tx.one('SELECT s.version,s.digest,v.metadata FROM app.sources s JOIN app.source_versions v ON v.source_id=s.id AND v.version=s.version WHERE s.id=$1', [sourceId]);
-      const same = prior?.digest === digest(document.content) && canonical(prior.metadata) === canonical(document.metadata);
+      const prior = await tx.one('SELECT s.version,s.title,s.digest,v.metadata FROM app.sources s JOIN app.source_versions v ON v.source_id=s.id AND v.version=s.version WHERE s.id=$1', [sourceId]);
+      const same = prior?.title === document.title && prior?.digest === digest(document.content) && canonical(prior.metadata) === canonical(document.metadata);
       const result = await putSource(tx, { id: sourceId, title: document.title, content: document.content, metadata: document.metadata });
       results.push({ key: document.key, sourceId, version: result.version, action: !prior ? 'added' : same ? 'unchanged' : 'updated' });
     }

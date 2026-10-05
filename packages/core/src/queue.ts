@@ -8,6 +8,7 @@ export async function createBoss(url=process.env.DATABASE_URL!, schedules=false)
   await boss.start();
   await boss.createQueue(LEARNING_QUEUE,{retryLimit:2,retryDelay:5,retryBackoff:true,expireInSeconds:210});
   await boss.createQueue('maintenance',{policy:'exclusive',retryLimit:1,expireInSeconds:50});
+  await boss.createQueue('device-execute',{retryLimit:0,expireInSeconds:30});
   await boss.createQueue('mail-send',{retryLimit:0,expireInSeconds:90});
   return boss;
 }

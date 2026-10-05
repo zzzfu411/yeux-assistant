@@ -21,7 +21,11 @@ try {
   for(const database of ['assistant_api_test','assistant_runtime_test','assistant_migration_test'])await pool.query('CREATE DATABASE '+database);
   await pool.end();pool=undefined;
   const env={...process.env,API_TEST_DATABASE_URL:base+'assistant_api_test',RUNTIME_TEST_DATABASE_URL:base+'assistant_runtime_test',MIGRATION_TEST_DATABASE_URL:base+'assistant_migration_test'};
-  run('pnpm',['typecheck'],env);run('pnpm',['build'],env);run('pnpm',['exec','vitest','run'],env);
-  console.log('全部类型、构建与 PostgreSQL 回归通过。测试容器将移除；真实数据库未被使用。');
+  run('pnpm',['check:architecture'],env);run('pnpm',['typecheck'],env);run('pnpm',['build'],env);run('pnpm',['exec','vitest','run'],env);
+  console.log('类型、构建与 PostgreSQL 回归通过，正在清理测试容器。');
 } catch(error){console.error(error.message);process.exitCode=1;}
-finally{await pool?.end();if(started)spawnSync('docker',['rm','-f',name],{stdio:'ignore'});}
+finally{
+  try { await pool?.end(); } catch { process.exitCode=1;console.error('测试数据库连接未能正常关闭。'); }
+  if(started){const removed=spawnSync('docker',['rm','-f',name],{encoding:'utf8'});if(removed.error||removed.status!==0){process.exitCode=1;console.error('测试容器清理失败，请核对 '+name+'。');}}
+  if(!process.exitCode)console.log('全部检查通过，测试容器已移除；真实数据库未被使用。');
+}

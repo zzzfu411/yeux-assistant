@@ -7,7 +7,13 @@ import { resolve } from 'node:path';
 // Registered, reviewed migrations only; never resolve database or user-supplied paths.
 const migrations = [
   { version: 1, file: 'packages/storage/migrations/0001.sql' },
-  { version: 2, file: 'packages/storage/migrations/0002.sql' }
+  { version: 2, file: 'packages/storage/migrations/0002.sql' },
+  { version: 3, file: 'packages/storage/migrations/0003.sql' },
+  { version: 4, file: 'packages/storage/migrations/0004.sql' },
+  { version: 5, file: 'packages/storage/migrations/0005.sql' },
+  { version: 6, file: 'packages/storage/migrations/0006.sql' },
+  { version: 7, file: 'packages/storage/migrations/0007.sql' },
+  { version: 8, file: 'packages/storage/migrations/0008.sql' }
 ] as const;
 
 export type Row = Record<string, any>;

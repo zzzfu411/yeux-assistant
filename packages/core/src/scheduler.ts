@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PgBoss } from 'pg-boss';
 import type { Store } from '../../storage/src/index.js';
-import { createSession } from './application.js';
+import { createSession } from './sessions.js';
 import { AppError, event, notify } from './common.js';
 
 export function nextScheduledTime(due: Date, intervalSeconds: number, now = new Date()) {

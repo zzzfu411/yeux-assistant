@@ -8,8 +8,6 @@ export const storage={
   get(key:string){try{return sessionStorage.getItem(prefix+key);}catch{return null;}},
   set(key:string,value:string){try{sessionStorage.setItem(prefix+key,value);}catch{/* Storage may be disabled; the current page still works. */}},
   remove(key:string){try{sessionStorage.removeItem(prefix+key);}catch{}},
-  legacyToken(){try{return sessionStorage.getItem('gse-token')||'';}catch{return '';}},
-  forgetLegacy(){try{sessionStorage.removeItem('gse-token');}catch{}},
   clear(){try{for(const key of Object.keys(sessionStorage))if(key.startsWith(prefix)||key==='gse-token')sessionStorage.removeItem(key);}catch{}}
 };
 function nonce(){const bytes=crypto.getRandomValues(new Uint8Array(16));return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');}
@@ -30,7 +28,7 @@ export class ApiClient {
     for(const signal of signals){if(signal.aborted)controller.abort();else signal.addEventListener('abort',abort,{once:true});}
     const timeout=setTimeout(abort,20_000);
     try{
-      const response=await fetch('/api/v2'+path,{method,body:encoded,signal:controller.signal,headers:{Authorization:'Bearer '+this.token,...(encoded!==undefined?{'Content-Type':'application/json'}:{}),...(key?{'Idempotency-Key':key}:{})}});
+      const response=await fetch('/api/v2'+path,{method,body:encoded,signal:controller.signal,headers:{...(this.token?{Authorization:'Bearer '+this.token}:{}),...(encoded!==undefined?{'Content-Type':'application/json'}:{}),...(key?{'Idempotency-Key':key}:{})}});
       if(this.lifetime.signal.aborted)throw new DOMException('已退出','AbortError');
       if(!response.ok){const error=await response.json().catch(()=>null);if(response.status<500)storage.remove(signature);throw new ApiError(error?.error?.message||'请求未完成，请重试。',response.status,error?.error?.code||'http');}
       const value=options.blob?await response.blob():options.raw?await response.text():await response.json();
@@ -49,7 +47,7 @@ export class ApiClient {
 }
 export const ApiContext=createContext<ApiClient|null>(null);
 export function useApi(){const api=useContext(ApiContext);if(!api)throw new Error('No API client');return api;}
-export function useData<T>(path:string){const api=useApi();return useQuery({queryKey:[path],queryFn:({signal})=>api.get<T>(path,signal),retry:1,staleTime:15_000});}
+export function useData<T>(path:string,options:{refetchInterval?:number}={}){const api=useApi();return useQuery({queryKey:[path],queryFn:({signal})=>api.get<T>(path,signal),retry:1,staleTime:15_000,...options});}
 export function useDraft<T>(key:string,initial:T){
   const [value,update]=useState<T>(()=>{try{const saved=storage.get('draft.'+key);return saved?JSON.parse(saved) as T:initial;}catch{return initial;}});
   const current=useRef(value);current.current=value;
@@ -75,7 +73,19 @@ export function useEvents(api:ApiClient,client:QueryClient,onExpired:()=>void){
   useEffect(()=>{
     const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;let retryTimer:ReturnType<typeof setTimeout>|undefined;
     let cursor=storage.get('cursor')||'0';
-    const invalidate=()=>{if(!timer)timer=setTimeout(()=>{timer=undefined;void client.invalidateQueries();},150);};
+    let refreshSources=false;
+    const invalidate=(kind?:string)=>{
+      refreshSources ||= kind===undefined||kind==='stream.reset'||kind==='legacy.imported'||kind.startsWith('source.');
+      if(!timer)timer=setTimeout(()=>{
+        timer=undefined;const includeSources=refreshSources;refreshSources=false;
+        // Learning progress cannot change the source catalogue; a source event or
+        // reconnect or legacy import still refreshes every active query, including version details.
+        void client.invalidateQueries({predicate:query=>{
+          const path=query.queryKey[0];
+          return includeSources||typeof path!=='string'||!/^\/(?:sources(?:[/?]|$)|search(?:[?]|$))/.test(path);
+        }});
+      },150);
+    };
     const wait=()=>new Promise<void>(resolve=>{const finish=()=>{clearTimeout(retryTimer);controller.signal.removeEventListener('abort',finish);resolve();};retryTimer=setTimeout(finish,2500);controller.signal.addEventListener('abort',finish,{once:true});});
     async function connect(){
       while(!controller.signal.aborted){
@@ -83,13 +93,13 @@ export function useEvents(api:ApiClient,client:QueryClient,onExpired:()=>void){
         const abort=()=>connection.abort();controller.signal.addEventListener('abort',abort,{once:true});
         const heartbeat=()=>{clearTimeout(watchdog);watchdog=setTimeout(abort,45_000);};heartbeat();
         try{
-          const response=await fetch('/api/v2/events?after='+encodeURIComponent(cursor),{signal:connection.signal,headers:{Authorization:'Bearer '+api.token,Accept:'text/event-stream'}});
+          const response=await fetch('/api/v2/events?after='+encodeURIComponent(cursor),{signal:connection.signal,headers:{...(api.token?{Authorization:'Bearer '+api.token}:{}),Accept:'text/event-stream'}});
           if(response.status===401){expired.current();return;}
           if(!response.ok||!response.body)throw new Error('stream unavailable');
           setConnected(true);const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
           while(!controller.signal.aborted){const {done,value}=await reader.read();if(done)break;heartbeat();buffer+=decoder.decode(value,{stream:true});buffer=buffer.replace(/\r\n/g,'\n');
             let boundary:number;while((boundary=buffer.indexOf('\n\n'))>=0){const frame=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);const data=frame.split('\n').filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\n');if(!data)continue;
-              try{const event=RunEvent.parse(JSON.parse(data));cursor=event.id;storage.set('cursor',cursor);invalidate();}catch{/* Ignore heartbeat and unknown frames. */}}
+              try{const event=RunEvent.parse(JSON.parse(data));cursor=event.id;storage.set('cursor',cursor);invalidate(event.kind);}catch{/* Ignore heartbeat and unknown frames. */}}
           }
         }catch{/* The next connection resumes from the last durable event. */}
         finally{clearTimeout(watchdog!);controller.signal.removeEventListener('abort',abort);connection.abort();}
@@ -98,4 +108,13 @@ export function useEvents(api:ApiClient,client:QueryClient,onExpired:()=>void){
     }
     void connect();return()=>{controller.abort();clearTimeout(timer);clearTimeout(retryTimer);};
   },[api,client]);return connected;
+}
+
+export async function authRequest(path:string,body?:unknown){
+  try{
+    const response=await fetch('/api/v2/auth/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(15000)});
+    const result=await response.json();
+    if(!response.ok)throw new ApiError(result?.error?.message||'登录请求未完成。',response.status,result?.error?.code||'auth');
+    return result as {username:string};
+  }catch(error){if(error instanceof ApiError)throw error;throw new ApiError('暂时无法连接助手，请确认电脑上的服务已启动。');}
 }

@@ -1,0 +1,59 @@
+# Separate server instance: never merges the Mac's private data or published ports.
+name: yeux-assitant-server
+x-app: &app
+  build:
+    context: ${ASSISTANT_SOURCE_DIR:?set the project directory}
+    dockerfile: Dockerfile
+  image: yeux-assitant:server
+  init: true
+  user: "${ASSISTANT_UID:?set the data owner}:${ASSISTANT_GID:?set the data group}"
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=128m
+  environment:
+    DATABASE_URL: postgres://assistant:${POSTGRES_PASSWORD:?initialize the server instance}@db:5432/${ASSISTANT_DATABASE:-assistant}
+    ASSISTANT_DATA: /app/private
+    ASSISTANT_PUBLIC_ORIGIN: ${ASSISTANT_PUBLIC_ORIGIN:?configure the server origin}
+    HOST: 0.0.0.0
+    PORT: 8765
+  volumes:
+    - ${ASSISTANT_DATA_DIR:?set an absolute server data directory}:/app/private
+  depends_on:
+    db:
+      condition: service_healthy
+services:
+  db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?initialize the server instance}
+      POSTGRES_DB: ${ASSISTANT_DATABASE:-assistant}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U assistant -d ${ASSISTANT_DATABASE:-assistant}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  api:
+    <<: *app
+    # A host HTTPS reverse proxy forwards here; the app never opens a public listener.
+    ports:
+      - "127.0.0.1:${ASSISTANT_PORT:-8765}:8765"
+    command: [node, dist/apps/api/src/main.js]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8765/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 20s
+  worker:
+    <<: *app
+    stop_grace_period: 120s
+    command: [node, dist/apps/worker/src/main.js]
+volumes:
+  postgres-data:

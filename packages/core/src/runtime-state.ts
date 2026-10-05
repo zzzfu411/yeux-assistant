@@ -1,6 +1,6 @@
 import type { Store, Tx, Row } from '../../storage/src/index.js';
 import { AppError, event, notify } from './common.js';
-import { lockSession } from './application.js';
+import { lockSession } from './sessions.js';
 
 export class StaleRun extends Error { constructor() { super('执行已取消或被新的操作替代。'); } }
 export class RuntimeLimit extends AppError { constructor(message: string) { super(message, 409, 'runtime_limit'); } }

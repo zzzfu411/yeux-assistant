@@ -1,9 +1,10 @@
 import { readFile, readdir, stat, writeFile, realpath } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
-import { AppError, canonical, digest, id, event, notify } from './common.js';
+import { AppError, canonical, digest, id, event, notify, iso } from './common.js';
 import type { Store, Tx, Row } from '../../storage/src/index.js';
 import { SourceMetadata, type Citation } from '../../contracts/src/index.js';
+import type { SourceImportResult } from '../../contracts/src/source-inputs.js';
 
 export function chunks(content: string, size = 1800, overlap = 200) {
   if(size<2 || overlap<0 || overlap>=size-1)throw new Error('Invalid chunk size/overlap');
@@ -24,9 +25,12 @@ export function terms(query: string) {
   }
   return [...new Set(result)].slice(-48);
 }
-export async function putSource(tx: Tx, input: {id:string;title:string;content:string;path?:string;metadata?:SourceMetadata|null}) {
-  if (Buffer.byteLength(input.content)>2_000_000) throw new AppError('资料超过 2 MB，请拆成较小的文本。');
-  if(input.content.includes('\0') || Buffer.from(input.content,'utf8').toString('utf8')!==input.content)throw new AppError('资料包含无法保存的字符，请使用有效的 UTF-8 文本。');
+export function validateSourceText(content: string) {
+  if (Buffer.byteLength(content)>2_000_000) throw new AppError('资料超过 2 MB，请拆成较小的文本。');
+  if(content.includes('\0') || Buffer.from(content,'utf8').toString('utf8')!==content)throw new AppError('资料包含无法保存的字符，请使用有效的 UTF-8 文本。');
+}
+export async function putSource(tx: Tx, input: {id:string;title:string;content:string;path?:string;metadata?:SourceMetadata|null;managed?:boolean}) {
+  validateSourceText(input.content);
   await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-id:'+input.id]);
   const hash=digest(input.content);
   const prior=await tx.one('SELECT * FROM app.sources WHERE id=$1 FOR UPDATE',[input.id]);
@@ -34,10 +38,16 @@ export async function putSource(tx: Tx, input: {id:string;title:string;content:s
   // A plain scanner may observe the same extracted file. Keep its metadata only while its text matches.
   const metadata=input.metadata===undefined ? (prior?.digest===hash ? oldMetadata : null) : input.metadata===null ? null : SourceMetadata.parse(input.metadata);
   if(metadata?.pages.some((page:SourceMetadata['pages'][number])=>page.end>input.content.length))throw new AppError('提取页码范围超出了资料正文，尚未保存。');
-  if (prior?.digest===hash && canonical(oldMetadata)===canonical(metadata)) return {id:input.id,version:prior.version};
+  if (prior?.digest===hash && prior.title===input.title && canonical(oldMetadata)===canonical(metadata)) {
+    if(input.managed && !prior.managed) {
+      await tx.exec('UPDATE app.sources SET managed=true,revision=revision+1,updated_at=now() WHERE id=$1',[input.id]);
+      await event(tx,'source.updated',input.id,{version:prior.version});
+    }
+    return {id:input.id,version:prior.version};
+  }
   const version=(prior?.version||0)+1;
-  await tx.exec('INSERT INTO app.sources(id,title,path,version,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET title=excluded.title,version=excluded.version,digest=excluded.digest,updated_at=now()', [input.id,input.title,input.path||null,version,hash]);
-  await tx.exec('INSERT INTO app.source_versions(source_id,version,content,digest,metadata) VALUES($1,$2,$3,$4,$5)',[input.id,version,input.content,hash,metadata===null?null:JSON.stringify(metadata)]);
+  await tx.exec('INSERT INTO app.sources(id,title,path,version,digest,managed) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET title=excluded.title,version=excluded.version,digest=excluded.digest,managed=app.sources.managed OR excluded.managed,revision=app.sources.revision+1,updated_at=now()', [input.id,input.title,input.path||null,version,hash,input.managed??false]);
+  await tx.exec('INSERT INTO app.source_versions(source_id,version,title,content,digest,metadata) VALUES($1,$2,$3,$4,$5,$6)',[input.id,version,input.title,input.content,hash,metadata===null?null:JSON.stringify(metadata)]);
   for (const piece of chunks(input.content)) await tx.exec('INSERT INTO app.chunks(id,source_id,version,start_offset,end_offset,content) VALUES($1,$2,$3,$4,$5,$6)',[id(),input.id,version,piece.start,piece.end,piece.content]);
   await event(tx,'source.updated',input.id,{version}); return {id:input.id,version};
 }
@@ -57,9 +67,9 @@ export function citationFromRow(row:Row):Citation {
 export async function retrieve(tx: Tx, query: string, sourceIds: string[] = [], limit=6, course?:string): Promise<Citation[]> {
   const words=terms(query); if (!words.length) return [];
   const patterns=words.map(t=>'%'+t.replace(/[\\%_]/g,'\\$&')+'%');
-  const rows=await tx.rows(`SELECT c.*,s.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
+  const rows=await tx.rows(`SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
     JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
-    WHERE (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
+    WHERE s.archived_at IS NULL AND (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
     AND ($4::text IS NULL OR ($4='unclassified' AND coalesce(v.metadata->>'course','')='') OR ($4<>'unclassified' AND v.metadata->>'course'=$4))
     ORDER BY word_similarity($3,c.content) DESC,c.id LIMIT 80`,[sourceIds,patterns,query.slice(-300),course||null]);
   return rows.map(row=>({row,score:words.reduce((n,t)=>n+Number(row.content.toLowerCase().includes(t)),0)}))
@@ -68,15 +78,23 @@ export async function retrieve(tx: Tx, query: string, sourceIds: string[] = [], 
 export class Knowledge {
   readonly seen=new Map<string, string>();
   constructor(readonly store: Store, readonly folder: string) {}
-  async import(tx: Tx, key: string, title: string, content: string) {
+  async import(tx: Tx, key: string, title: string, content: string, allowDuplicate = false):Promise<SourceImportResult> {
     const sourceId='source-'+digest(key).slice(0,24), path=sourceId+'.md';
-    if(Buffer.byteLength(content)>2_000_000 || content.includes('\0') || Buffer.from(content,'utf8').toString('utf8')!==content)throw new AppError('资料超过 2 MB 或包含无效字符。');
+    validateSourceText(content);
+    // Serialize equal Web uploads, including requests using different idempotency keys.
+    await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-digest:'+digest(content)]);
     await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-path:'+path]);
+    const prior=await tx.one('SELECT id FROM app.sources WHERE path=$1',[path]);
+    if(!prior && !allowDuplicate) {
+      const duplicate=await tx.one('SELECT id,version,revision,archived_at FROM app.sources WHERE digest=$1 ORDER BY (archived_at IS NOT NULL),created_at,id LIMIT 1 FOR SHARE',[digest(content)]);
+      if(duplicate)return {id:duplicate.id,version:duplicate.version,revision:duplicate.revision,duplicate:true,archivedAt:duplicate.archived_at?iso(duplicate.archived_at):null};
+    }
     const file=join(this.folder,'documents',path);
     try { await writeFile(file,content,{flag:'wx',mode:0o600,flush:true}); }
     catch(e: any) { if(e.code!=='EEXIST') throw e; if(await readFile(file,'utf8')!==content) throw new AppError('原始资料已被修改，不能覆盖。',409,'source_conflict'); }
-    const prior=await tx.one('SELECT id FROM app.sources WHERE path=$1',[path]);
-    return putSource(tx,{id:prior?.id||sourceId,title,content,path});
+    const saved=await putSource(tx,{id:prior?.id||sourceId,title,content,path,managed:true});
+    const current=(await tx.one('SELECT revision,archived_at FROM app.sources WHERE id=$1',[saved.id]))!;
+    return {...saved,revision:current.revision,duplicate:false,archivedAt:current.archived_at?iso(current.archived_at):null};
   }
   async scan() {
     // macOS temporary/data directories may have a /var → /private/var alias.
@@ -94,15 +112,27 @@ export class Knowledge {
         const name=relative(base,file), info=await stat(file), stamp=info.mtimeMs+':'+info.size;
         if(this.seen.get(name)===stamp) continue;
         try {
+          // Lifecycle changes are checked again under the source lock below.
+          // This early check avoids rereading immutable/archived originals on
+          // every worker sweep, without caching a skipped file across restore.
+          const observed=await this.store.one('SELECT managed,archived_at FROM app.sources WHERE path=$1',[name]);
+          if(observed?.managed || observed?.archived_at)continue;
           const actual=await realpath(file); if(!actual.startsWith(base+sep)) throw new AppError('资料路径越界。');
           if(info.size>2_000_000) throw new AppError('资料超过 2 MB，尚未索引。');
           const content=new TextDecoder('utf-8',{fatal:true}).decode(await readFile(actual));
-          await this.store.transaction(async tx=>{
+          const indexed=await this.store.transaction(async tx=>{
             await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-path:'+name]);
-            const old=await tx.one('SELECT id,title FROM app.sources WHERE path=$1',[name]);
-            await putSource(tx,{id:old?.id||'file-'+digest(name).slice(0,24),title:old?.title||name,content,path:name});
+            const found=await tx.one('SELECT id FROM app.sources WHERE path=$1',[name]);
+            const sourceId=found?.id||'file-'+digest(name).slice(0,24);
+            await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['source-id:'+sourceId]);
+            const old=await tx.one('SELECT id,title,managed,archived_at FROM app.sources WHERE path=$1',[name]);
+            // Managed text is versioned in PostgreSQL. Its first on-disk original
+            // is immutable and must never replace a later browser edit.
+            if(old?.managed || old?.archived_at)return false;
+            await putSource(tx,{id:sourceId,title:old?.title||name,content,path:name});
+            return true;
           });
-          this.seen.set(name,stamp);
+          if(indexed)this.seen.set(name,stamp);
         } catch(error) { await this.store.transaction(tx=>notify(tx,'source-error:'+digest(name+stamp),null,'有一份资料尚未索引',name+'：'+(error instanceof AppError ? error.message : '请检查文件编码与读取权限。'))); }
       }
     };

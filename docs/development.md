@@ -14,7 +14,7 @@ scripts/            启停、备份、资料准备与迁移
 tests/              单元、数据库、进程恢复与浏览器测试
 ```
 
-业务表位于 PostgreSQL `app` schema，pg-boss 使用 `queue`，LangGraph 使用 `checkpoints`。默认两路学习执行，同目标串行，单次最多 5 次模型调用、180 秒；自动重试共享预算。同一目标最多一个待反馈步骤。
+业务表位于 PostgreSQL `app` schema，pg-boss 使用 `queue`，LangGraph 使用 `checkpoints`。默认两路学习执行，同目标串行，普通学习单次最多 5 次模型调用、180 秒；研究任务按 `research.effort` 使用 1/4/8 次、150/420/840 秒预算；评阅可走可选的独立评阅模型（`llm.review`）。自动重试共享原预算。同一目标最多一个待反馈步骤。
 
 ## 本地开发
 

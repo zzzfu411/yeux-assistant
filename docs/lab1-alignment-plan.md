@@ -1,10 +1,12 @@
 # Lab1 题面对齐方案 · 2026-10-04
 
-> 状态：**规划，未实施**。依据：官方题面 <https://jyywiki.cn/GSE/2026/lab1.md>（2026-10-04 实时抓取，与课程仓 `gse/official/lab1.html` 快照正文一致）、本仓 [SPEC](../SPEC.md)、[2026-10-04 审计](audit-2026-10-04.md) 和当日源码。
+> 状态：**分阶段实施中**。当前完成范围和验证证据见 [SPEC 的 Lab1 对齐记录](../SPEC.md#lab1-对齐--2026-10-05)，其余条目仍是计划。依据：官方题面 <https://jyywiki.cn/GSE/2026/lab1.md>（2026-10-04 实时抓取，与课程仓 `gse/official/lab1.html` 快照正文一致）、本仓 [SPEC](../SPEC.md)、[2026-10-04 审计](audit-2026-10-04.md) 和当日源码。
 >
 > 本文规定要改什么、怎么改、怎么验收。实施仍按 SPEC §0 的循环推进：发现缺口 → 确定行为与边界 → 小步实现 → 隔离自检 → 应用并核对。每个阶段的证据写回 SPEC，本文不追加运行记录。
 
 ## 0. 差距摘要
+
+以下为 2026-10-04 的实施前快照；当前已完成项、模拟与真实验收边界见 SPEC 的当期记录。
 
 | 题面要求 | 现状 | 对应阶段 |
 | --- | --- | --- |
@@ -42,6 +44,8 @@
 | Q6 | 是否统一代码格式 | 引入 Prettier 一次性格式化 | 是，单独提交（P0.4） |
 | Q7 | 现行实例是否重新导入 26 份课程资料 | 是 / 否 | 是（P6），导入前先备份 |
 | Q8 | 现有改动的提交粒度 | 按领域拆 4–5 个提交 / 合成一个提交 | 按领域拆分；推送前本人确认 |
+
+已确认（2026-10-05）：Q1 使用私密独立工作区；Q2 后续自有 VPS，当前仅本机访问；Q3 本轮先完成模拟开发，真实账号与事务探查稍后验收。Q6 采用统一格式；Q7 按既有授权接入的 GSE、数据库、软件工程资料包恢复导入。Q8 现有交叉实现合并为可独立验证的基线提交，文档及格式分别提交，未推送。邮箱真实授权仍由本人直接填设置，不在聊天提供。
 
 ## 3. 总体设计
 
@@ -144,7 +148,7 @@ private/workspace/
   - 每条命令前加 `-c safe.directory=<工作区> -c user.name=yeux-assistant -c user.email=assistant@localhost -c commit.gpgsign=false`。
   - 路径参数放在 `--` 之后，并校验路径位于工作区内、不是符号链接。
   - 超时 10 秒；超时按失败处理并报告，不自动重试提交。
-- **串行化**：所有工作区写入先取 PostgreSQL advisory lock（新常量，例如 `847392010`）。出现残留的 `.git/index.lock` 时，doctor 报告并说明处理方法；Worker 只在持有该锁且锁文件超过 10 分钟时删除它。
+- **串行化**：所有工作区写入先取 PostgreSQL advisory lock（新常量，`847392030`，避开现有学习并发锁）。出现残留的 `.git/index.lock` 时，doctor 报告并说明处理方法；不按文件年龄自动删除锁；手工 Git 进程可能仍在工作，须先核实进程再由本人处理。
 - **镜像**：`Dockerfile` 增加 `RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*`。服务器版的只读根文件系统不受影响，因为 Git 只写挂载的 `private/`。
 - **备份**：`scripts/backup.mjs` 和 `backup-integrity.mjs` 把 `private/workspace`（含 `.git`）纳入清单；`backup:check` 额外对备份副本运行 `git fsck --no-dangling`。
 - **doctor**：新增“工作区”检查项：是否为 Git 仓库、能否读取 HEAD、未提交改动数、是否有残留锁。

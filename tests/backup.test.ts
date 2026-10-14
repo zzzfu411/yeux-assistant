@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { WorkspaceRepo } from '../packages/core/src/workspace/repo.js';
 import { createHash } from 'node:crypto';
 // @ts-expect-error Operational scripts execute directly in Node.
 import { createBackup } from '../scripts/backup.mjs';
@@ -57,6 +58,25 @@ describe('complete local backup', () => {
         '符号链接',
       );
       expect(await readdir(join(folder, 'backups'))).toEqual([]);
+    } finally {
+      await rm(folder, { recursive: true, force: true });
+    }
+  });
+  it('includes the workspace Git history and raw mail originals in the private backup', async () => {
+    const folder = await mkdtemp(join(tmpdir(), 'workspace-backup-'));
+    try {
+      const repo = new WorkspaceRepo(folder);
+      await repo.initialize();
+      await repo.write('notes/private.md', 'synthetic personal note');
+      await repo.commitFiles(['notes/private.md'], 'synthetic note');
+      await mkdir(join(folder, 'mail-raw'));
+      await writeFile(join(folder, 'mail-raw', 'synthetic.eml'), 'synthetic mail');
+      const output = await createBackup(folder, (path: string) => writeFile(path, 'synthetic dump'));
+      const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'));
+      expect(manifest.files.some((item: any) => item.path === 'workspace/.git/HEAD')).toBe(true);
+      expect(manifest.files.some((item: any) => item.path.startsWith('workspace/.git/objects/'))).toBe(true);
+      expect(await readFile(join(output, 'mail-raw', 'synthetic.eml'), 'utf8')).toBe('synthetic mail');
+      expect((await new WorkspaceRepo(output).status()).head).toBe((await repo.status()).head);
     } finally {
       await rm(folder, { recursive: true, force: true });
     }

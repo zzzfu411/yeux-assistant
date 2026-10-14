@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, rename, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store } from '../packages/storage/src/index.js';
@@ -291,5 +291,42 @@ describe.skipIf(!url)('source maintenance with real PostgreSQL', () => {
       await update(initial.id, { revision: 1, title: '原始笔记', content: 'sharedneedle 合成原文' }),
     ).toMatchObject({ version: 1, revision: 1 });
     expect((await sources.detail(initial.id)).versions).toHaveLength(1);
+  });
+  it('removes deleted files from retrieval, preserves history and restores the same source without another content version', async () => {
+    const path = join(folder, 'documents', 'filesystem.md');
+    await writeFile(path, 'lifecycle 查找删除后的资料');
+    await knowledge.scan();
+    const source = (await store.one("SELECT * FROM app.sources WHERE path='filesystem.md'"))!;
+    await rm(path);
+    await knowledge.scan();
+    expect(await retrieve(store, 'lifecycle')).toEqual([]);
+    expect((await sources.detail(source.id, 1)).content).toContain('lifecycle');
+    expect((await sources.detail(source.id)).missingAt).toBeTruthy();
+    await writeFile(path, 'lifecycle 查找删除后的资料');
+    await knowledge.scan();
+    expect((await retrieve(store, 'lifecycle'))[0]!.sourceId).toBe(source.id);
+    expect((await sources.detail(source.id)).version).toBe(1);
+  });
+  it('treats renames as a missing old path and a new source, and handles a removed root', async () => {
+    await writeFile(join(folder, 'documents', 'before.md'), 'renamecase 同一原文');
+    await knowledge.scan();
+    const before = (await store.one("SELECT * FROM app.sources WHERE path='before.md'"))!;
+    await rename(join(folder, 'documents', 'before.md'), join(folder, 'documents', 'after.md'));
+    await knowledge.scan();
+    const hits = await retrieve(store, 'renamecase');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.sourceId).not.toBe(before.id);
+    expect((await sources.list()).find((row) => row.id === hits[0]!.sourceId)?.possibleRenameOf).toBe('before.md');
+    await rm(join(folder, 'documents'), { recursive: true });
+    await knowledge.scan();
+    expect(await retrieve(store, 'renamecase')).toEqual([]);
+  });
+  it('indexes workspace notes and records but restricts profile retrieval to mail or errands', async () => {
+    for (const name of ['notes/note.md', 'records/record.md', 'profile/name.md'])
+      await writeFile(join(folder, 'workspace', name), 'workspacekey 合成资料');
+    await knowledge.scan();
+    expect(await retrieve(store, 'workspacekey')).toHaveLength(2);
+    expect(await retrieve(store, 'workspacekey', [], 6, undefined, 'mail')).toHaveLength(3);
+    expect(await retrieve(store, 'workspacekey', [], 6, undefined, 'errand')).toHaveLength(3);
   });
 });

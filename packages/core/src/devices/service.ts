@@ -59,11 +59,13 @@ export class DeviceActions {
   readonly adapters: ReadonlyMap<string, DeviceAdapter>;
   readonly timeoutMs: number;
   readonly boundary: CommandBoundary;
+  private readonly timeoutOverride: boolean;
   constructor(
     readonly store: Store,
     readonly boss: PgBoss,
     options: { adapters?: ReadonlyMap<string, DeviceAdapter>; timeoutMs?: number; boundary?: CommandBoundary } = {},
   ) {
+    this.timeoutOverride = options.timeoutMs !== undefined;
     this.boundary = options.boundary || once;
     this.adapters = options.adapters || registeredAdapters(store);
     this.timeoutMs = Math.max(10, Math.min(20000, options.timeoutMs ?? 20000));
@@ -84,6 +86,10 @@ export class DeviceActions {
       throw new AppError('设备能力版本已变化，请重新选择操作。', 409, 'device_capability_changed');
     action.schema.parse(command.payload.arguments);
     return { adapter, action };
+  }
+  private deadline(command: Row) {
+    const { action } = this.registeredCommand(command);
+    return this.timeoutOverride ? this.timeoutMs : Math.max(10, Math.min(120000, action.timeoutMs ?? this.timeoutMs));
   }
   private command<T>(key: string, operation: string, input: unknown, work: (tx: Tx) => Promise<T>) {
     return this.store.transaction((tx) => this.boundary(tx, key, operation, input, () => work(tx)));
@@ -257,6 +263,7 @@ export class DeviceActions {
         action = capability(adapter, data.capability),
         args = action.schema.parse(data.arguments);
       await adapter.validateDevice?.(tx, deviceId);
+      await adapter.validateCommand?.(tx, deviceId, action.id, args);
       const expiresAt = iso((await tx.one("SELECT clock_timestamp()+interval '5 minutes' AS deadline"))!.deadline);
       const payload = {
         deviceId,
@@ -306,7 +313,11 @@ export class DeviceActions {
         throw error;
       }
       const row = await this.transition(tx, command, 'approved');
-      await this.boss.send(DEVICE_QUEUE, { commandId }, { db: tx.bossDb, singletonKey: commandId });
+      await this.boss.send(
+        DEVICE_QUEUE,
+        { commandId },
+        { db: tx.bossDb, singletonKey: commandId, expireInSeconds: Math.ceil(this.deadline(command) / 1000) + 15 },
+      );
       return commandDTO(row);
     });
   }
@@ -378,6 +389,7 @@ export class DeviceActions {
       try {
         const { adapter } = this.registeredCommand(command);
         await adapter.validateDevice?.(tx, command.device_id);
+        await adapter.validateCommand?.(tx, command.device_id, command.payload.capability, command.payload.arguments);
       } catch (error) {
         const changed =
           error instanceof AppError && ['device_capability_changed', 'adapter_version_missing'].includes(error.code);
@@ -393,7 +405,7 @@ export class DeviceActions {
       const token = id();
       await tx.exec(
         "UPDATE app.device_commands SET execution_token=$2,started_at=clock_timestamp(),execution_deadline=clock_timestamp()+$3::double precision*interval '1 millisecond' WHERE id=$1",
-        [commandId, token, this.timeoutMs],
+        [commandId, token, this.deadline(command)],
       );
       return { ...row, execution_token: token };
     });
@@ -422,7 +434,7 @@ export class DeviceActions {
       if (!claimed) return;
       const current = claimed,
         { adapter, action } = this.registeredCommand(current);
-      timer = setTimeout(stop, this.timeoutMs);
+      timer = setTimeout(stop, this.deadline(current));
       poll = setInterval(async () => {
         if (polling || controller.signal.aborted) return;
         polling = true;
@@ -490,7 +502,11 @@ export class DeviceActions {
         await this.finish(
           current,
           notApplied ? 'failed' : 'uncertain',
-          notApplied ? '操作未执行，请检查设备连接后重新选择。' : unknownResult,
+          notApplied
+            ? error instanceof DeviceNotApplied && current.payload.adapter === 'browser.ehall'
+              ? error.message
+              : '操作未执行，请检查设备连接后重新选择。'
+            : unknownResult,
         );
       } finally {
         controller.signal.removeEventListener('abort', abortListener);
@@ -514,6 +530,8 @@ export class DeviceActions {
       const { command } = await this.lockCommand(tx, claim.id);
       if (command.state !== 'executing' || command.execution_token !== claim.execution_token) return;
       await this.transition(tx, command, state, error, receipt);
+      if (state === 'succeeded' && receipt?.after)
+        await this.adapter(command.payload.adapter).record?.(tx, command, receipt.after);
       if (state === 'succeeded' && receipt?.after)
         await tx.exec('UPDATE app.devices SET observed_state=$2,observed_at=$3 WHERE id=$1', [
           command.device_id,
@@ -575,7 +593,11 @@ export class DeviceActions {
             ['created', 'retry', 'active'].includes(job.state),
           )
         )
-          await this.boss.send(DEVICE_QUEUE, { commandId: command.id }, { db: tx.bossDb, singletonKey: command.id });
+          await this.boss.send(
+            DEVICE_QUEUE,
+            { commandId: command.id },
+            { db: tx.bossDb, singletonKey: command.id, expireInSeconds: Math.ceil(this.deadline(command) / 1000) + 15 },
+          );
       });
   }
 }

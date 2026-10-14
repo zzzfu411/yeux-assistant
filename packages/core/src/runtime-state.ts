@@ -25,7 +25,7 @@ export async function fence(tx: Tx, identity: RunIdentity) {
   const goal = session.goal_id ? await tx.one('SELECT * FROM app.goals WHERE id=$1', [session.goal_id]) : null;
   if (goal && goal.status !== 'active') throw new StaleRun();
   if (!run.deadline || new Date(run.deadline).getTime() <= Date.now())
-    throw new RuntimeLimit('本次运行已达到 180 秒上限，请缩小问题后重试。');
+    throw new RuntimeLimit('本次运行已达到时间上限，已保存的进度可查看。');
   return { run, session, goal };
 }
 
@@ -73,9 +73,7 @@ export async function claimRun(store: Store, runId: string): Promise<Row | null>
       return null;
     if (run.generation >= 3 || (run.deadline && new Date(run.deadline).getTime() <= Date.now())) {
       const message =
-        run.generation >= 3
-          ? '本次运行重试次数已用完，请查看后重试。'
-          : '本次运行已达到 180 秒上限，请缩小问题后重试。';
+        run.generation >= 3 ? '本次运行重试次数已用完，请查看后重试。' : '本次运行已达到时间上限，已保存的进度可查看。';
       await tx.exec("UPDATE app.runs SET state='failed',error=$2,finished_at=now() WHERE id=$1", [runId, message]);
       await tx.exec(
         "UPDATE app.sessions SET state='failed',error=$2,revision=revision+1,updated_at=now() WHERE id=$1",
@@ -87,7 +85,7 @@ export async function claimRun(store: Store, runId: string): Promise<Row | null>
     }
     const claimed = (await tx.one(
       `UPDATE app.runs SET state='running',generation=generation+1,
-      started_at=coalesce(started_at,now()),deadline=coalesce(deadline,now()+interval '180 seconds'),error=''
+      started_at=coalesce(started_at,now()),deadline=coalesce(deadline,now()+max_seconds*interval '1 second'),error=''
       WHERE id=$1 RETURNING *`,
       [runId],
     ))!;

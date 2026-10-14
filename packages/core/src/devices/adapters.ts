@@ -5,6 +5,7 @@ import { AppError } from '../common.js';
 
 import { DeviceNotApplied, capability, type Capability, type DeviceAdapter, type ExecutionContext } from './driver.js';
 import { BridgedAudio } from './bridge.js';
+import { BridgedEhall } from './ehall.js';
 export { DeviceNotApplied, capability, publicCapabilities } from './driver.js';
 export type { Capability, DeviceAdapter, ExecutionContext } from './driver.js';
 type Arguments = DeviceCommand['arguments'];
@@ -65,5 +66,10 @@ export class SimulatedLamp implements DeviceAdapter {
   }
 }
 export function registeredAdapters(store: Store): ReadonlyMap<string, DeviceAdapter> {
-  return new Map([new SimulatedLamp(store), new BridgedAudio(store)].map((adapter) => [adapter.id, adapter]));
+  return new Map(
+    [new SimulatedLamp(store), new BridgedAudio(store), new BridgedEhall(store)].map((adapter) => [
+      adapter.id,
+      adapter,
+    ]),
+  );
 }

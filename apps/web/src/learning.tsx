@@ -1,3 +1,5 @@
+import { EffortPicker, ResearchBanner, ResearchProgress } from './research';
+import type { Effort } from '../../../packages/contracts/src/research';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -16,6 +18,7 @@ import {
 } from '../../../packages/contracts/src/index';
 import { useAction, useApi, useData, useDraft } from './api';
 import type { GoalOverview, TodayOverview, SessionSummary } from '../../../packages/contracts/src/pagination';
+import { CreateErrandInput } from '../../../packages/contracts/src/errands';
 import {
   date,
   ErrorNotice,
@@ -31,6 +34,7 @@ import {
   CursorControls,
 } from './ui';
 import { MemoryEditor } from './memory-editor';
+import { ErrandPanel, FlowList } from './errand';
 import s from './styles.module.css';
 import { Icon, type IconName } from './icons';
 
@@ -128,6 +132,16 @@ function LegacyRecord({ record, sessionId }: { record: Record<string, unknown>; 
 }
 
 const taskModes = {
+  research: {
+    label: '深入研究',
+    summary: '比较方案、查证资料、改进答案',
+    icon: 'research',
+    field: '研究问题',
+    help: '填写问题与验收要求，助手会检索资料、比较候选并保留较好版本。',
+    example: '比较关系型数据库与文档数据库，结合课程资料给出选型依据、反例和适用边界。',
+    action: '开始研究',
+    footer: '研究记录、引用与消耗会保存',
+  },
   goal: {
     label: '学习计划',
     summary: '拆解目标，持续练习',
@@ -148,6 +162,17 @@ const taskModes = {
     action: '开始答疑',
     footer: '结果会保存在历史记录',
   },
+  errand: {
+    label: '办理通知',
+    summary: '抽取要素、查材料、拟邮件',
+    icon: 'checklist',
+    field: '通知原文',
+    help: '粘贴通知或邮件正文。助手抽取截止与活动时间（附原文依据），对照你的资料列出材料，缺信息时先问你，再准备邮件草稿和日历。',
+    example:
+      '关于举办 2026 年秋季学期“生成式软件工程”课程展示的通知\n各位同学：课程展示定于 11 月 20 日 14:00 在仙Ⅱ-204 举行。请于 11 月 10 日 23:59 前将报名表和项目简介（不超过 500 字）发送至 gse-ta@nju.edu.cn，邮件主题注明“展示报名+姓名”。',
+    action: '开始办理',
+    footer: '要素逐条核对原文；邮件需你确认才发送',
+  },
   work: {
     label: '整理材料',
     summary: '提炼要点、生成草稿',
@@ -161,7 +186,7 @@ const taskModes = {
   manage: {
     label: '安排复盘',
     summary: '生成待办与复盘清单',
-    icon: 'today',
+    icon: 'clock',
     field: '安排或复盘内容',
     help: '填写待办或学习记录，生成安排与复盘清单。',
     example: '明天有 1 小时，安排数据库事务复习、软件工程阅读，并列出复盘要点。',
@@ -182,13 +207,19 @@ const taskModes = {
   }
 >;
 type TaskMode = keyof typeof taskModes;
-type TaskFields = { title: string; outcome: string; sourceIds: string[] };
+type TaskFields = { title: string; outcome: string; sourceIds: string[]; effort?: Effort; flowId?: string };
 type TaskDraft = TaskFields & { mode: TaskMode; saved?: Partial<Record<TaskMode, TaskFields>> };
 function switchTask(draft: TaskDraft, mode: TaskMode): TaskDraft {
   if (draft.mode === mode) return draft;
   const saved = {
     ...draft.saved,
-    [draft.mode]: { title: draft.title, outcome: draft.outcome, sourceIds: draft.sourceIds },
+    [draft.mode]: {
+      title: draft.title,
+      outcome: draft.outcome,
+      sourceIds: draft.sourceIds,
+      effort: draft.effort,
+      flowId: draft.flowId,
+    },
   };
   return { ...(saved[mode] || { title: '', outcome: '', sourceIds: [] }), mode, saved };
 }
@@ -212,7 +243,35 @@ function GoalSourcePicker({ value, onChange }: { value: string[]; onChange: (ids
   );
 }
 
-export function TodayPage({ initialMode }: { initialMode?: string | null }) {
+function TodayStats({ data }: { data: TodayOverview }) {
+  // Red is kept for what is waiting on the owner; other non-zero counts use the ink colour.
+  const items: Array<[string, number, string, IconName, 'annot' | 'ink' | 'none']> = [
+    ['待你处理', data.pendingTotal, '#/history?state=pending', 'today', data.pendingTotal > 0 ? 'annot' : 'none'],
+    [
+      '待确认邮件',
+      data.mailWaiting ?? 0,
+      '#/mail?filter=drafting',
+      'mail',
+      (data.mailWaiting ?? 0) > 0 ? 'annot' : 'none',
+    ],
+    ['新邮件', data.mailNew ?? 0, '#/mail?filter=new', 'bell', (data.mailNew ?? 0) > 0 ? 'ink' : 'none'],
+    ['进行中的目标', data.activeGoalTotal, '#/goals', 'goals', 'none'],
+  ];
+  return (
+    <nav className={s.statStrip} aria-label="今日概况">
+      {items.map(([label, value, href, icon, highlight]) => (
+        <a key={label} href={href} data-highlight={highlight}>
+          <Icon name={icon} />
+          <span>
+            <strong>{value}</strong>
+            {label}
+          </span>
+        </a>
+      ))}
+    </nav>
+  );
+}
+export function TodayPage({ initialMode, greeting }: { initialMode?: string | null; greeting?: string }) {
   const query = useData<TodayOverview>('/today/overview', { refetchInterval: 20_000 }),
     api = useApi(),
     action = useAction(),
@@ -220,10 +279,18 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
   const [draft, setDraft] = useDraft<TaskDraft>('new-goal', { title: '', outcome: '', sourceIds: [], mode: 'goal' });
   const [optionsOpen, setOptionsOpen] = useState(false);
   const task = taskModes[draft.mode] || taskModes.goal;
+  // Research needs a model to solve and review; fail here instead of in the background run.
+  const researchBlocked = draft.mode === 'research' && query.data?.modelConfigured === false;
   useEffect(() => {
-    if (initialMode && Object.hasOwn(taskModes, initialMode))
-      setDraft((current) => switchTask(current, initialMode as TaskMode));
+    if (initialMode && Object.hasOwn(taskModes, initialMode)) {
+      const flowId = new URLSearchParams(window.location.hash.split('?')[1] || '').get('flow') || undefined;
+      setDraft((current) => {
+        const next = switchTask(current, initialMode as TaskMode);
+        return flowId ? { ...next, flowId } : next;
+      });
+    }
   }, [initialMode, setDraft]);
+  const flows = useData<Array<{ id: string; enabled: boolean; definition: { title: string } }>>('/flows');
   const selectMode = (mode: TaskMode) => {
     if (action.busy) return;
     setDraft((current) => switchTask(current, mode));
@@ -239,9 +306,20 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
             '/goals',
             CreateGoal.parse({ title: draft.title.trim(), outcome: draft.outcome, sourceIds: draft.sourceIds }),
           );
+        if (draft.mode === 'errand')
+          return api.write<{ sessionId: string }>(
+            '/errands',
+            CreateErrandInput.parse({ text: draft.title, ...(draft.flowId ? { flowId: draft.flowId } : {}) }),
+          );
         return api.write<{ sessionId: string }>(
           '/sessions',
-          CreateSession.parse({ prompt: draft.title, kind: draft.mode }),
+          CreateSession.parse({
+            prompt: draft.title,
+            kind: draft.mode === 'research' ? 'work' : draft.mode,
+            ...(draft.mode === 'research'
+              ? { research: { effort: draft.effort || 'low', sourceIds: draft.sourceIds } }
+              : {}),
+          }),
         );
       },
       (result) => {
@@ -255,7 +333,10 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
   };
   return (
     <>
-      <Heading title="学习工作台">选择功能，填写内容，开始处理。</Heading>
+      <Heading title="学习工作台" eyebrow={greeting}>
+        选择功能，填写内容，开始处理。关闭页面后任务仍在后台继续。
+      </Heading>
+      {query.data && <TodayStats data={query.data} />}
       <div className={s.featureGrid} role="group" aria-label="选择功能">
         {(Object.keys(taskModes) as TaskMode[]).map((mode) => {
           const item = taskModes[mode];
@@ -328,6 +409,48 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
               value={draft.title}
               onChange={(e) => setDraft({ ...draft, title: e.target.value })}
             />
+            {draft.mode === 'errand' && (
+              <div className={s.composerControls}>
+                <div className={s.inlineSelect}>
+                  <label htmlFor="errand-flow">按流程办理</label>
+                  <select
+                    id="errand-flow"
+                    value={draft.flowId || ''}
+                    onChange={(e) => setDraft({ ...draft, flowId: e.target.value || undefined })}
+                  >
+                    <option value="">不使用流程（默认步骤）</option>
+                    {(flows.data || [])
+                      .filter((flow) => flow.enabled)
+                      .map((flow) => (
+                        <option key={flow.id} value={flow.id}>
+                          {flow.definition.title}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+            )}
+            {draft.mode === 'research' && (
+              <>
+                <EffortPicker
+                  value={draft.effort || 'low'}
+                  disabled={action.busy}
+                  onChange={(effort) => setDraft({ ...draft, effort })}
+                />
+                <details className={s.composerOptions} onToggle={(e) => setOptionsOpen(e.currentTarget.open)}>
+                  <summary>
+                    研究资料 · {draft.sourceIds.length ? `已选 ${draft.sourceIds.length} 份` : '自动检索'}
+                  </summary>
+                  {optionsOpen && (
+                    <GoalSourcePicker
+                      value={draft.sourceIds}
+                      onChange={(sourceIds) => setDraft({ ...draft, sourceIds })}
+                    />
+                  )}
+                  <p className={s.muted}>不选时检索可用资料库；选择后仅使用所选资料。每次研究固定原文版本。</p>
+                </details>
+              </>
+            )}
             {draft.mode === 'goal' && (
               <>
                 <div className={s.composerControls}>
@@ -375,11 +498,21 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
                 </div>
               </>
             )}
+            {researchBlocked && (
+              <p className={s.composerBlocked} role="note">
+                深入研究需要先连接模型，并开启资料片段引用。<a href="#/settings">去设置</a>
+              </p>
+            )}
             <div className={s.composerFooter}>
               <span className={s.muted}>{task.footer}</span>
               <button
                 className={s.primary}
-                disabled={action.busy || !draft.title.trim() || (draft.mode === 'goal' && draft.sourceIds.length > 100)}
+                disabled={
+                  action.busy ||
+                  researchBlocked ||
+                  !draft.title.trim() ||
+                  (draft.mode === 'goal' && draft.sourceIds.length > 100)
+                }
               >
                 {action.busy ? '正在提交…' : task.action}
                 <Icon name="arrow" />
@@ -410,36 +543,27 @@ export function TodayPage({ initialMode }: { initialMode?: string | null }) {
               )}
             </section>
           )}
-          <div className={s.quickLinks} aria-label="常用入口">
-            <a href="#/devices">
-              <Icon name="device" />
-              <span>
-                设备控制<small>查看状态、执行设备操作</small>
-              </span>
-              <Icon name="arrow" />
-            </a>
-            <a href="#/library">
-              <Icon name="library" />
-              <span>
-                资料管理<small>导入、查找课程材料</small>
-              </span>
-              <Icon name="arrow" />
-            </a>
-            <a href="#/schedules">
-              <Icon name="today" />
-              <span>
-                定时计划<small>按时准备学习任务</small>
-              </span>
-              <Icon name="arrow" />
-            </a>
-            <a href="#/history">
-              <Icon name="work" />
-              <span>
-                历史记录<small>查看之前的任务与结果</small>
-              </span>
-              <Icon name="arrow" />
-            </a>
-          </div>
+          <FlowList compact />
+          <nav className={s.quickLinks} aria-label="常用入口">
+            {(
+              [
+                ['#/mail', 'mail', '邮件', '往来线程、回复草稿与通知'],
+                ['#/devices', 'device', '设备控制', '确认设备操作与 ehall 模拟事务'],
+                ['#/settings?view=workspace', 'branch', '规则与流程', '已确认的纠正，用 Git 保存'],
+                ['#/schedules', 'clock', '定时计划', '按时准备学习任务'],
+                ['#/history', 'history', '历史记录', '查看之前的任务与结果'],
+              ] as const
+            ).map(([href, icon, title, description]) => (
+              <a href={href} key={href}>
+                <Icon name={icon} />
+                <span>
+                  {title}
+                  <small>{description}</small>
+                </span>
+                <Icon name="arrow" />
+              </a>
+            ))}
+          </nav>
         </aside>
       </div>
     </>
@@ -558,6 +682,11 @@ function GoalContent({ detail, reload }: { detail: GoalOverview; reload: () => P
       revision: goal.revision,
     });
   const [markComplete, setMarkComplete] = useState(false);
+  const next = useData<{ items: SessionSummary[] }>(
+    '/sessions/list?goalId=' + encodeURIComponent(goal.id) + '&state=pending&limit=1',
+  ).data?.items[0];
+  const steps = plan?.steps || [],
+    practiced = steps.filter((step) => ['practiced', 'completed'].includes(step.state)).length;
   const refresh = () => {
     void client.invalidateQueries();
   };
@@ -610,6 +739,30 @@ function GoalContent({ detail, reload }: { detail: GoalOverview; reload: () => P
         {goal.nextReview && goal.status === 'active' && <> · 下次复习 {date(goal.nextReview)}</>}
       </Heading>
       {goal.outcome && <p className={s.description}>{goal.outcome}</p>}
+      {(next || steps.length > 0) && (
+        <div className={s.goalSummary}>
+          {steps.length > 0 && (
+            <div className={s.goalProgress}>
+              <span>
+                学习路径 <strong>{practiced}</strong> / {steps.length} 步已练习
+              </span>
+              <span className={s.meter} role="img" aria-label={`已练习 ${practiced} / ${steps.length} 步`}>
+                <i style={{ width: (practiced / steps.length) * 100 + '%' }} />
+              </span>
+            </div>
+          )}
+          {next && (
+            <a className={s.primary} href={'#/session/' + encodeURIComponent(next.id)}>
+              {next.state === 'waiting_feedback'
+                ? '继续练习'
+                : next.state === 'failed'
+                  ? '处理当前步骤'
+                  : '查看准备进度'}
+              <Icon name="arrow" />
+            </a>
+          )}
+        </div>
+      )}
       <div className={s.toolbar}>
         <button
           className={s.secondary}
@@ -678,7 +831,7 @@ function GoalContent({ detail, reload }: { detail: GoalOverview; reload: () => P
           <h2>学习路径</h2>
           <ol className={s.steps}>
             {plan.steps.map((step) => (
-              <li key={step.id}>
+              <li key={step.id} data-state={step.state}>
                 <div>
                   <strong>{step.title}</strong>
                   <p>{step.objective}</p>
@@ -745,7 +898,7 @@ function GoalAttempts({ goalId }: { goalId: string }) {
   );
 }
 export function SessionPage({ id }: { id: string }) {
-  const query = useData<SessionDetail>('/sessions/' + encodeURIComponent(id));
+  const query = useData<SessionDetail>('/sessions/' + encodeURIComponent(id), { refetchInterval: 5000 });
   return (
     <>
       <a className={s.back} href={query.data?.session.goalId ? '#/goal/' + query.data.session.goalId : '#/today'}>
@@ -809,6 +962,8 @@ function SessionContent({
         ? session.state === 'waiting_feedback'
         : ['waiting_feedback', 'ready', 'completed'].includes(session.state);
   const sending = approvals.some((approval) => ['approved', 'executing', 'uncertain'].includes(approval.state));
+  const isErrand = session.flow === 'errand',
+    isMail = session.flow === 'mail-reply' || Boolean(session.parentSessionId && session.recipient);
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const sent = answer;
@@ -879,9 +1034,25 @@ function SessionContent({
       });
     setEditing(true);
   };
+  const kindLabel =
+    session.research || detail.research
+      ? '深入研究'
+      : session.flow === 'errand'
+        ? '办理通知'
+        : session.flow === 'mail-reply'
+          ? '邮件回复'
+          : session.parentSessionId
+            ? '邮件草稿'
+            : session.kind === 'study'
+              ? session.goalId
+                ? '学习计划'
+                : '学习答疑'
+              : session.kind === 'work'
+                ? '整理材料'
+                : '安排复盘';
   return (
     <>
-      <Heading title={session.title}>
+      <Heading title={session.title} eyebrow={kindLabel + ' · ' + date(session.createdAt)}>
         <Status state={session.state} />
       </Heading>
       <details className={s.disclosure}>
@@ -894,8 +1065,12 @@ function SessionContent({
         </div>
       )}
       {active && (
-        <div className={s.notice} role="status">
-          <p>正在准备。你可以离开页面，稍后回来继续。</p>
+        <div className={s.runningNotice} role="status">
+          <span className={s.pulse} aria-hidden="true" />
+          <p>
+            {session.state === 'queued' ? '已排队，等待后台开始。' : '正在准备。'}
+            你可以离开页面，稍后回来继续。
+          </p>
           <button
             className={s.secondary}
             disabled={action.busy || !session.currentRunId}
@@ -905,11 +1080,89 @@ function SessionContent({
           </button>
         </div>
       )}
-      {session.content && (
-        <article className={s.answer}>
-          <Result>{session.content}</Result>
-          <Sources citations={session.citations} />
-        </article>
+      {detail.research && (
+        <ResearchBanner detail={detail.research} active={active && detail.research.runId === session.currentRunId} />
+      )}
+      {Boolean(detail.related?.length) && (
+        <nav className={s.relatedLinks} aria-label="相关任务">
+          {detail.related!.map((item) => (
+            <a key={item.id} href={'#/session/' + encodeURIComponent(item.id)}>
+              <Icon name={item.flow === 'errand' ? 'checklist' : 'mail'} />
+              {item.relation === 'parent' ? '来自办事：' : item.flow === 'errand' ? '办事：' : '邮件草稿：'}
+              {item.title}
+              <Status state={item.state} />
+            </a>
+          ))}
+        </nav>
+      )}
+      {isErrand && detail.errand ? (
+        <>
+          {detail.errand.state.plan?.summary && (
+            <article className={s.answer}>
+              <Result>{detail.errand.state.plan.summary}</Result>
+              <Sources citations={session.citations} />
+            </article>
+          )}
+          <ErrandPanel errand={detail.errand} session={session} />
+        </>
+      ) : isMail && session.content ? (
+        <MailDraft
+          session={session}
+          busy={action.busy || active}
+          sending={sending}
+          edited={artifacts.some((artifact) => artifact.provenance === 'user_revision' && artifact.kind === 'draft')}
+          onEdit={edit}
+          onRequest={() =>
+            void action.run(
+              () => api.write('/sessions/' + session.id + '/approval', { revision: session.revision }),
+              refresh,
+            )
+          }
+          onPropose={() =>
+            void action.run(
+              () =>
+                api.write<{ key?: string; content?: string; pending?: boolean }>(
+                  '/sessions/' + session.id + '/rule-proposal',
+                  { revision: session.revision },
+                ),
+              (result) =>
+                action.setMessage(
+                  result.pending
+                    ? '正在从你的修改中总结规则，通常需要半分钟。完成后会通知你，提议在“资料 → 记忆与偏好”确认后才会生效。'
+                    : '已生成规则提议' +
+                        (result.content ? '：“' + result.content + '”' : '') +
+                        '。到“资料 → 记忆与偏好”确认后才会生效。',
+                ),
+            )
+          }
+        />
+      ) : (
+        session.content && (
+          <article className={s.answer}>
+            <Result>{session.content}</Result>
+            <Sources citations={session.citations} />
+          </article>
+        )
+      )}
+      {detail.research && (
+        <ResearchProgress
+          detail={detail.research}
+          sessionId={session.id}
+          active={active && detail.research.runId === session.currentRunId}
+        />
+      )}
+      {Boolean(detail.ruleUsage?.length) && (
+        <details className={s.disclosure}>
+          <summary>本次遵循的规则</summary>
+          {detail.ruleUsage!.map((rule) => (
+            <div key={rule.runId + ':' + rule.key} className={s.evidence}>
+              <p>
+                {rule.key} · 第 {rule.version} 版 · {rule.commitSha?.slice(0, 7) || '未提交的文件版本'}
+              </p>
+              <p className={s.prewrap}>{rule.content}</p>
+            </div>
+          ))}
+        </details>
       )}
       {attempts.map((attempt) => (
         <section className={s.conversation} key={attempt.id}>
@@ -943,10 +1196,13 @@ function SessionContent({
           </a>
         </div>
       )}
+      {canAnswer && session.research && (
+        <p className={s.muted}>提交修改意见会按本任务的研究投入开启新一轮，单独计算预算。</p>
+      )}
       {canAnswer && (
         <form className={s.composer} onSubmit={submit}>
           <label htmlFor="answer" className={s.composerLabel}>
-            {session.kind === 'study' ? '练习回答' : '修改意见'}
+            {session.kind === 'study' ? '练习回答' : isErrand ? '补充信息' : isMail ? '补充信息或修改要求' : '修改意见'}
           </label>
           <textarea
             id="answer"
@@ -1244,5 +1500,90 @@ function SessionContent({
         </section>
       )}
     </>
+  );
+}
+
+/** A reply draft shown as the letter that would be sent; sending always goes through the exact approval. */
+function MailDraft({
+  session,
+  busy,
+  sending,
+  edited,
+  onEdit,
+  onRequest,
+  onPropose,
+}: {
+  session: LearningSession;
+  busy: boolean;
+  sending: boolean;
+  edited: boolean;
+  onEdit: () => void;
+  onRequest: () => void;
+  onPropose: () => void;
+}) {
+  const questions = session.mail?.questions || [];
+  return (
+    <section className={s.letterDraft} aria-label="邮件草稿">
+      <dl className={s.letterHead}>
+        <div>
+          <dt>收件人</dt>
+          <dd>{session.recipient || '（未填写）'}</dd>
+        </div>
+        {Boolean(session.mail?.cc?.length) && (
+          <div>
+            <dt>抄送</dt>
+            <dd>{session.mail!.cc!.join('、')}</dd>
+          </div>
+        )}
+        <div>
+          <dt>主题</dt>
+          <dd>{session.title}</dd>
+        </div>
+        {session.mail?.threadId && (
+          <div>
+            <dt>线程</dt>
+            <dd>
+              <a href={'#/mail/' + encodeURIComponent(session.mail.threadId)}>查看往来信件</a>
+              {session.mail.inReplyTo ? ' · 作为回复发送（保留会话关联）' : ''}
+            </dd>
+          </div>
+        )}
+      </dl>
+      <div className={s.letterBody}>{session.content}</div>
+      <Sources citations={session.citations} />
+      {questions.length > 0 && session.state === 'waiting_feedback' && (
+        <div className={s.questions} role="note">
+          <h2>回复前需要你补充</h2>
+          <ol>
+            {questions.map((question, index) => (
+              <li key={index}>{question}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+      <div className={s.toolbar}>
+        <button
+          type="button"
+          className={s.primary}
+          disabled={busy || sending || session.state !== 'ready'}
+          onClick={onRequest}
+        >
+          <Icon name="mail" />
+          核对并发送
+        </button>
+        <button type="button" className={s.secondary} disabled={busy || sending} onClick={onEdit}>
+          修改草稿
+        </button>
+        {edited && (
+          <button type="button" className={s.textButton} disabled={busy} onClick={onPropose}>
+            <Icon name="branch" />
+            从我的修改总结规则
+          </button>
+        )}
+      </div>
+      <p className={s.marginNote}>
+        “核对并发送”会先生成一份不可更改的发送确认：收件人、主题、正文和版本都固定下来，你确认后才会发出。
+      </p>
+    </section>
   );
 }

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { PgBoss } from 'pg-boss';
 import type { Store, Tx } from '../packages/storage/src/index.js';
-import { Settings, initializeData, config } from '../packages/core/src/config.js';
+import { Settings, initializeData, config, modelFor } from '../packages/core/src/config.js';
 import { Application } from '../packages/core/src/application.js';
 
 describe('configuration snapshots and durable acknowledgements', () => {
@@ -78,6 +78,72 @@ describe('configuration snapshots and durable acknowledgements', () => {
     expect(JSON.stringify(value._assistant_config_commands)).not.toContain(original.llm.api_key);
     expect(JSON.stringify(value._assistant_config_commands)).not.toContain(original.mail_password);
     expect(saved).not.toHaveProperty('api_key');
+  });
+  it('keeps an optional reviewer separate, never moving its key to another service', async () => {
+    const reviewer = {
+      review_base_url: 'https://review.example.invalid/v1',
+      review_model: 'review-model',
+      review_api_key: 'synthetic-review-secret',
+    };
+    let view = await settings.save({ ...(await input()), ...reviewer }, 'review-1');
+    expect(view).toMatchObject({ review_base_url: reviewer.review_base_url, review_model: 'review-model' });
+    expect(view.has_review_api_key).toBe(true);
+    expect(JSON.stringify(view)).not.toContain('synthetic-review-secret');
+    // Omitted reviewer fields keep it; a blank key on the same service keeps the key.
+    await settings.save(await input('another-model'), 'review-2');
+    view = await settings.save(
+      { ...(await input()), review_base_url: reviewer.review_base_url, review_model: 'r2' },
+      'review-3',
+    );
+    expect((await config(folder)).llm.review).toEqual({
+      base_url: reviewer.review_base_url,
+      model: 'r2',
+      api_key: 'synthetic-review-secret',
+    });
+    // Moving to another address requires entering a key again.
+    await settings.save(
+      { ...(await input()), review_base_url: 'https://other.example.invalid/v1', review_model: 'r3' },
+      'review-4',
+    );
+    expect((await config(folder)).llm.review).toEqual({ base_url: 'https://other.example.invalid/v1', model: 'r3' });
+    const before = await readFile(join(folder, 'config.json'), 'utf8');
+    await expect(
+      settings.save({ ...(await input()), review_base_url: '', review_model: 'only-name' }, 'review-5'),
+    ).rejects.toThrow('评阅模型需要同时填写地址和名称');
+    expect(await readFile(join(folder, 'config.json'), 'utf8')).toBe(before);
+    view = await settings.save({ ...(await input()), review_base_url: '', review_model: '' }, 'review-6');
+    expect((await config(folder)).llm).not.toHaveProperty('review');
+    expect(view).toMatchObject({ review_base_url: '', review_model: '', has_review_api_key: false });
+  });
+  it('routes reviews to the reviewer and reuses the main key only on the same service', () => {
+    const llm = { base_url: 'https://a.example/v1', model: 'solver', api_key: 'main', tools: true };
+    expect(modelFor(llm, 'review')).toMatchObject({ model: 'solver', independent: false });
+    expect(modelFor({ ...llm, review: { base_url: 'https://a.example/v1', model: 'judge' } }, 'review')).toMatchObject({
+      base_url: 'https://a.example/v1',
+      model: 'judge',
+      api_key: 'main',
+      independent: true,
+      tools: true,
+    });
+    const other = modelFor({ ...llm, review: { base_url: 'https://b.example/v1', model: 'judge' } }, 'review');
+    expect(other.api_key).toBeUndefined();
+    expect(modelFor({ ...llm, review: { base_url: 'https://b.example/v1', model: 'judge' } }, 'solve').model).toBe(
+      'solver',
+    );
+  });
+  it('still reads acknowledgements stored before the reviewer existed', async () => {
+    const request = await input();
+    await settings.save(request, 'legacy-ack');
+    const value = await config(folder);
+    for (const record of Object.values(value._assistant_config_commands.records) as Array<{ response: any }>) {
+      delete record.response.review_base_url;
+      delete record.response.review_model;
+      delete record.response.has_review_api_key;
+    }
+    await writeFile(join(folder, 'config.json'), JSON.stringify(value));
+    const replay = await settings.save(request, 'legacy-ack');
+    expect(replay.model).toBe('new-model');
+    expect(replay).not.toHaveProperty('review_model');
   });
   it('recovers the same request after config rename succeeds and PostgreSQL command insert rolls back', async () => {
     // The production Application invokes Settings inside a transaction. Here the

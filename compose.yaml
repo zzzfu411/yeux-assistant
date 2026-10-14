@@ -9,6 +9,7 @@ x-app: &app
     ASSISTANT_DATA: /app/private
     HOST: 0.0.0.0
     PORT: 8765
+    ASSISTANT_REMOTE_ORIGIN: ${ASSISTANT_REMOTE_ORIGIN:-}
   volumes:
     - ${ASSISTANT_DATA_DIR:-./private}:/app/private
   depends_on:
@@ -32,7 +33,7 @@ services:
   api:
     <<: *app
     ports:
-      - "${ASSISTANT_BIND:-0.0.0.0}:${ASSISTANT_PORT:-8765}:8765"
+      - "${ASSISTANT_BIND:-127.0.0.1}:${ASSISTANT_PORT:-8765}:8765"
     command: [node, dist/apps/api/src/main.js]
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:8765/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]

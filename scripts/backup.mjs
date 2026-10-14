@@ -16,6 +16,11 @@ const entries = [
   'artifacts',
   'receipts',
   'mail-quarantine',
+  'workspace',
+  'mail-raw',
+  'ehall-evidence',
+  'mail-sim',
+  'web-push.json',
 ];
 export async function createBackup(folder, dump) {
   const parent = join(folder, 'backups');

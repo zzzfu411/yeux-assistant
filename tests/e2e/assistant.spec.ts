@@ -1,6 +1,13 @@
+import type { ResearchDetail } from '../../packages/contracts/src/research';
 import { test, expect, type Page, type Route } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import type { Citation, SourceMetadata, SourceSummary } from '../../packages/contracts/src/index';
+
+async function openMore(page: Page) {
+  // Desktop lists secondary pages in the sidebar; phones open them from the tab bar.
+  const more = page.getByLabel('更多', { exact: true });
+  if (await more.isVisible()) await more.click();
+}
 
 const timestamp = '2026-09-19T02:00:00.000Z';
 function fixture() {
@@ -44,6 +51,7 @@ function fixture() {
     updatedAt: timestamp,
   };
   return {
+    research: null as ResearchDetail | null,
     runtimeError: false,
     modelConfigured: true,
     workerOnline: true,
@@ -94,6 +102,23 @@ function fixture() {
       },
     ],
     schedules: [] as Array<Record<string, unknown>>,
+    flows: [] as Array<Record<string, unknown>>,
+    mailWaiting: 0,
+    mailThreads: [] as Array<Record<string, unknown>>,
+    mailMessages: [] as Array<Record<string, unknown>>,
+    mailSettings: {
+      mode: 'simulation',
+      address: 'me@smail.nju.edu.cn',
+      has_password: false,
+      imap_host: '',
+      imap_port: 993,
+      smtp_host: '',
+      smtp_port: 465,
+      poll: false,
+      auto_draft: 'direct',
+      daily_limit: 10,
+      revision: 'c'.repeat(64),
+    },
   };
 }
 type State = ReturnType<typeof fixture>;
@@ -252,6 +277,9 @@ async function setup(page: Page, state = fixture(), login = true) {
         pendingTotal: pending.length,
         sessions: pending.slice(0, 3).map(summary),
         unread: 1,
+        mailWaiting: state.mailWaiting,
+        mailNew: state.mailThreads.filter((t: any) => t.triage === 'new').length,
+        mailMode: state.mailSettings.mode,
         modelConfigured: state.modelConfigured,
         workerOnline: state.workerOnline,
         backgroundIssues: state.runtimeError ? 1 : 0,
@@ -324,6 +352,7 @@ async function setup(page: Page, state = fixture(), login = true) {
         attempts: state.attempts,
       });
     if (path === '/sessions') return json({ items: [state.session], total: 1 });
+    if (path === '/sessions/session-1/research/export') return json({ research: state.research });
     if (path === '/sessions/session-1')
       return json({
         session: state.session,
@@ -331,6 +360,7 @@ async function setup(page: Page, state = fixture(), login = true) {
         artifacts: state.artifacts,
         approvals: state.approvals,
         legacy: state.legacy,
+        research: state.research,
       });
     if (path === '/sources')
       return state.sourcesFailed ? json({ error: { message: '资料载入失败' } }, 503) : json(state.sources);
@@ -364,6 +394,22 @@ async function setup(page: Page, state = fixture(), login = true) {
       ).catch(() => {});
     }
     if (path === '/memories') return json(state.memories);
+    if (path === '/flows') return json(state.flows);
+    if (path === '/push/devices') return json([]);
+    if (path === '/push/key') return json({ publicKey: 'BMock' });
+    if (path === '/settings/mail') return json(state.mailSettings);
+    if (path === '/mail/threads')
+      return json({
+        items: state.mailThreads,
+        total: state.mailThreads.length,
+        counts: { new: state.mailThreads.filter((t: any) => t.triage === 'new').length },
+      });
+    if (path.startsWith('/mail/threads/')) {
+      const thread = state.mailThreads.find((t: any) => t.id === path.split('/').at(-1));
+      return thread
+        ? json({ thread, messages: state.mailMessages, sessions: [] })
+        : json({ error: { code: 'not_found', message: '不存在' } }, 404);
+    }
     if (path.endsWith('/history'))
       return json([
         { key: 'legacy-preference', version: 1, snapshot: { content: '先提问再解释' }, created_at: timestamp },
@@ -411,7 +457,7 @@ async function setup(page: Page, state = fixture(), login = true) {
   return state;
 }
 async function secondary(page: Page, name: string) {
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name, exact: true }).click();
 }
 
@@ -436,7 +482,7 @@ test('输入刷新与切页可恢复，退出清除会话草稿', async ({ page 
   await page.getByRole('link', { name: '目标', exact: true }).click();
   await page.getByRole('link', { name: '今天', exact: true }).click();
   await expect(page.getByLabel('学习目标')).toHaveValue('每天学一点 TypeScript');
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('button', { name: '退出', exact: true }).click();
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
   expect(
@@ -488,10 +534,10 @@ test('版本冲突保留回答，显式载入后用新版本提交', async ({ pa
 test('中文检索能打开原文，Markdown 不执行脚本', async ({ page }) => {
   await setup(page);
   await page.getByRole('link', { name: '资料', exact: true }).click();
-  await page.getByText('检索正文片段', { exact: true }).click();
+  await expect(page.getByRole('heading', { name: '检索正文片段', exact: true })).toBeVisible();
   await page.getByLabel('正文关键词', { exact: true }).fill('需求');
   await page.getByRole('button', { name: '检索正文', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '正文片段' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /“需求”的正文片段/ })).toBeVisible();
   await page.getByRole('link', { name: '第一讲：软件工程', exact: true }).click();
   await expect(page.getByRole('heading', { name: '第一讲：软件工程' })).toBeVisible();
   expect(await page.evaluate(() => Boolean((window as unknown as { __unsafe?: boolean }).__unsafe))).toBe(false);
@@ -508,6 +554,23 @@ test('设置密钥不进入草稿，保存与连接测试分开', async ({ page 
   await expect(page.getByLabel('API 密钥', { exact: true })).toHaveValue('');
   await page.getByRole('button', { name: '测试已保存的连接' }).click();
   await expect(page.getByRole('status').filter({ hasText: '连接成功' })).toBeVisible();
+});
+test('独立评阅模型可选填写，密钥不进入浏览器草稿', async ({ page }) => {
+  const state = await setup(page);
+  await secondary(page, '设置');
+  await page.getByText('独立评阅模型（深入研究）').click();
+  await page.getByLabel('评阅模型地址', { exact: true }).fill('https://review.example/v1');
+  await page.getByLabel('评阅模型名称', { exact: true }).fill('review-model');
+  await page.getByLabel('评阅密钥', { exact: true }).fill('private-review-key');
+  expect(await page.evaluate(() => JSON.stringify(sessionStorage))).not.toContain('private-review-key');
+  await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '配置已保存' })).toBeVisible();
+  expect(state.posts.at(-1)!.body).toMatchObject({
+    review_base_url: 'https://review.example/v1',
+    review_model: 'review-model',
+    review_api_key: 'private-review-key',
+  });
+  await expect(page.getByLabel('评阅密钥', { exact: true })).toHaveValue('');
 });
 test('旧偏好 scope 保留，独立计划可创建', async ({ page }) => {
   const state = await setup(page);
@@ -602,7 +665,7 @@ test('账号会话刷新后保留，浏览器不保存密码或访问令牌', as
   expect(await page.evaluate(() => sessionStorage.getItem('assistant.v2.token'))).toBe(null);
   expect(await page.evaluate(() => JSON.stringify(sessionStorage))).not.toContain('test-password');
   await expect.poll(() => state.events.includes('7')).toBe(true);
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('button', { name: '退出', exact: true }).click();
   await page.reload();
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
@@ -792,7 +855,7 @@ test('课程资料按课程筛选，检索传课程范围并保留未分类资�
   await expect(page.getByRole('link', { name: /数据库关系模型/ })).toBeVisible();
   await expect(page.getByRole('link', { name: /GSE第一讲/ })).toHaveCount(0);
   await expect(page.getByText('数据库 · PDF · 第 3 版', { exact: true })).toBeVisible();
-  await page.getByText('检索正文片段', { exact: true }).click();
+  await expect(page.getByRole('heading', { name: '检索正文片段', exact: true })).toBeVisible();
   await page.getByLabel('正文关键词', { exact: true }).fill('可验证');
   await page.getByRole('button', { name: '检索正文', exact: true }).click();
   await expect(page.getByRole('link', { name: '数据库关系模型', exact: true })).toBeVisible();
@@ -872,7 +935,7 @@ test('课程检索切换不会被旧课程的迟到响应覆盖', async ({ page 
   await setup(page, state);
   await page.getByRole('link', { name: '资料', exact: true }).click();
   await page.getByLabel('筛选课程').selectOption('gse');
-  await page.getByText('检索正文片段', { exact: true }).click();
+  await expect(page.getByRole('heading', { name: '检索正文片段', exact: true })).toBeVisible();
   await page.getByLabel('正文关键词', { exact: true }).fill('可验证');
   await page.getByRole('button', { name: '检索正文', exact: true }).click();
   await expect.poll(() => state.searches.some((url) => url.includes('course=gse'))).toBe(true);
@@ -893,7 +956,7 @@ test('课程原文件下载退出后中止，不产生迟到下载', async ({ pa
   page.on('download', () => downloads++);
   await page.getByRole('button', { name: '下载原文件', exact: true }).click();
   await expect.poll(() => state.originals.length).toBe(1);
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('button', { name: '退出', exact: true }).click();
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
   await expect.poll(() => state.completedOriginals.length).toBe(1);
@@ -1068,7 +1131,7 @@ for (const [mode, label, field, action, prompt] of [
   test(`首页直接进入${label}，确认填写后才创建对应任务`, async ({ page }, testInfo) => {
     const state = await setup(page),
       features = page.getByRole('group', { name: '选择功能' });
-    await expect(features.getByRole('button')).toHaveCount(4);
+    await expect(features.getByRole('button')).toHaveCount(6);
     await features.getByRole('button', { name: label, exact: true }).click();
     await expect(features.getByRole('button', { name: label, exact: true })).toHaveAttribute('aria-pressed', 'true');
     const form = page.getByRole('form', { name: label + '填写区', exact: true });
@@ -1089,6 +1152,93 @@ for (const [mode, label, field, action, prompt] of [
   });
 }
 
+test('办理通知：粘贴通知、可选流程，确认后才创建办事', async ({ page }) => {
+  const state = fixture();
+  state.flows.push({
+    id: 'showcase',
+    version: 1,
+    enabled: true,
+    definition: {
+      id: 'showcase',
+      title: '课程展示报名',
+      version: 1,
+      trigger: { manual: true },
+      steps: ['extract_notice', 'archive'],
+    },
+  });
+  await setup(page, state);
+  await page.getByRole('button', { name: '办理通知', exact: true }).click();
+  const form = page.getByRole('form', { name: '办理通知填写区', exact: true });
+  await expect(form.getByRole('button', { name: '开始办理', exact: true })).toBeDisabled();
+  await expect(page.getByRole('link', { name: /课程展示报名/ })).toBeVisible();
+  await page
+    .getByLabel('通知原文', { exact: true })
+    .fill('课程展示定于 11 月 20 日 14:00 举行，请于 11 月 10 日前报名。');
+  await page.getByLabel('按流程办理', { exact: true }).selectOption('showcase');
+  expect(state.posts).toHaveLength(0);
+  await form.getByRole('button', { name: '开始办理', exact: true }).click();
+  await expect.poll(() => state.posts.length).toBe(1);
+  expect(state.posts[0]).toMatchObject({
+    path: '/errands',
+    body: { text: '课程展示定于 11 月 20 日 14:00 举行，请于 11 月 10 日前报名。', flowId: 'showcase' },
+  });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+test('邮件：按线程查看往来，起草回复与模拟来信都需本人明确操作', async ({ page }) => {
+  const state = fixture();
+  state.mailThreads.push({
+    id: 'thread-1',
+    subject: '组会报告安排',
+    participants: ['ta@example.edu'],
+    lastMessageAt: timestamp,
+    triage: 'new',
+    messageCount: 1,
+    latestFrom: 'ta@example.edu',
+    preview: '请确认周五报告。',
+    sessionId: null,
+    sessionState: null,
+    revision: 1,
+  });
+  state.mailMessages.push({
+    id: 'm1',
+    direction: 'in',
+    from: 'ta@example.edu',
+    to: ['me@smail.nju.edu.cn'],
+    cc: [],
+    subject: '组会报告安排',
+    sentAt: timestamp,
+    body: '请确认周五 15:00 报告。',
+    bodyOrigin: 'html',
+    bulk: false,
+    attachments: [],
+    sourceId: 'source-1',
+  });
+  await setup(page, state);
+  const more = page.getByLabel('更多', { exact: true });
+  if (await more.isVisible()) await more.click();
+  await page.getByRole('link', { name: /^邮件/ }).first().click();
+  await expect(page.getByRole('heading', { name: '邮件', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: /待处理/ }).click();
+  await page.getByRole('link', { name: /组会报告安排/ }).click();
+  await expect(page.getByText('请确认周五 15:00 报告。')).toBeVisible();
+  await expect(page.getByText('由 HTML 邮件转换为文本')).toBeVisible();
+  expect(state.posts).toHaveLength(0);
+  await page.getByRole('button', { name: '起草回复', exact: true }).click();
+  await expect.poll(() => state.posts.length).toBe(1);
+  expect(state.posts[0]).toMatchObject({ path: '/mail/threads/thread-1/draft', body: { revision: 1 } });
+  // The reply draft opens as its own task page.
+  await expect(page.getByRole('heading', { name: state.session.title, exact: true })).toBeVisible();
+  await page.goto('/#/mail/thread-1');
+  await page.getByText('模拟对方在这个线程里回信').click();
+  await page.getByLabel('正文', { exact: true }).fill('收到，谢谢。');
+  await page.getByRole('button', { name: '放入模拟收件箱', exact: true }).click();
+  await expect.poll(() => state.posts.length).toBe(2);
+  expect(state.posts[1]).toMatchObject({
+    path: '/mail/simulate',
+    body: { body: '收到，谢谢。', replyToThread: 'thread-1' },
+  });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
 test('功能草稿独立保存，刷新保留长材料和目标的资料选择', async ({ page }) => {
   await setup(page);
   const features = page.getByRole('group', { name: '选择功能' }),
@@ -1152,8 +1302,8 @@ test('首页待办按状态提供动作，常用入口可直接使用', async ({
   await page.getByRole('link', { name: /查看进度/ }).click();
   await expect(page.getByRole('button', { name: '停止', exact: true })).toBeVisible();
   await page.getByRole('link', { name: '今天', exact: true }).click();
-  await page.getByRole('link', { name: /资料管理/ }).click();
-  await expect(page.getByRole('button', { name: '添加资料', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: /规则与流程 已确认/ }).click();
+  await expect(page.getByRole('heading', { name: '规则与流程', exact: true })).toBeVisible();
   await page.getByRole('link', { name: '今天', exact: true }).click();
   await page.getByRole('link', { name: /定时计划 按时准备/ }).click();
   await expect(page.getByRole('button', { name: '添加计划', exact: true })).toBeVisible();
@@ -1433,7 +1583,7 @@ for (const appearance of ['light', 'dark'] as const)
       expect(box?.height).toBeGreaterThanOrEqual(44);
     }
     await page.screenshot({ path: testInfo.outputPath(`today-${appearance}.png`), fullPage: true, scale: 'css' });
-    await page.getByLabel('更多', { exact: true }).click();
+    await openMore(page);
     await expect(page.getByRole('link', { name: '设置', exact: true })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath(`menu-${appearance}.png`), fullPage: true, scale: 'css' });
     await page.getByRole('link', { name: '设置', exact: true }).click();
@@ -1491,4 +1641,111 @@ test('今天会刷新后台状态，持续保存正在输入的草稿', async ({
   await expect(page.getByText('后台有 1 项检查需要处理。')).toHaveCount(0);
   await expect(page.getByText(/后台尚未运行/)).toBeVisible();
   await expect(page.getByLabel('学习目标')).toHaveValue('保留输入的学习目标');
+});
+
+test('深入研究保留投入和资料草稿，明确提交后创建任务', async ({ page }, testInfo) => {
+  const state = await setup(page);
+  await page.getByRole('button', { name: '深入研究', exact: true }).click();
+  await page.getByLabel('研究问题', { exact: true }).fill('对比数据库隔离级别与适用边界。');
+  await page.getByRole('radio', { name: /深入/ }).check();
+  await page.getByText('研究资料 · 自动检索', { exact: true }).click();
+  await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
+  await page.getByRole('button', { name: '整理材料', exact: true }).first().click();
+  await page.getByRole('button', { name: '深入研究', exact: true }).click();
+  await page.reload();
+  await expect(page.getByRole('radio', { name: /深入/ })).toBeChecked();
+  await expect(page.getByLabel('研究问题', { exact: true })).toHaveValue('对比数据库隔离级别与适用边界。');
+  await expect(page.getByText('研究资料 · 已选 1 份')).toBeVisible();
+  await expect(page.getByText(/≤ 8 次调用/)).toBeVisible();
+  expect(state.posts).toHaveLength(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('research-form.png'), fullPage: true });
+  await page.getByRole('button', { name: '开始研究', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '对比数据库隔离级别与适用边界。', exact: true })).toBeVisible();
+  expect(state.posts[0]?.body).toMatchObject({ kind: 'work', research: { effort: 'high', sourceIds: ['source-1'] } });
+});
+
+test('未连接模型时深入研究不能提交，并指向设置', async ({ page }) => {
+  const state = fixture();
+  state.modelConfigured = false;
+  await setup(page, state);
+  await page.getByRole('button', { name: '深入研究', exact: true }).click();
+  await page.getByLabel('研究问题', { exact: true }).fill('比较两种隔离级别。');
+  await expect(page.getByText('深入研究需要先连接模型')).toBeVisible();
+  await expect(page.getByRole('button', { name: '开始研究', exact: true })).toBeDisabled();
+  expect(state.posts).toHaveLength(0);
+});
+test('研究记录展示保留版本、未完整报告的用量和导出', async ({ page }, testInfo) => {
+  const state = fixture();
+  state.session.kind = 'work';
+  state.session.goalId = null;
+  state.session.state = 'ready';
+  state.research = {
+    runId: 'run-1',
+    model: 'fixture',
+    sourceVersions: [],
+    calls: 4,
+    maxCalls: 4,
+    elapsedMs: 1200,
+    usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15, reportedCalls: 1, complete: false },
+    state: {
+      version: 1,
+      effort: 'low',
+      phase: 'finished',
+      stopReason: 'budget',
+      best: 0,
+      warnings: [],
+      candidates: [
+        {
+          index: 0,
+          strategy: '依据资料求解',
+          parent: null,
+          answer: { content: '保留的候选答案', citations: [], limitations: ['尚待核对'] },
+          citations: [],
+          review: {
+            scores: { coverage: 3, evidence: 2, challenges: 2, usability: 3 },
+            rationale: '覆盖主要要求',
+            issues: ['补充反例'],
+            queries: [],
+            satisfied: false,
+          },
+          score: 10,
+          accepted: true,
+          reviewNote: '首个已评阅版本。',
+        },
+        {
+          index: 1,
+          strategy: '根据意见修订',
+          parent: 0,
+          answer: { content: '退步的候选答案', citations: [], limitations: [] },
+          citations: [],
+          review: {
+            scores: { coverage: 1, evidence: 1, challenges: 1, usability: 1 },
+            rationale: '遗漏主要要求',
+            issues: ['遗漏'],
+            queries: [],
+            satisfied: false,
+          },
+          score: 4,
+          accepted: false,
+          reviewNote: '评分未提高，保留之前的较好版本。',
+        },
+      ],
+    },
+  };
+  await setup(page, state);
+  await page.goto('/#/session/session-1');
+  const panel = page.getByRole('region', { name: '研究记录' });
+  await expect(panel).toContainText('当前采用第 1 版');
+  await expect(panel).toContainText('已报告 15 token（不完整）');
+  await panel.getByText('候选版本与查证（2）').click();
+  await panel.getByText('第 2 版', { exact: true }).click();
+  await expect(panel.getByRole('img', { name: '模型评分 4 / 16' })).toBeVisible();
+  await expect(panel).toContainText('评分未提高，保留之前的较好版本。');
+  await expect(panel.getByText('退步的候选答案', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('research-record.png'), fullPage: true });
+  const download = page.waitForEvent('download');
+  await panel.getByRole('button', { name: '导出研究记录' }).click();
+  expect((await download).suggestedFilename()).toBe('research-session-1.json');
 });

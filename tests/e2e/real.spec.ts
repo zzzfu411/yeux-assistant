@@ -1,6 +1,12 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+
+async function openMore(page: Page) {
+  // Desktop lists secondary pages in the sidebar; phones open them from the tab bar.
+  const more = page.getByLabel('更多', { exact: true });
+  if (await more.isVisible()) await more.click();
+}
 
 // Explicit opt-in: this suite only targets a disposable API/Worker instance.
 test.skip(
@@ -119,10 +125,10 @@ test('真实 PostgreSQL 与 Worker：资料→目标→自评→复习记录→�
   });
   await page.screenshot({ path: testInfo.outputPath('real-source-restored.png'), fullPage: true, scale: 'css' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name: '历史', exact: true }).click();
   await expect(page.getByRole('link', { name: new RegExp(title) })).toBeVisible();
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name: '定时计划', exact: true }).click();
   await page.getByRole('button', { name: '添加计划', exact: true }).click();
   await page.getByLabel('计划名称').fill('暂停的验收计划 ' + suffix);
@@ -137,7 +143,7 @@ test('真实 PostgreSQL 与 Worker：资料→目标→自评→复习记录→�
   });
   expect(added.ok()).toBe(true);
   const deviceId = (await added.json()).deviceId;
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name: '设备', exact: true }).click();
   const lamp = page.getByRole('article').filter({ has: page.getByRole('heading', { name: lampName, exact: true }) });
   await lamp.getByRole('button', { name: '开灯', exact: true }).click();
@@ -160,7 +166,7 @@ test('真实 PostgreSQL 与 Worker：资料→目标→自评→复习记录→�
   });
   await page.screenshot({ path: testInfo.outputPath('real-device-verified.png'), fullPage: true, scale: 'css' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name: '设置', exact: true }).click();
   await expect(page.getByRole('button', { name: '保存配置', exact: true })).toBeVisible();
 });

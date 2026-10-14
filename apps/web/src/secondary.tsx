@@ -1,3 +1,4 @@
+import { WorkspacePanel } from './workspace';
 import { useRef, useState, type FormEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ModelSettingsInput, ScheduleInput, type LearningSession } from '../../../packages/contracts/src/index';
@@ -5,6 +6,8 @@ import { useAction, useApi, useData, useDraft } from './api';
 import { date, ErrorNotice, Heading, Pages, QueryState, SessionRows, useCursorList, CursorControls } from './ui';
 import s from './styles.module.css';
 import { RuntimeStatusPanel } from './runtime-status';
+import { Icon } from './icons';
+import { MailSettingsPanel, PushPanel } from './connections';
 import { AgentConnectionsPanel } from './agent-connections';
 import type { SessionSummary } from '../../../packages/contracts/src/pagination';
 
@@ -25,6 +28,9 @@ type ModelSettings = {
   tools: boolean;
   revision: string;
   mail_configured: boolean;
+  review_base_url?: string;
+  review_model?: string;
+  has_review_api_key?: boolean;
 };
 type Notification = {
   id: string;
@@ -358,10 +364,38 @@ export function SettingsPage() {
         <AgentConnectionsPanel />
       </>
     );
+  if (view === 'workspace')
+    return (
+      <>
+        <a className={s.back} href="#/settings">
+          返回设置
+        </a>
+        <Heading title="规则与流程">保存可以重复使用的做事方法。</Heading>
+        <WorkspacePanel />
+      </>
+    );
   const statusFirst = view === 'runtime';
   return (
     <>
-      <Heading title="设置">连接模型，查看后台运行状态。</Heading>
+      <Heading title="设置">连接模型，管理规则和外部连接，查看后台运行状态。</Heading>
+      <div className={s.settingsLinks}>
+        <a href="#/settings?view=workspace">
+          <Icon name="branch" />
+          <span>
+            规则与流程
+            <small>确认后的纠正写入私密 Git，新任务按版本使用</small>
+          </span>
+          <Icon name="arrow" />
+        </a>
+        <a href="#/settings?view=agents">
+          <Icon name="device" />
+          <span>
+            外部 Agent
+            <small>按连接授权读取资料、准备任务</small>
+          </span>
+          <Icon name="arrow" />
+        </a>
+      </div>
       {statusFirst && <RuntimeStatusPanel />}
       <QueryState pending={query.isPending} error={query.error} retry={() => void query.refetch()} />
       {query.data && (
@@ -373,15 +407,6 @@ export function SettingsPage() {
           }}
         />
       )}
-      <section className={s.section}>
-        <div className={s.sectionHeading}>
-          <h2>外部 Agent</h2>
-          <a className={s.secondary} href="#/settings?view=agents">
-            管理连接
-          </a>
-        </div>
-        <p className={s.muted}>授权读取资料、准备任务；按连接控制权限。</p>
-      </section>
       {!statusFirst && <RuntimeStatusPanel />}
     </>
   );
@@ -396,22 +421,47 @@ function SettingsForm({
   const api = useApi(),
     client = useQueryClient(),
     action = useAction();
-  const [draft, setDraft] = useDraft('model', {
+  const [draft, setDraft] = useDraft<{
+    base_url: string;
+    model: string;
+    tools: boolean;
+    revision: string;
+    review_base_url?: string;
+    review_model?: string;
+  }>('model', {
     base_url: settings.base_url,
     model: settings.model,
     tools: settings.tools,
     revision: settings.revision,
+    review_base_url: settings.review_base_url || '',
+    review_model: settings.review_model || '',
   });
-  const [apiKey, setApiKey] = useState('');
+  const [apiKey, setApiKey] = useState(''),
+    [reviewKey, setReviewKey] = useState('');
+  // Drafts saved before the reviewer existed fall back to the stored values.
+  const reviewBase = draft.review_base_url ?? settings.review_base_url ?? '',
+    reviewModel = draft.review_model ?? settings.review_model ?? '';
   const save = (e: FormEvent) => {
     e.preventDefault();
-    const submittedKey = apiKey;
+    const submittedKey = apiKey,
+      submittedReviewKey = reviewKey;
     void action.run(
       () =>
-        api.write<ModelSettings>('/settings/model', ModelSettingsInput.parse({ ...draft, api_key: apiKey }), 'PATCH'),
+        api.write<ModelSettings>(
+          '/settings/model',
+          ModelSettingsInput.parse({
+            ...draft,
+            api_key: apiKey,
+            review_base_url: reviewBase,
+            review_model: reviewModel,
+            ...(reviewKey ? { review_api_key: reviewKey } : {}),
+          }),
+          'PATCH',
+        ),
       (result) => {
         setDraft((current) => ({ ...current, revision: result.revision }));
         setApiKey((current) => (current === submittedKey ? '' : current));
+        setReviewKey((current) => (current === submittedReviewKey ? '' : current));
         action.setMessage('配置已保存。可以测试连接。');
         void client.invalidateQueries();
       },
@@ -422,9 +472,18 @@ function SettingsForm({
       if (result) setDraft((current) => ({ ...current, revision: result.revision }));
       action.setMessage('已载入最新版本，输入已保留。');
     });
+  const connected = Boolean(settings.base_url && settings.model);
   return (
     <>
-      <form className={s.form} onSubmit={save}>
+      <form className={`${s.form} ${s.settingsCard}`} onSubmit={save} aria-labelledby="model-settings-title">
+        <div className={s.sectionHeading}>
+          <h2 id="model-settings-title">模型连接</h2>
+          <span className={s.status} data-tone={connected ? 'success' : 'accent'}>
+            <i aria-hidden="true" />
+            {connected ? (settings.has_api_key ? '已配置' : '已配置 · 无密钥') : '未配置'}
+          </span>
+        </div>
+        <p className={s.muted}>兼容 Chat Completions 接口。保存与测试连接分开进行。</p>
         <label>
           模型服务地址
           <input
@@ -466,6 +525,51 @@ function SettingsForm({
           允许向模型提供检索到的资料片段
         </label>
         <p className={s.muted}>关闭后，不提供资料片段或历史生成内容；本次输入和已保存偏好仍会发送。</p>
+        <details className={s.reviewerSettings} open={Boolean(settings.review_model) || undefined}>
+          <summary>
+            独立评阅模型（深入研究）
+            <span className={s.muted}>
+              {settings.review_model ? ' · 当前：' + settings.review_model : ' · 未设置，由主模型自评'}
+            </span>
+          </summary>
+          <p className={s.muted}>
+            求解与评阅用不同模型，可减少同一模型重复自己的错误。两项都留空则沿用主模型；与主模型同一服务地址时可不填密钥。
+          </p>
+          <div className={s.formGrid}>
+            <label>
+              评阅模型地址
+              <input
+                type="url"
+                maxLength={2000}
+                value={reviewBase}
+                onChange={(e) => setDraft({ ...draft, review_base_url: e.target.value })}
+                placeholder="留空沿用主模型"
+                autoComplete="off"
+              />
+            </label>
+            <label>
+              评阅模型名称
+              <input
+                value={reviewModel}
+                maxLength={300}
+                onChange={(e) => setDraft({ ...draft, review_model: e.target.value })}
+                placeholder="例如另一家厂商的模型"
+                autoComplete="off"
+              />
+            </label>
+          </div>
+          <label>
+            评阅密钥
+            <input
+              type="password"
+              value={reviewKey}
+              maxLength={10000}
+              onChange={(e) => setReviewKey(e.target.value)}
+              placeholder={settings.has_review_api_key ? '已保存；留空保留' : '更换地址时需重新填写'}
+              autoComplete="new-password"
+            />
+          </label>
+        </details>
         <div className={s.toolbar}>
           <button className={s.primary} disabled={action.busy}>
             保存配置
@@ -491,13 +595,8 @@ function SettingsForm({
           </p>
         )}
       </form>
-      <section className={s.section}>
-        <h2>运行方式</h2>
-        <p>后台运行时持续处理任务。设备休眠或服务停止期间，任务会等待恢复。</p>
-        <p className={s.muted}>
-          邮箱{settings.mail_configured ? '已配置，发送前仍需核对具体内容' : '尚未配置'}。账号配置保存在部署设备。
-        </p>
-      </section>
+      <MailSettingsPanel />
+      <PushPanel />
     </>
   );
 }

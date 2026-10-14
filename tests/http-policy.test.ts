@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { FastifyRequest } from 'fastify';
-import { publicOrigin, checkOrigin, secureSession } from '../apps/api/src/http-policy.js';
+import { publicOrigin, remoteOrigin, checkOrigin, secureSession } from '../apps/api/src/http-policy.js';
 const request = (origin: string, host = '127.0.0.1:8765') =>
   ({
     method: 'POST',
@@ -42,5 +42,20 @@ describe('explicit server origin', () => {
     expect(() => checkOrigin(request('https://other.example'), 'https://study.example')).toThrow();
     expect(secureSession('http', 'https://study.example')).toBe(true);
     expect(secureSession('http', 'http://127.0.0.1:8765')).toBe(false);
+  });
+  it('accepts a tunnelled HTTPS entrance only for its own Host, keeping local loopback use', () => {
+    const remote = 'https://assistant.example';
+    // Phone through the proxy: Host is the public name, Origin must match it, cookies are Secure.
+    const phone = request('https://assistant.example', 'assistant.example');
+    expect(() => checkOrigin(phone, undefined, remote)).not.toThrow();
+    expect(secureSession('http', undefined, phone, remote)).toBe(true);
+    expect(() => checkOrigin(request('https://evil.example', 'assistant.example'), undefined, remote)).toThrow();
+    // The Mac browser on loopback still works and keeps non-Secure cookies over plain HTTP.
+    const local = request('http://127.0.0.1:8765');
+    expect(() => checkOrigin(local, undefined, remote)).not.toThrow();
+    expect(secureSession('http', undefined, local, remote)).toBe(false);
+    // A loopback page cannot claim the remote origin.
+    expect(() => checkOrigin(request('https://assistant.example'), undefined, remote)).toThrow();
+    expect(() => remoteOrigin('http://assistant.example')).toThrow();
   });
 });

@@ -12,6 +12,6 @@ export async function createBoss(url = process.env.DATABASE_URL!, schedules = fa
   await boss.createQueue('mail-send', { retryLimit: 0, expireInSeconds: 90 });
   return boss;
 }
-export async function enqueue(boss: PgBoss, tx: Tx, runId: string) {
-  await boss.send(LEARNING_QUEUE, { runId }, { db: tx.bossDb, singletonKey: runId });
+export async function enqueue(boss: PgBoss, tx: Tx, runId: string, seconds = 180) {
+  await boss.send(LEARNING_QUEUE, { runId }, { db: tx.bossDb, singletonKey: runId, expireInSeconds: seconds + 30 });
 }

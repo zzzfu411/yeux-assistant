@@ -14,6 +14,13 @@ const migrations = [
   { version: 6, file: 'packages/storage/migrations/0006.sql' },
   { version: 7, file: 'packages/storage/migrations/0007.sql' },
   { version: 8, file: 'packages/storage/migrations/0008.sql' },
+  { version: 9, file: 'packages/storage/migrations/0009.sql' },
+  { version: 10, file: 'packages/storage/migrations/0010.sql' },
+  { version: 11, file: 'packages/storage/migrations/0011.sql' },
+  { version: 12, file: 'packages/storage/migrations/0012.sql' },
+  { version: 13, file: 'packages/storage/migrations/0013.sql' },
+  { version: 14, file: 'packages/storage/migrations/0014.sql' },
+  { version: 15, file: 'packages/storage/migrations/0015.sql' },
 ] as const;
 
 export type Row = Record<string, any>;

@@ -1012,4 +1012,35 @@ describe.runIf(Boolean(url))('durable learning with PostgreSQL and LangGraph', (
     expect(calls).toBe(5);
     expect(retry.deadline).toEqual(first.deadline);
   });
+  it('applies a Git-backed correction to another session and records only the rules actually sent to the model', async () => {
+    const rule = {
+      key: 'notice.deadline-vs-start',
+      scope: 'correction',
+      content: '报名截止时间不是活动开始时间，两者分别记录。',
+      confirmed: true,
+      enabled: true,
+      revision: 0,
+    };
+    const saved = await app.saveMemory('rule-save', rule);
+    await app.saveMemory('mail-rule', { ...rule, key: 'mail.signature', scope: 'mail', content: '合成私密邮件落款' });
+    const contexts: string[] = [];
+    await mockModel((_instruction, context) => {
+      contexts.push(context);
+      return { content: '已分别整理两个时间。', sourceIds: [] };
+    });
+    const first = await app.addSession('notice-one', { kind: 'work', prompt: '通知一：报名于2026年10月6日截止。' });
+    await execute(first.runId);
+    const second = await app.addSession('notice-two', {
+      kind: 'work',
+      prompt: '通知二：报名于2026年10月7日截止，活动10月8日开始。',
+    });
+    await execute(second.runId);
+    expect(contexts).toHaveLength(2);
+    expect(contexts.every((context) => context.includes(rule.content))).toBe(true);
+    expect(contexts.join('')).not.toContain('合成私密邮件落款');
+    const usage = await store.rows('SELECT * FROM app.rule_usage ORDER BY run_id');
+    expect(usage).toHaveLength(2);
+    expect(usage.every((row) => row.commit_sha === saved.commitSha && row.version === 1)).toBe(true);
+    expect((await app.session(second.sessionId)).ruleUsage[0]!.content).toBe(rule.content);
+  });
 });

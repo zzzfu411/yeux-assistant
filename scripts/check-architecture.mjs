@@ -25,6 +25,8 @@ function targetOf(from, specifier) {
   return [path, stem + '.ts', stem + '.tsx', join(stem, 'index.ts')].find((value) => known.has(value));
 }
 function allowed(from, to) {
+  if (from.startsWith('apps/device-bridge/'))
+    return to.startsWith('apps/device-bridge/') || to.startsWith('packages/contracts/');
   if (from.startsWith('apps/web/')) return to.startsWith('apps/web/') || to.startsWith('packages/contracts/');
   if (from.startsWith('packages/contracts/')) return to.startsWith('packages/contracts/');
   if (from.startsWith('packages/storage/')) return to.startsWith('packages/storage/');

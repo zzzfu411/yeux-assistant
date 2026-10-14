@@ -1,13 +1,15 @@
+import { Workspace } from './workspace/service.js';
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { PoolClient } from 'pg';
 import type { PgBoss } from 'pg-boss';
 import type { Store } from '../../storage/src/index.js';
 import { AppError, event } from './common.js';
-import { config } from './config.js';
+import { config, mailMode } from './config.js';
 import { Knowledge } from './knowledge.js';
 import { MailActions } from './mail.js';
-import { LEARNING_QUEUE } from './queue.js';
+import { Push } from './push.js';
+import { LEARNING_QUEUE, enqueue } from './queue.js';
 import { openCheckpoints } from './learning.js';
 import { ArtifactExporter, Scheduler } from './scheduler.js';
 import { claimRun, failRun, publicRuntimeError, type RunIdentity } from './runtime-state.js';
@@ -112,7 +114,7 @@ export class RunSupervisor {
       };
       const timer = setTimeout(
         () => {
-          result = { ok: false, error: '本次运行已达到 180 秒上限，请缩小问题后重试。', permanent: true };
+          result = { ok: false, error: '本次运行已达到时间上限，已保存的进度可查看。', permanent: true };
           this.kill(child);
         },
         Math.max(1, deadline - Date.now()),
@@ -202,10 +204,10 @@ export async function recoverInterruptedRuns(store: Store, boss: PgBoss) {
           );
         await tx.exec("UPDATE app.runs SET state='queued',error='服务曾中断，正在继续。' WHERE id=$1", [run.id]);
         await tx.exec("UPDATE app.sessions SET state='queued',error='',updated_at=now() WHERE id=$1", [session.id]);
-        await boss.send(LEARNING_QUEUE, { runId: run.id }, { singletonKey: run.id, db: tx.bossDb });
+        await enqueue(boss, tx, run.id, run.max_seconds);
         await event(tx, 'run.recovered', session.id, { runId: run.id, modelCalls: run.model_calls });
       } else if (!jobs.some((j) => ['created', 'retry'].includes(j.state))) {
-        await boss.send(LEARNING_QUEUE, { runId: run.id }, { singletonKey: run.id, db: tx.bossDb });
+        await enqueue(boss, tx, run.id, run.max_seconds);
       }
     });
 }
@@ -226,7 +228,8 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
     scheduler = new Scheduler(store, boss),
     knowledge = new Knowledge(store, folder),
     exporter = new ArtifactExporter(store, folder),
-    mail = new MailActions(store, boss, folder);
+    mail = new MailActions(store, boss, folder),
+    push = new Push(store, folder);
   await withLock(store, 847392005, () => mail.recover());
   const devices = new DeviceActions(store, boss);
   await devices.recover();
@@ -280,8 +283,13 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
       withLock(store, 847392006, async () => {
         await operation('devices', () => devices.sweep());
         await operation('scheduler', () => scheduler.tick());
-        await operation('knowledge', () => knowledge.scan());
+        await operation('knowledge', async () => {
+          await new Workspace(store, folder).scan();
+          await knowledge.scan();
+        });
         await operation('exports', () => exporter.tick());
+        // Phone notifications ride on the same tick; each notification is claimed before sending.
+        await operation('push', () => push.deliver());
         // Recover queued but unconsumed approvals too; sendOne rechecks exact content and state.
         const approved = await store.one(
           "SELECT id FROM app.approvals WHERE state='approved' ORDER BY created_at,id LIMIT 1",
@@ -304,16 +312,21 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
       );
     },
   );
-  await boss.work('mail-poll', { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 }, async () => {
-    await track(() =>
-      operation('mail-poll', () =>
-        withLock(store, 847392008, async () => {
-          const settings = await config(folder);
-          if (settings.poll_mail && settings.mail_user && settings.mail_password) await mail.poll();
-        }),
-      ),
-    );
-  });
+  await boss.work<{ manual?: boolean }>(
+    'mail-poll',
+    { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 },
+    async (jobs) => {
+      await track(() =>
+        operation('mail-poll', () =>
+          withLock(store, 847392008, async () => {
+            const settings = await config(folder);
+            // Periodic polling follows the setting; "收取新邮件" and simulated delivery poll once on request.
+            if (mailMode(settings) !== 'off' && (settings.poll_mail || jobs[0]?.data?.manual)) await mail.poll();
+          }),
+        ),
+      );
+    },
+  );
   const heartbeat = async () => {
     if (stopping || heartbeatBusy) return;
     heartbeatBusy = true;

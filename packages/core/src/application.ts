@@ -1,3 +1,12 @@
+import { researchDetail } from './research/service.js';
+import { archiveErrand, createErrand, errandCalendar, errandDetail, flowSuggestion } from './errands/service.js';
+import { CreateErrandInput, ErrandActionInput } from '../../contracts/src/errands.js';
+import { proposeRule } from './proposals.js';
+import { MailInbox } from './mail/inbox.js';
+import { openImapFolder, SimulatedMailbox } from './mail/mailbox.js';
+import { Push } from './push.js';
+import nodemailer from 'nodemailer';
+import { Workspace } from './workspace/service.js';
 import type { PgBoss } from 'pg-boss';
 import type { Store, Tx, Row } from '../../storage/src/index.js';
 import {
@@ -31,7 +40,7 @@ import { createRun, createSession, lockSession } from './sessions.js';
 export { createRun, createSession, lockSession } from './sessions.js';
 import { Knowledge, retrieve } from './knowledge.js';
 import { Sources } from './sources.js';
-import { config, Settings } from './config.js';
+import { config, mailMode, Settings } from './config.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import {
@@ -48,7 +57,7 @@ import type { GoalDetail, Today } from '../../contracts/src/index.js';
 // Preserve PostgreSQL microseconds; Date.toISOString() would drop cursor precision.
 const cursorTime = (column: string) => `to_char(${column} AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 const summaryColumns =
-  's.id,s.goal_id,s.title,s.kind,s.state,left(s.prompt,160) AS prompt_preview,left(s.error,240) AS error_preview,s.created_at,s.updated_at';
+  's.id,s.goal_id,s.title,s.kind,s.state,left(s.prompt,160) AS prompt_preview,left(s.error,240) AS error_preview,s.flow,(s.research IS NOT NULL) AS is_research,s.created_at,s.updated_at';
 const cursorDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
@@ -123,9 +132,12 @@ async function ensureNoPendingSend(tx: Tx, sessionId: string) {
     throw new AppError('请先处理发送记录，再修改这项任务。', 409, 'action_in_progress');
 }
 export class Application {
+  readonly workspace: Workspace;
   readonly knowledge: Knowledge;
   readonly settings: Settings;
   readonly sourceLibrary: Sources;
+  readonly mail: MailInbox;
+  readonly push: Push;
   constructor(
     readonly store: Store,
     readonly boss: PgBoss,
@@ -133,6 +145,9 @@ export class Application {
     token: string,
     readonly commandBoundary?: CommandBoundary,
   ) {
+    this.workspace = new Workspace(store, folder);
+    this.mail = new MailInbox(store, boss, folder);
+    this.push = new Push(store, folder);
     this.knowledge = new Knowledge(store, folder);
     this.settings = new Settings(folder, token);
     this.sourceLibrary = new Sources(store, this.knowledge);
@@ -146,10 +161,17 @@ export class Application {
   }
   async today(
     summary?: false,
-  ): Promise<Today & { goalTotal: number; activeGoalTotal: number; pendingTotal: number; backgroundIssues: number }>;
+  ): Promise<
+    Today &
+      Pick<
+        TodayOverview,
+        'goalTotal' | 'activeGoalTotal' | 'pendingTotal' | 'backgroundIssues' | 'mailWaiting' | 'mailNew' | 'mailMode'
+      >
+  >;
   async today(summary: true): Promise<TodayOverview>;
   async today(summary = false) {
-    const llm = (await config(this.folder)).llm,
+    const settings = await config(this.folder),
+      llm = settings.llm,
       configured = Boolean(llm?.base_url && llm?.model);
     return this.store.snapshot(async (tx) => ({
       ...(summary
@@ -173,6 +195,14 @@ export class Application {
         )
       ).map((row) => (summary ? sessionSummaryDTO(row) : sessionDTO(row))),
       unread: Number((await tx.one('SELECT count(*) AS n FROM app.notifications WHERE read_at IS NULL'))?.n || 0),
+      mailWaiting: Number(
+        (await tx.one(
+          `SELECT count(*) n FROM app.sessions s WHERE s.state='ready' AND s.content<>'' AND (s.flow='mail-reply' OR s.parent_session_id IS NOT NULL)
+           AND NOT EXISTS (SELECT 1 FROM app.approvals a WHERE a.session_id=s.id AND a.state IN ('approved','executing','sent','resolved_sent'))`,
+        ))!.n,
+      ),
+      mailNew: Number((await tx.one("SELECT count(*) n FROM app.mail_threads WHERE triage='new'"))!.n),
+      mailMode: mailMode(settings),
       modelConfigured: configured,
       workerOnline: Boolean(
         await tx.one("SELECT name FROM app.health WHERE name='worker' AND heartbeat>now()-interval '20 seconds'"),
@@ -294,10 +324,18 @@ export class Application {
   async sourceSelection(tx: Tx, ids: string[], retained: string[] = []) {
     if (!ids.length) return;
     const unique = [...new Set(ids)],
-      rows = await tx.rows('SELECT id,archived_at FROM app.sources WHERE id=ANY($1::text[]) ORDER BY id FOR SHARE', [
-        unique,
-      ]);
-    if (rows.length !== unique.length || rows.some((row) => row.archived_at && !retained.includes(row.id)))
+      rows = await tx.rows(
+        'SELECT id,archived_at,missing_at,path FROM app.sources WHERE id=ANY($1::text[]) ORDER BY id FOR SHARE',
+        [unique],
+      );
+    if (
+      rows.length !== unique.length ||
+      rows.some(
+        (row) =>
+          (row.archived_at || row.missing_at || row.path?.startsWith('workspace/profile/')) &&
+          !retained.includes(row.id),
+      )
+    )
       throw new AppError('有一份所选资料已归档或不存在，请重新选择。');
   }
   async addGoal(key: string, input: unknown) {
@@ -391,6 +429,15 @@ export class Application {
   async session(sessionId: string) {
     return this.store.snapshot(async (tx) => ({
       session: sessionDTO(await requireRow(tx, 'SELECT * FROM app.sessions WHERE id=$1', [sessionId])),
+      research: await researchDetail(tx, sessionId),
+      errand: await errandDetail(tx, sessionId),
+      related: (
+        await tx.rows(
+          `SELECT id,title,state,flow,CASE WHEN id=(SELECT parent_session_id FROM app.sessions WHERE id=$1) THEN 'parent' ELSE 'child' END AS relation
+           FROM app.sessions WHERE parent_session_id=$1 OR id=(SELECT parent_session_id FROM app.sessions WHERE id=$1) ORDER BY created_at`,
+          [sessionId],
+        )
+      ).map((r) => ({ id: r.id, title: r.title, state: r.state, flow: r.flow, relation: r.relation })),
       attempts: (
         await tx.rows('SELECT * FROM app.attempts WHERE session_id=$1 ORDER BY created_at,id', [sessionId])
       ).map(attemptDTO),
@@ -405,6 +452,10 @@ export class Application {
       })),
       approvals: await tx.rows(
         'SELECT id,state,digest,payload,error FROM app.approvals WHERE session_id=$1 ORDER BY created_at DESC',
+        [sessionId],
+      ),
+      ruleUsage: await tx.rows(
+        'SELECT u.run_id AS "runId",u.key,u.version,u.commit_sha AS "commitSha",u.content FROM app.rule_usage u JOIN app.runs r ON r.id=u.run_id WHERE r.session_id=$1 ORDER BY r.created_at,u.key',
         [sessionId],
       ),
       legacy:
@@ -590,25 +641,7 @@ export class Application {
     return this.store.rows('SELECT * FROM app.memories ORDER BY updated_at DESC,key');
   }
   async saveMemory(key: string, input: unknown) {
-    const data = MemoryInput.parse(input);
-    return this.command(key, 'memory.save', data, async (tx) => {
-      await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['memory:' + data.key]);
-      const old = await tx.one('SELECT * FROM app.memories WHERE key=$1 FOR UPDATE', [data.key]);
-      if ((old?.version || 0) !== data.revision)
-        throw new AppError('偏好已修改，请载入最新版本。', 409, 'version_conflict');
-      const version = data.revision + 1;
-      await tx.exec(
-        'INSERT INTO app.memories(key,scope,content,version,confirmed,enabled) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(key) DO UPDATE SET scope=excluded.scope,content=excluded.content,version=excluded.version,confirmed=excluded.confirmed,enabled=excluded.enabled,updated_at=now()',
-        [data.key, data.scope, data.content, version, data.confirmed, data.enabled],
-      );
-      await tx.exec('INSERT INTO app.memory_versions(key,version,snapshot) VALUES($1,$2,$3)', [
-        data.key,
-        version,
-        JSON.stringify({ ...data, version }),
-      ]);
-      await event(tx, 'memory.updated', data.key);
-      return { key: data.key, version };
-    });
+    return this.workspace.rules.save(key, input);
   }
   async schedules() {
     return (await this.store.rows('SELECT * FROM app.schedules ORDER BY created_at,id')).map((r) => ({
@@ -695,5 +728,74 @@ export class Application {
       await tx.exec('SELECT pg_advisory_xact_lock(847392003)');
       return this.settings.save(input, key);
     });
+  }
+  async saveMailSettings(key: string, input: unknown) {
+    return this.command(key, 'settings.mail', input, async (tx) => {
+      await tx.exec('SELECT pg_advisory_xact_lock(847392003)');
+      return this.settings.saveMail(input, key);
+    });
+  }
+  /** Checks each step separately and never sends mail; errors stay generic so no server text leaks. */
+  async testMail() {
+    const settings = await config(this.folder);
+    const mode = mailMode(settings);
+    if (mode === 'off') throw new AppError('邮箱尚未启用。', 409, 'mail_off');
+    if (mode === 'simulation') {
+      const box = new SimulatedMailbox(this.folder);
+      await box.open('inbox').list(0);
+      return { ok: true, message: '模拟邮箱可用：来信保存在本机 private/mail-sim，发送只写入模拟“已发送”。' };
+    }
+    const steps: string[] = [];
+    try {
+      const inbox = await openImapFolder(settings, 'inbox', AbortSignal.timeout(20000));
+      await inbox?.close();
+      steps.push('收件箱可读');
+      const sent = await openImapFolder(settings, 'sent', AbortSignal.timeout(20000));
+      steps.push(sent ? '已发送文件夹可读' : '未找到已发送文件夹（只同步收件箱）');
+      await sent?.close();
+    } catch {
+      throw new AppError('IMAP 登录或读取失败，请检查地址、端口、账号和客户端专用密码。', 502, 'mail_imap');
+    }
+    try {
+      const transport = nodemailer.createTransport({
+        host: settings.smtp_host || 'smtp.exmail.qq.com',
+        port: Number(settings.smtp_port || 465),
+        secure: true,
+        auth: { user: settings.mail_user, pass: settings.mail_password },
+        connectionTimeout: 10000,
+        greetingTimeout: 15000,
+        socketTimeout: 20000,
+      });
+      await transport.verify();
+      transport.close();
+      steps.push('SMTP 可登录（未发送任何邮件）');
+    } catch {
+      throw new AppError('SMTP 登录失败，请检查发信服务器、端口和密码。', 502, 'mail_smtp');
+    }
+    return { ok: true, message: steps.join('；') + '。' };
+  }
+  async addErrand(key: string, input: unknown) {
+    const data = CreateErrandInput.parse(input);
+    return this.command(key, 'errand.create', data, (tx) =>
+      createErrand(tx, this.boss, {
+        title: data.title,
+        text: data.text,
+        origin: { kind: 'paste' },
+        flow: data.flowId ? { id: data.flowId } : null,
+      }),
+    );
+  }
+  async archiveErrand(key: string, sessionId: string, input: unknown) {
+    return archiveErrand(this.store, this.folder, key, sessionId, ErrandActionInput.parse(input));
+  }
+  async errandCalendar(sessionId: string) {
+    return this.store.snapshot((tx) => errandCalendar(tx, sessionId));
+  }
+  async errandFlowDraft(sessionId: string) {
+    return this.store.snapshot((tx) => flowSuggestion(tx, sessionId));
+  }
+  async proposeRule(key: string, sessionId: string, input: unknown) {
+    const data = ErrandActionInput.parse(input);
+    return proposeRule(this.store, this.folder, this.workspace.rules, key, sessionId, data.revision);
   }
 }

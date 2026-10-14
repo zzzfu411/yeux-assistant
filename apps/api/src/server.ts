@@ -14,11 +14,12 @@ import { dataFolder, initializeData } from '../../../packages/core/src/config.js
 import { Authentication, sessionCookie, cookieHeader } from '../../../packages/core/src/auth.js';
 import { AppError } from '../../../packages/core/src/common.js';
 import { LoginInput } from '../../../packages/contracts/src/index.js';
-import { publicOrigin, checkOrigin, secureSession } from './http-policy.js';
+import { publicOrigin, remoteOrigin, checkOrigin, secureSession } from './http-policy.js';
 import { registerLearningRoutes } from './routes/learning.js';
 import { registerSourceRoutes } from './routes/sources.js';
 import { registerOrganizationRoutes } from './routes/organization.js';
 import { registerIntegrationRoutes } from './routes/integrations.js';
+import { registerAssistantRoutes } from './routes/assistant.js';
 import { registerDeviceRoutes } from './routes/devices.js';
 import { registerEventRoutes } from './routes/events.js';
 import { registerStatusRoutes } from './routes/status.js';
@@ -28,9 +29,10 @@ import { AgentAccess } from '../../../packages/core/src/agents.js';
 import { registerAgentManagement, registerAgentRoutes } from './routes/agents.js';
 
 export async function buildServer(
-  options: { url?: string; folder?: string; assets?: boolean; publicOrigin?: string } = {},
+  options: { url?: string; folder?: string; assets?: boolean; publicOrigin?: string; remoteOrigin?: string } = {},
 ) {
   const externalOrigin = publicOrigin(options.publicOrigin ?? process.env.ASSISTANT_PUBLIC_ORIGIN);
+  const remote = remoteOrigin(options.remoteOrigin ?? process.env.ASSISTANT_REMOTE_ORIGIN);
   const folder = options.folder || dataFolder();
   const token = await initializeData(folder);
   const store = new Store(options.url);
@@ -54,7 +56,7 @@ export async function buildServer(
     if (failure?.status === 'rejected') throw failure.reason;
   });
   server.addHook('onRequest', async (request) => {
-    checkOrigin(request, externalOrigin);
+    checkOrigin(request, externalOrigin, remote);
   });
   server.addHook('onSend', async (_request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -117,7 +119,7 @@ export async function buildServer(
     const devices = new DeviceActions(store, boss);
     const auth = new Authentication(store, folder);
     const agents = new AgentAccess(store);
-    const bridges = new DeviceBridges(store);
+    const bridges = new DeviceBridges(store, folder);
     const bearerValid = (raw: string) => {
       const supplied = Buffer.from(raw.startsWith('Bearer ') ? raw.slice(7) : '');
       const expected = Buffer.from(token);
@@ -140,7 +142,10 @@ export async function buildServer(
       },
       async (request, reply) => {
         const result = await auth.login(request.body.username, request.body.password);
-        reply.header('Set-Cookie', cookieHeader(result.token, secureSession(request.protocol, externalOrigin)));
+        reply.header(
+          'Set-Cookie',
+          cookieHeader(result.token, secureSession(request.protocol, externalOrigin, request, remote)),
+        );
         return { username: result.username };
       },
     );
@@ -175,13 +180,17 @@ export async function buildServer(
         }));
         api.post('/auth/logout', async (request, reply) => {
           await auth.logout(sessionCookie(request.headers.cookie));
-          reply.header('Set-Cookie', cookieHeader('', secureSession(request.protocol, externalOrigin), true));
+          reply.header(
+            'Set-Cookie',
+            cookieHeader('', secureSession(request.protocol, externalOrigin, request, remote), true),
+          );
           return { ok: true };
         });
         registerLearningRoutes(api, app);
         registerSourceRoutes(api, app, folder);
         registerOrganizationRoutes(api, app, store);
         registerIntegrationRoutes(api, app, mail, folder);
+        registerAssistantRoutes(api, app);
         registerDeviceRoutes(api, devices);
         registerDeviceBridgeManagement(api, bridges, administrator);
         registerStatusRoutes(api, store);

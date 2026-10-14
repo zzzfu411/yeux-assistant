@@ -1,1 +1,5 @@
-{"name":"@assistant/core","private":true,"type":"module"}
+{
+  "name": "@assistant/core",
+  "private": true,
+  "type": "module"
+}

@@ -27,7 +27,13 @@ const Case = z.object({
   rubric: z.string().min(1),
 });
 export type EvaluationCase = z.infer<typeof Case>;
-type Llm = { base_url: string; model: string; api_key?: string; tools: boolean };
+type Llm = {
+  base_url: string;
+  model: string;
+  api_key?: string;
+  tools: boolean;
+  review?: { base_url: string; model: string; api_key?: string };
+};
 type Invocation = {
   response?: ModelAssessment;
   rawResponse: unknown;
@@ -88,13 +94,23 @@ export function pickEvaluationModel(value: unknown): Llm {
           model: z.string().max(300).default(''),
           api_key: z.string().max(10000).optional(),
           tools: z.boolean().default(true),
+          // Optional independent reviewer used by deep research.
+          review: z
+            .object({
+              base_url: z.string().min(1).max(2000),
+              model: z.string().min(1).max(300),
+              api_key: z.string().max(10000).optional(),
+            })
+            .optional(),
         })
         .default({ base_url: '', model: '', tools: true }),
     })
     .parse(value);
   const llm = parsed.llm;
   validateBaseURL(llm.base_url);
-  if (llm.api_key && /[\x00-\x1f\x7f]/.test(llm.api_key)) throw new Error('模型密钥包含无效字符。');
+  if (llm.review) validateBaseURL(llm.review.base_url);
+  for (const key of [llm.api_key, llm.review?.api_key])
+    if (key && /[\x00-\x1f\x7f]/.test(key)) throw new Error('模型密钥包含无效字符。');
   return llm;
 }
 export function evaluationContext(item: EvaluationCase, index: number): ModelContext {

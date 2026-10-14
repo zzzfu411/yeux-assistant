@@ -1,6 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
 import type { Device, DeviceCommand, DeviceOverview } from '../../packages/contracts/src/devices';
 
+async function openMore(page: Page) {
+  // Desktop lists secondary pages in the sidebar; phones open them from the tab bar.
+  const more = page.getByLabel('更多', { exact: true });
+  if (await more.isVisible()) await more.click();
+}
+
 function fixture() {
   return {
     control: { enabled: true, revision: 1 },
@@ -425,7 +431,7 @@ test('消息链接打开超过最近50条的设备记录，保留原任务链接
   ];
   await setup(page, state);
   await expect(page.getByText('旧记录已核实。', { exact: true })).toHaveCount(0);
-  await page.getByLabel('更多', { exact: true }).click();
+  await openMore(page);
   await page.getByRole('link', { name: '消息（2）', exact: true }).click();
   await expect(page.getByRole('link', { name: '查看任务', exact: true })).toHaveAttribute(
     'href',

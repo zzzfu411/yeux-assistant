@@ -6,7 +6,7 @@ import { ErrorNotice, PageBoundary } from './ui';
 import { TodayPage, GoalPage, GoalsPage, SessionPage } from './learning';
 import type { TodayOverview } from '../../../packages/contracts/src/pagination';
 import s from './styles.module.css';
-import { Icon } from './icons';
+import { Icon, type IconName } from './icons';
 
 const LibraryPage = lazy(() => import('./library').then((module) => ({ default: module.LibraryPage })));
 const SourcePage = lazy(() => import('./library').then((module) => ({ default: module.SourcePage })));
@@ -16,6 +16,8 @@ const SchedulesPage = lazy(() => import('./secondary').then((module) => ({ defau
 const SettingsPage = lazy(() => import('./secondary').then((module) => ({ default: module.SettingsPage })));
 
 const DevicesPage = lazy(() => import('./devices').then((module) => ({ default: module.DevicesPage })));
+const MailPage = lazy(() => import('./mail').then((module) => ({ default: module.MailPage })));
+const MailThreadPage = lazy(() => import('./mail').then((module) => ({ default: module.MailThreadPage })));
 function useRoute() {
   const [route, setRoute] = useState(() => window.location.hash.slice(1) || '/today');
   useEffect(() => {
@@ -235,6 +237,13 @@ function Authenticated({
       }),
     [],
   );
+  useEffect(() => {
+    // Warm the Markdown renderer so answers do not flash a loading line.
+    void import('react-markdown');
+    // The push-only service worker makes the app installable and lets the phone receive notifications.
+    if (window.isSecureContext && 'serviceWorker' in navigator)
+      void navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }, []);
   useEffect(
     () => () => {
       api.dispose();
@@ -249,6 +258,20 @@ function Authenticated({
       </QueryClientProvider>
     </ApiContext.Provider>
   );
+}
+const sectionNames: Record<string, string> = {
+  today: '今天',
+  goals: '目标',
+  library: '资料',
+  devices: '设备',
+  mail: '邮件',
+  notifications: '消息',
+  schedules: '定时计划',
+  history: '历史',
+  settings: '设置',
+};
+function greeting(hour = new Date().getHours()) {
+  return hour < 5 ? '夜深了' : hour < 11 ? '早上好' : hour < 13 ? '中午好' : hour < 18 ? '下午好' : '晚上好';
 }
 function Shell({
   api,
@@ -266,7 +289,9 @@ function Shell({
   const route = useRoute(),
     connected = useEvents(api, client, expired),
     today = useData<TodayOverview>('/today/overview'),
-    action = useAction();
+    action = useAction(),
+    [menu, setMenu] = useState(false),
+    toggle = useRef<HTMLButtonElement>(null);
 
   const url = new URL(route, 'http://assistant.local'),
     parts = url.pathname.split('/').filter(Boolean);
@@ -280,16 +305,46 @@ function Shell({
   } catch {
     name = 'today';
   }
+  useEffect(() => setMenu(false), [route]);
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setMenu(false);
+      toggle.current?.focus();
+    };
+    window.addEventListener('keydown', close);
+    return () => window.removeEventListener('keydown', close);
+  }, [menu]);
   const primary = name === 'goal' ? 'goals' : name === 'source' ? 'library' : name === 'session' ? 'today' : name;
-  const secondary = [
-    ['devices', '设备'],
-    ['notifications', '消息' + (today.data?.unread ? '（' + today.data.unread + '）' : '')],
-    ['schedules', '定时计划'],
-    ['history', '历史'],
-    ['settings', '设置'],
+  const view = url.searchParams.get('view');
+  const unread = today.data?.unread || 0,
+    mailBadge = (today.data?.mailWaiting || 0) + (today.data?.mailNew || 0);
+  const secondary: Array<[string, string, IconName, boolean]> = [
+    ['mail', '邮件' + (mailBadge ? '（' + mailBadge + '）' : ''), 'mail', name === 'mail'],
+    ['notifications', '消息' + (unread ? '（' + unread + '）' : ''), 'bell', name === 'notifications'],
+    ['devices', '设备', 'device', name === 'devices'],
+    ['schedules', '定时计划', 'clock', name === 'schedules'],
+    ['history', '历史', 'history', name === 'history'],
+    ['settings?view=workspace', '规则与流程', 'branch', name === 'settings' && view === 'workspace'],
+    ['settings', '设置', 'gear', name === 'settings' && view !== 'workspace'],
   ];
+  const section =
+    name === 'session'
+      ? '任务记录'
+      : name === 'goal'
+        ? '目标'
+        : name === 'source'
+          ? '资料'
+          : name === 'settings' && view === 'workspace'
+            ? '规则与流程'
+            : sectionNames[name] || '今天';
   const page =
-    name === 'devices' ? (
+    name === 'mail' && id ? (
+      <MailThreadPage key={id} id={id} />
+    ) : name === 'mail' ? (
+      <MailPage />
+    ) : name === 'devices' ? (
       <DevicesPage commandId={url.searchParams.get('command') || ''} />
     ) : name === 'goals' ? (
       <GoalsPage />
@@ -300,7 +355,13 @@ function Shell({
     ) : name === 'library' ? (
       <LibraryPage />
     ) : name === 'source' && id ? (
-      <SourcePage key={route} id={id} version={url.searchParams.get('version') || undefined} />
+      <SourcePage
+        key={route}
+        id={id}
+        version={url.searchParams.get('version') || undefined}
+        start={url.searchParams.get('start') || undefined}
+        end={url.searchParams.get('end') || undefined}
+      />
     ) : name === 'notifications' ? (
       <NotificationsPage />
     ) : name === 'schedules' ? (
@@ -310,8 +371,9 @@ function Shell({
     ) : name === 'settings' ? (
       <SettingsPage />
     ) : (
-      <TodayPage initialMode={url.searchParams.get('mode')} />
+      <TodayPage initialMode={url.searchParams.get('mode')} greeting={greeting() + '，' + username} />
     );
+  const now = new Date();
   return (
     <div className={s.layout}>
       <a
@@ -343,57 +405,81 @@ function Shell({
               key={path}
             >
               <Icon name={path} />
-              {label}
+              <span>{label}</span>
             </a>
           ))}
         </nav>
-        <details className={s.more} key={route}>
-          <summary aria-label="更多">
-            <span className={s.userAvatar} aria-hidden="true">
-              {username.slice(0, 1).toUpperCase()}
-            </span>
-            <span className={s.moreLabel}>
-              更多<small>{username}</small>
-            </span>
-            <Icon name="more" />
-            {Boolean(today.data?.unread) && <span className={s.unreadDot} aria-label="有新消息" />}
-          </summary>
-          <div className={s.moreMenu}>
-            {secondary.map(([path, label]) => (
+        <button
+          ref={toggle}
+          type="button"
+          className={s.moreToggle}
+          aria-label="更多"
+          aria-expanded={menu}
+          aria-controls="more-panel"
+          onClick={() => setMenu(!menu)}
+        >
+          <Icon name={menu ? 'close' : 'more'} />
+          <span>更多</span>
+          {unread + mailBadge > 0 && <span className={s.unreadDot} aria-label="有新消息" />}
+        </button>
+        <div id="more-panel" className={s.morePanel} data-open={menu}>
+          <p className={s.navCaption}>更多功能</p>
+          <nav className={s.secondaryNav} aria-label="更多功能">
+            {secondary.map(([path, label, icon, current]) => (
               <a
                 key={path}
                 href={'#/' + path}
-                className={name === path ? s.activeNav : s.navLink}
-                aria-current={name === path ? 'page' : undefined}
+                className={current ? s.activeNav : s.navLink}
+                aria-current={current ? 'page' : undefined}
               >
-                {label}
+                <Icon name={icon} />
+                <span>{label}</span>
               </a>
             ))}
-            <div className={s.connection}>
-              <span className={connected ? s.online : s.offline} />
-              {connected ? '已连接' : '正在重连'}
-            </div>
-            <div className={s.account}>
+          </nav>
+          <div className={s.account}>
+            <span className={s.userAvatar} aria-hidden="true">
+              {username.slice(0, 1).toUpperCase()}
+            </span>
+            <span className={s.accountName}>
               {username}
-              <span>管理员</span>
-            </div>
-            <button className={s.textButton} disabled={action.busy} onClick={() => void action.run(logout)}>
-              退出
+              <small>
+                <i className={connected ? s.online : s.offline} />
+                管理员<span className={s.accountConnection}> · {connected ? '已连接' : '正在重连'}</span>
+              </small>
+            </span>
+            <button
+              type="button"
+              className={s.iconButton}
+              disabled={action.busy}
+              onClick={() => void action.run(logout)}
+              title="退出登录"
+              aria-label="退出"
+            >
+              <Icon name="logout" />
+              <span>退出</span>
             </button>
-            <ErrorNotice error={action.error} />
           </div>
-        </details>
+          <ErrorNotice error={action.error} />
+        </div>
       </aside>
+      {menu && <div className={s.scrim} aria-hidden="true" onClick={() => setMenu(false)} />}
       <div className={s.workspace}>
         <header className={s.workbar}>
-          <span>个人学习空间</span>
-          <div>
-            <span className={s.workConnection}>
-              <i className={connected ? s.online : s.offline} />
-              {connected ? '已连接' : '正在重连'}
+          <a className={s.compactBrand} href="#/today" aria-label="返回今天">
+            <span className={s.mascot}>
+              <img src="/sardina-secretary.png" alt="" width="1280" height="1280" />
             </span>
-            <time>
-              {new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}
+            <strong>yeux</strong>
+          </a>
+          <span className={s.crumb}>{section}</span>
+          <div>
+            <span className={s.workConnection} title={connected ? '实时更新已连接' : '正在重新连接实时更新'}>
+              <i className={connected ? s.online : s.offline} />
+              <span>{connected ? '已连接' : '正在重连'}</span>
+            </span>
+            <time dateTime={now.toISOString().slice(0, 10)}>
+              {new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }).format(now)}
             </time>
           </div>
         </header>

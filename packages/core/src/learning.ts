@@ -86,15 +86,23 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
         await tx.rows(
           `SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
         JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
-        WHERE s.id=ANY($1::text[]) AND s.archived_at IS NULL ORDER BY c.source_id,c.start_offset LIMIT 6`,
+        WHERE s.id=ANY($1::text[]) AND s.archived_at IS NULL AND s.missing_at IS NULL AND (s.path IS NULL OR s.path NOT LIKE 'workspace/profile/%') ORDER BY c.source_id,c.start_offset LIMIT 6`,
           [context.goal.source_ids],
         )
       ).map(citationFromRow);
     }
-    const memories = await tx.rows(
+    let memories = await tx.rows(
       "SELECT * FROM app.memories WHERE enabled AND (scope IN ('all','preference','fact','correction') OR scope=$1) ORDER BY updated_at DESC,key",
       [context.session.kind],
     );
+    const snapshotKey = 'run-rules:' + context.run.id;
+    const savedRules = await tx.one('SELECT value FROM app.settings WHERE key=$1', [snapshotKey]);
+    if (savedRules) memories = savedRules.value;
+    else
+      await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING', [
+        snapshotKey,
+        JSON.stringify(memories),
+      ]);
     const previous = delivered?.content || context.session.content;
     const modelContext: ModelContext = {
       task: [
@@ -106,6 +114,9 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
         .join('\n'),
       latest: attempt?.answer || context.run.input.answer || context.session.prompt,
       previous,
+      ruleRecords: memories
+        .filter((m) => m.confirmed)
+        .map((m) => ({ key: m.key, version: m.version, commitSha: m.commit_sha ?? null, content: m.content })),
       rules: memories.filter((m) => m.confirmed).map((m) => m.key + ': ' + m.content),
       notes: memories.filter((m) => !m.confirmed).map((m) => m.key + ': ' + m.content),
       sources: citations,

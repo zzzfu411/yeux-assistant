@@ -1,3 +1,6 @@
+import { executeResearchRun } from '../../../packages/core/src/research/service.js';
+import { executeMailReplyRun } from '../../../packages/core/src/mail/reply.js';
+import { executeErrandRun } from '../../../packages/core/src/errands/service.js';
 import { Store } from '../../../packages/storage/src/index.js';
 import { dataFolder } from '../../../packages/core/src/config.js';
 import { executeLearningRun, openCheckpoints } from '../../../packages/core/src/learning.js';
@@ -18,7 +21,15 @@ try {
   const runId = process.argv[2]!,
     generation = Number(process.argv[3]);
   if (!runId || !Number.isInteger(generation)) throw new AppError('执行参数无效。');
-  await executeLearningRun(store, dataFolder(), { runId, generation }, saver);
+  const session = await store.one(
+    'SELECT s.research,s.flow FROM app.sessions s JOIN app.runs r ON r.session_id=s.id WHERE r.id=$1',
+    [runId],
+  );
+  // Each session kind has one executor; all share the fenced run identity and its budget.
+  if (session?.research) await executeResearchRun(store, dataFolder(), { runId, generation });
+  else if (session?.flow === 'mail-reply') await executeMailReplyRun(store, dataFolder(), { runId, generation });
+  else if (session?.flow === 'errand') await executeErrandRun(store, dataFolder(), { runId, generation });
+  else await executeLearningRun(store, dataFolder(), { runId, generation }, saver);
   result = { ok: true };
 } catch (error) {
   result = {

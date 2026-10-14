@@ -1,10 +1,8 @@
 import { execFile } from 'node:child_process';
 import { AudioInput, AudioState } from '../../../packages/contracts/src/device-bridge.js';
 
-export type LocalDevice = {
-  read(signal: AbortSignal): Promise<{ volume: number; muted: boolean }>;
-  execute(input: unknown, signal: AbortSignal): Promise<void>;
-};
+import type { LocalDevice } from './local.js';
+export type { LocalDevice } from './local.js';
 export const readAudioScript =
   'set v to get volume settings\nreturn ((output volume of v) as text) & "," & ((output muted of v) as text)';
 export const writeAudioScript =
@@ -33,7 +31,10 @@ export function runAppleScript(script: string, args: string[], signal: AbortSign
     if (signal.aborted) stop();
   });
 }
-export function macAudio(run = runAppleScript, platform = process.platform): LocalDevice {
+export function macAudio(
+  run = runAppleScript,
+  platform = process.platform,
+): LocalDevice<unknown, { volume: number; muted: boolean }> {
   const supported = () => {
     if (platform !== 'darwin') throw new Error('此适配器需要在 macOS 宿主机运行。');
   };

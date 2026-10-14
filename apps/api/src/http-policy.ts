@@ -26,12 +26,27 @@ export function publicOrigin(value: string | undefined): string | undefined {
   return url.origin;
 }
 
-export function checkOrigin(request: FastifyRequest, externalOrigin?: string) {
+/**
+ * A tunnelled remote entrance (ASSISTANT_REMOTE_ORIGIN) coexists with direct loopback use.
+ * Both arrive from 127.0.0.1, so the Host header decides which rule applies; the API itself only
+ * listens on loopback, so a remote Host can only come through the configured HTTPS proxy.
+ */
+export function remoteOrigin(value: string | undefined): string | undefined {
+  const origin = publicOrigin(value);
+  if (origin && !origin.startsWith('https://')) throw new Error('ASSISTANT_REMOTE_ORIGIN 必须是 HTTPS 来源。');
+  return origin;
+}
+const viaRemote = (request: FastifyRequest, remote?: string) =>
+  Boolean(remote && request.headers.host?.toLowerCase() === new URL(remote).host);
+
+export function checkOrigin(request: FastifyRequest, externalOrigin?: string, remote?: string) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || !request.headers.origin) return;
   let supplied: URL, expected: URL;
   try {
     supplied = new URL(request.headers.origin);
-    expected = new URL(externalOrigin || `${request.protocol}://${request.headers.host}`);
+    expected = new URL(
+      viaRemote(request, remote) ? remote! : externalOrigin || `${request.protocol}://${request.headers.host}`,
+    );
   } catch {
     throw new AppError('请求来源无效。', 403, 'origin_mismatch');
   }
@@ -47,5 +62,6 @@ export function checkOrigin(request: FastifyRequest, externalOrigin?: string) {
   }
 }
 
-export const secureSession = (protocol: string, externalOrigin?: string) =>
-  externalOrigin ? externalOrigin.startsWith('https://') : protocol === 'https';
+export const secureSession = (protocol: string, externalOrigin?: string, request?: FastifyRequest, remote?: string) =>
+  (request ? viaRemote(request, remote) : false) ||
+  (externalOrigin ? externalOrigin.startsWith('https://') : protocol === 'https');

@@ -1,14 +1,15 @@
-import { readFile, lstat, chmod } from 'node:fs/promises';
+import { readFile, lstat, chmod, mkdir } from 'node:fs/promises';
 import { resolve, dirname, join } from 'node:path';
 import { BridgeConfig } from '../packages/contracts/src/device-bridge.js';
 import { runDeviceBridge } from '../apps/device-bridge/src/client.js';
 import { macAudio } from '../apps/device-bridge/src/audio.js';
+import { ehallDriver } from '../apps/device-bridge/src/ehall/driver.js';
+import { chromium } from 'playwright';
 
 async function main() {
   const args = process.argv.slice(2).filter((arg) => arg !== '--');
   if (args.length !== 2 || args[0] !== '--config')
     throw new Error('用法：pnpm device:run --config private/device.json');
-  if (process.platform !== 'darwin') throw new Error('当前 macos.audio 适配器需要在 macOS 宿主机运行。');
   const path = resolve(args[1]!),
     info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink() || info.size > 4096)
@@ -19,12 +20,39 @@ async function main() {
   const stop = () => controller.abort();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  const profile = join(dirname(path), 'ehall-profile');
+  let close: (() => Promise<void>) | undefined;
+  let driver = macAudio() as import('../apps/device-bridge/src/local.js').LocalDevice;
+  if (config.adapter === 'browser.ehall') {
+    await mkdir(profile, { recursive: true, mode: 0o700 });
+    const info = await lstat(profile);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('浏览器资料目录无效。');
+    await chmod(profile, 0o700);
+    const context = await chromium.launchPersistentContext(profile, {
+      channel: 'chrome',
+      headless: false,
+      serviceWorkers: 'block',
+      viewport: { width: 900, height: 760 },
+      acceptDownloads: false,
+    });
+    close = () => context.close();
+    try {
+      driver = await ehallDriver(context);
+    } catch (error) {
+      await close();
+      throw error;
+    }
+  }
   let previous = '';
-  console.log('设备执行器手动启动；仅处理已确认的默认输出音量操作。按 Ctrl+C 停止。');
+  console.log(
+    config.adapter === 'browser.ehall'
+      ? 'ehall 模拟执行器手动启动；在打开的窗口点击模拟登录。仅访问本机模拟站点。按 Ctrl+C 停止。'
+      : '设备执行器手动启动；仅处理已确认的默认输出音量操作。按 Ctrl+C 停止。',
+  );
   try {
     await runDeviceBridge(
       config,
-      macAudio(),
+      driver,
       join(dirname(path), 'device-state', config.deviceId),
       controller.signal,
       (state) => {
@@ -34,6 +62,7 @@ async function main() {
       },
     );
   } finally {
+    await close?.();
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }

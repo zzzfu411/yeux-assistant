@@ -13,6 +13,8 @@ export type Memory = {
   confirmed: boolean;
   enabled: boolean;
   updated_at: string;
+  path?: string | null;
+  commit_sha?: string | null;
 };
 export const scopeNames: Record<string, string> = {
   preference: '偏好',
@@ -22,6 +24,8 @@ export const scopeNames: Record<string, string> = {
   study: '学习',
   work: '工作',
   manage: '管理',
+  mail: '邮件',
+  errand: '办事',
 };
 export function MemoryEditor({
   memory,
@@ -80,6 +84,11 @@ export function MemoryEditor({
     );
   return (
     <form className={s.form} onSubmit={save}>
+      {memory?.path && (
+        <p className={s.muted}>
+          {memory.path} · {memory.commit_sha?.slice(0, 7) || '手工修改尚未提交'}
+        </p>
+      )}
       <label>
         内容
         <textarea

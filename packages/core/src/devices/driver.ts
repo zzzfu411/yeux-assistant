@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Device, DeviceCommand } from '../../../contracts/src/devices.js';
-import type { Tx } from '../../../storage/src/index.js';
+import type { Row, Tx } from '../../../storage/src/index.js';
 import { AppError } from '../common.js';
 
 type Arguments = DeviceCommand['arguments'];
@@ -10,6 +10,7 @@ export type Capability = {
   version: string;
   label: string;
   schema: z.ZodType<Arguments>;
+  timeoutMs?: number;
   choices: Array<{ label: string; arguments: Arguments }>;
   summary: (input: Arguments) => string;
   matches: (input: Arguments, state: Arguments, before?: Arguments) => boolean;
@@ -23,6 +24,8 @@ export interface DeviceAdapter {
   /** Must settle after abort within a documented bound; process adapters must terminate and reap their child. */
   execute(deviceId: string, capability: string, input: Arguments, context: ExecutionContext): Promise<void>;
   readState(deviceId: string, signal: AbortSignal, context?: ExecutionContext): Promise<Arguments>;
+  validateCommand?(tx: Tx, deviceId: string, capability: string, input: Arguments): Promise<void>;
+  record?(tx: Tx, command: Row, after: Arguments): Promise<void>;
   validateDevice?(tx: Tx, deviceId: string): Promise<void>;
 }
 /** Use only when the adapter can prove it did not send or apply a write. */

@@ -205,7 +205,7 @@ test('资料库使用中和归档均按标题查找，正文检索有独立入�
   await expect(page.getByText('没有符合条件的资料。', { exact: true })).toBeVisible();
   await page.getByRole('combobox', { name: '资料范围', exact: true }).selectOption('false');
   await page.getByLabel('按标题查找', { exact: true }).fill('00179');
-  await page.getByText('检索正文片段', { exact: true }).click();
+  await expect(page.getByRole('heading', { name: '检索正文片段', exact: true })).toBeVisible();
   await page.getByLabel('正文关键词', { exact: true }).fill('事务隔离');
   await page.getByRole('button', { name: '检索正文', exact: true }).click();
   const results = page.getByRole('region', { name: '正文片段结果', exact: true });

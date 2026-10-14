@@ -1,4 +1,4 @@
-import { readFile, readdir, stat, writeFile, realpath } from 'node:fs/promises';
+import { readFile, readdir, lstat, writeFile, realpath } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { AppError, canonical, digest, id, event, notify, iso } from './common.js';
@@ -130,6 +130,7 @@ export async function retrieve(
   sourceIds: string[] = [],
   limit = 6,
   course?: string,
+  scope?: 'mail' | 'errand',
 ): Promise<Citation[]> {
   const words = terms(query);
   if (!words.length) return [];
@@ -137,10 +138,10 @@ export async function retrieve(
   const rows = await tx.rows(
     `SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
     JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
-    WHERE s.archived_at IS NULL AND (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
+    WHERE s.archived_at IS NULL AND s.missing_at IS NULL AND ($5::boolean OR s.path IS NULL OR s.path NOT LIKE 'workspace/profile/%') AND (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
     AND ($4::text IS NULL OR ($4='unclassified' AND coalesce(v.metadata->>'course','')='') OR ($4<>'unclassified' AND v.metadata->>'course'=$4))
     ORDER BY word_similarity($3,c.content) DESC,c.id LIMIT 80`,
-    [sourceIds, patterns, query.slice(-300), course || null],
+    [sourceIds, patterns, query.slice(-300), course || null, Boolean(scope)],
   );
   return rows
     .map((row) => ({ row, score: words.reduce((n, t) => n + Number(row.content.toLowerCase().includes(t)), 0) }))
@@ -200,60 +201,113 @@ export class Knowledge {
     };
   }
   async scan() {
-    // macOS temporary/data directories may have a /var → /private/var alias.
-    // Compare canonical paths on both sides of the containment check.
-    const base = await realpath(resolve(this.folder, 'documents'));
-    const visit = async (directory: string): Promise<void> => {
-      for (const entry of await readdir(directory, { withFileTypes: true })) {
-        const file = join(directory, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory()) {
-          // Legacy v1 stores generated results here; nested course archive folders are originals.
-          if (directory === base && entry.name === 'archive') continue;
-          await visit(file);
-          continue;
-        }
-        if (!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
-        const name = relative(base, file),
-          info = await stat(file),
-          stamp = info.mtimeMs + ':' + info.size;
-        if (this.seen.get(name) === stamp) continue;
-        try {
-          // Lifecycle changes are checked again under the source lock below.
-          // This early check avoids rereading immutable/archived originals on
-          // every worker sweep, without caching a skipped file across restore.
-          const observed = await this.store.one('SELECT managed,archived_at FROM app.sources WHERE path=$1', [name]);
-          if (observed?.managed || observed?.archived_at) continue;
-          const actual = await realpath(file);
-          if (!actual.startsWith(base + sep)) throw new AppError('资料路径越界。');
-          if (info.size > 2_000_000) throw new AppError('资料超过 2 MB，尚未索引。');
-          const content = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(actual));
-          const indexed = await this.store.transaction(async (tx) => {
-            await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-path:' + name]);
-            const found = await tx.one('SELECT id FROM app.sources WHERE path=$1', [name]);
-            const sourceId = found?.id || 'file-' + digest(name).slice(0, 24);
-            await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-id:' + sourceId]);
-            const old = await tx.one('SELECT id,title,managed,archived_at FROM app.sources WHERE path=$1', [name]);
-            // Managed text is versioned in PostgreSQL. Its first on-disk original
-            // is immutable and must never replace a later browser edit.
-            if (old?.managed || old?.archived_at) return false;
-            await putSource(tx, { id: sourceId, title: old?.title || name, content, path: name });
-            return true;
-          });
-          if (indexed) this.seen.set(name, stamp);
-        } catch (error) {
-          await this.store.transaction((tx) =>
-            notify(
-              tx,
-              'source-error:' + digest(name + stamp),
-              null,
-              '有一份资料尚未索引',
-              name + '：' + (error instanceof AppError ? error.message : '请检查文件编码与读取权限。'),
-            ),
-          );
-        }
+    const connection = await this.store.pool.connect();
+    try {
+      await connection.query('SELECT pg_advisory_lock(847392031)');
+      return await this.scanRoots();
+    } finally {
+      await connection.query('SELECT pg_advisory_unlock(847392031)').catch(() => {});
+      connection.release();
+    }
+  }
+  private async scanRoots() {
+    // Missing files are marked only after a complete successful traversal of that root.
+    // An unreadable root must not make every source disappear from retrieval.
+    const roots = [
+      { directory: 'documents', prefix: '' },
+      { directory: 'workspace/notes', prefix: 'workspace/notes/' },
+      { directory: 'workspace/profile', prefix: 'workspace/profile/' },
+      { directory: 'workspace/records', prefix: 'workspace/records/' },
+    ];
+    for (const root of roots) {
+      const location = resolve(this.folder, root.directory);
+      let base = location,
+        rootMissing = false;
+      try {
+        const info = await lstat(location);
+        if (!info.isDirectory()) throw new AppError('资料根目录必须是普通目录。');
+        base = await realpath(location);
+      } catch (error: any) {
+        if (error.code === 'ENOENT') rootMissing = true;
+        else throw error;
       }
-    };
-    await visit(base);
+      const present = new Set<string>();
+      const visit = async (directory: string): Promise<void> => {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          const file = join(directory, entry.name);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory()) {
+            if (directory === base && !root.prefix && entry.name === 'archive') continue;
+            await visit(file);
+            continue;
+          }
+          if (!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
+          const name = root.prefix + relative(base, file).split(sep).join('/'),
+            info = await lstat(file),
+            stamp = info.mtimeMs + ':' + info.size;
+          present.add(name);
+          const observed = await this.store.one(
+            'SELECT managed,archived_at,missing_at FROM app.sources WHERE path=$1',
+            [name],
+          );
+          if (observed?.managed || observed?.archived_at) continue;
+          if (this.seen.get(name) === stamp && !observed?.missing_at) continue;
+          try {
+            const actual = await realpath(file);
+            if (!actual.startsWith(base + sep)) throw new AppError('资料路径越界。');
+            if (info.size > 2_000_000) throw new AppError('资料超过 2 MB，尚未索引。');
+            const content = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(actual));
+            const indexed = await this.store.transaction(async (tx) => {
+              await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-path:' + name]);
+              const found = await tx.one('SELECT id FROM app.sources WHERE path=$1', [name]);
+              const sourceId = found?.id || 'file-' + digest(name).slice(0, 24);
+              await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-id:' + sourceId]);
+              const old = await tx.one('SELECT * FROM app.sources WHERE path=$1', [name]);
+              if (old?.managed || old?.archived_at) return false;
+              await putSource(tx, { id: sourceId, title: old?.title || name, content, path: name });
+              if (old?.missing_at) {
+                await tx.exec(
+                  'UPDATE app.sources SET missing_at=NULL,revision=revision+1,updated_at=now() WHERE id=$1',
+                  [sourceId],
+                );
+                await event(tx, 'source.restored', sourceId);
+              }
+              return true;
+            });
+            if (indexed) this.seen.set(name, stamp);
+          } catch (error) {
+            await this.store.transaction((tx) =>
+              notify(
+                tx,
+                'source-error:' + digest(name + stamp),
+                null,
+                '有一份资料尚未索引',
+                name + '：' + (error instanceof AppError ? error.message : '请检查文件编码与读取权限。'),
+              ),
+            );
+          }
+        }
+      };
+      if (!rootMissing) await visit(base);
+      const candidates = await this.store.rows(
+        'SELECT id,path FROM app.sources WHERE NOT managed AND path IS NOT NULL AND missing_at IS NULL',
+      );
+      for (const source of candidates) {
+        const inRoot = root.prefix
+          ? source.path.startsWith(root.prefix)
+          : !source.path.startsWith('workspace/') && !source.path.startsWith('archive/');
+        if (!inRoot || present.has(source.path)) continue;
+        await this.store.transaction(async (tx) => {
+          await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-path:' + source.path]);
+          await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['source-id:' + source.id]);
+          const result = await tx.exec(
+            'UPDATE app.sources SET missing_at=now(),revision=revision+1,updated_at=now() WHERE id=$1 AND NOT managed AND missing_at IS NULL',
+            [source.id],
+          );
+          if (result.rowCount) await event(tx, 'source.missing', source.id);
+        });
+        this.seen.delete(source.path);
+      }
+    }
   }
 }

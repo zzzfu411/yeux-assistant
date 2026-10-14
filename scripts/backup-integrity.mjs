@@ -12,8 +12,19 @@ const fileRoots = new Set([
   'runtime.env',
   'compose.override.yaml',
   'v2-cutover.json',
+  'web-push.json',
 ]);
-const directoryRoots = new Set(['source-assets', 'documents', 'artifacts', 'receipts', 'mail-quarantine']);
+const directoryRoots = new Set([
+  'source-assets',
+  'documents',
+  'artifacts',
+  'receipts',
+  'mail-quarantine',
+  'workspace',
+  'mail-raw',
+  'ehall-evidence',
+  'mail-sim',
+]);
 const metadata = new Set(['manifest.json', 'README.txt']);
 const safePath = (path) =>
   typeof path === 'string' &&
@@ -195,6 +206,25 @@ export async function verifyBackup(folder, { checkDump = inspectDump } = {}) {
         await handle.close();
       }
     }
+    if (manifest.files.some((entry) => entry.path.startsWith('workspace/'))) {
+      const git = spawnSync(
+        'git',
+        ['-c', 'safe.directory=' + join(root, 'workspace'), '-c', 'core.hooksPath=/dev/null', 'fsck', '--no-dangling'],
+        {
+          cwd: join(root, 'workspace'),
+          timeout: 10000,
+          stdio: 'ignore',
+          env: {
+            PATH: process.env.PATH,
+            GIT_CONFIG_NOSYSTEM: '1',
+            GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_TERMINAL_PROMPT: '0',
+          },
+        },
+      );
+      if (git.error || git.status !== 0)
+        throw failure('workspace_git_invalid', '备份中的工作区 Git 对象无法完整读取。');
+    }
     const result = await checkDump(join(root, 'database.dump'));
     for (const [path, before] of snapshots)
       if (!sameFile(before, await lstat(join(root, path))))
@@ -218,6 +248,7 @@ export async function verifyBackup(folder, { checkDump = inspectDump } = {}) {
       'file_unlisted',
       'checksum_mismatch',
       'dump_header_invalid',
+      'workspace_git_invalid',
     ]);
     errors.push({
       code: known.has(error.code) ? error.code : 'backup_unreadable',

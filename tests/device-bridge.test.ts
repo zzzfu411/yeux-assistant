@@ -36,7 +36,7 @@ describe.skipIf(!url)('outbound device bridge on isolated PostgreSQL (synthetic 
   });
   beforeEach(async () => {
     await built.store.exec(
-      'TRUNCATE app.device_bridge_calls,app.device_bridges,app.device_commands,app.device_simulation_state,app.devices,app.commands,app.agent_credentials,app.agent_audit,app.notifications',
+      'TRUNCATE app.action_evidence,app.device_bridge_calls,app.device_bridges,app.device_commands,app.device_simulation_state,app.devices,app.commands,app.agent_credentials,app.agent_audit,app.notifications',
     );
     await built.store.exec('UPDATE app.device_control SET enabled=true,revision=1');
     await built.store.exec("DELETE FROM queue.job WHERE name='device-execute'");

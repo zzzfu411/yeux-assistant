@@ -3,7 +3,10 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { BridgeCall, type BridgeConfig, type BridgeResult } from '../../../packages/contracts/src/device-bridge.js';
-import type { LocalDevice } from './audio.js';
+import { LocalNotApplied, type LocalDevice } from './local.js';
+import { createHash } from 'node:crypto';
+import { bridgeGrantMs, bridgeVersions } from '../../../packages/contracts/src/ehall.js';
+import { BridgeResult as ResultSchema } from '../../../packages/contracts/src/device-bridge.js';
 
 export class BridgeHttpError extends Error {
   constructor(readonly status: number) {
@@ -71,7 +74,7 @@ export async function executeCall(
   const started = performance.now();
   // A lost start reply is never retried: no local action follows an uncertain grant.
   const grant = z
-    .object({ remainingMs: z.number().int().min(0).max(5000) })
+    .object({ remainingMs: z.number().int().min(0).max(bridgeGrantMs(call.adapter)) })
     .strict()
     .parse(await request('/calls/' + call.id + '/start', { lease: call.lease }, signal));
   const remaining = Math.floor(grant.remainingMs - (performance.now() - started) - 100);
@@ -80,8 +83,21 @@ export async function executeCall(
     const bounded = AbortSignal.any([signal, AbortSignal.timeout(remaining)]);
     let dispatched = false;
     try {
-      if (call.kind === 'read') result = { ok: true, state: await driver.read(bounded) };
-      else {
+      if (call.kind === 'read') {
+        const state = await driver.read(bounded, call);
+        const png = await driver.evidence?.(bounded, call);
+        if (png) {
+          if (png.length > 2 * 1024 * 1024) throw new Error('Evidence exceeds 2 MB');
+          const hash = createHash('sha256').update(png).digest('hex');
+          await request(
+            '/calls/' + call.id + '/evidence',
+            { lease: call.lease, digest: hash, png: png.toString('base64') },
+            bounded,
+          );
+          state.screenshotDigest = hash;
+        }
+        result = ResultSchema.parse({ ok: true, state });
+      } else {
         await mkdir(journal, { recursive: true, mode: 0o700 });
         let marker;
         try {
@@ -108,13 +124,16 @@ export async function executeCall(
           }
           bounded.throwIfAborted();
           dispatched = true;
-          await driver.execute(call.arguments, bounded);
+          await driver.execute(call.arguments, bounded, call);
           bounded.throwIfAborted();
           result = { ok: true };
         }
       }
-    } catch {
-      result = { ok: false, effect: dispatched ? 'unknown' : 'not_applied' };
+    } catch (error) {
+      result = {
+        ok: false,
+        effect: error instanceof LocalNotApplied ? error.effect : dispatched ? 'unknown' : 'not_applied',
+      };
     }
   }
   // Retrying only the receipt is safe; the hardware operation above is never repeated.
@@ -150,7 +169,7 @@ export async function runDeviceBridge(
         const response = z
           .object({ call: BridgeCall.nullable() })
           .strict()
-          .parse(await request('/poll', { adapter: config.adapter, version: '1' }, signal));
+          .parse(await request('/poll', { adapter: config.adapter, version: bridgeVersions[config.adapter] }, signal));
         onStatus('connected');
         if (response.call) {
           await executeCall(response.call, config, driver, journal, request, signal);

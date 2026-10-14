@@ -318,9 +318,25 @@ describe.skipIf(!url)('durable, exact mail approvals (synthetic accounts only)',
     expect(await mail.poll()).toEqual({ imported: 0, quarantined: 0 });
     expect(send).not.toHaveBeenCalled();
   });
-  it('quarantines a complete HTML-only notice rather than storing placeholder facts', async () => {
+  it('converts an HTML-only notice to its real text and marks the origin, instead of placeholder facts', async () => {
     const message = Buffer.from(
-      'From: campus@example.invalid\r\nMessage-ID: <html@example.invalid>\r\nSubject: HTML notice\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Important original HTML content</p>',
+      'From: campus@example.invalid\r\nTo: sender@example.invalid\r\nMessage-ID: <html@example.invalid>\r\nSubject: HTML notice\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Important <b>original</b> HTML content</p>',
+    );
+    mail = new MailActions(store, boss, folder, { inbox: async () => inbox(new Map([[1, message]])), send });
+    expect(await mail.poll()).toEqual({ imported: 1, quarantined: 0 });
+    expect(await store.one('SELECT body_origin,body_text FROM app.mail_messages')).toMatchObject({
+      body_origin: 'html',
+      body_text: expect.stringContaining('Important original HTML content'),
+    });
+    const source = await store.one(
+      'SELECT v.content FROM app.sources s JOIN app.source_versions v ON v.source_id=s.id',
+    );
+    expect(source?.content).toContain('Important original HTML content');
+    expect(source?.content).not.toContain('<p>');
+  });
+  it('quarantines a message with no readable body at all', async () => {
+    const message = Buffer.from(
+      'From: campus@example.invalid\r\nMessage-ID: <empty@example.invalid>\r\nSubject: Empty\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n   ',
     );
     mail = new MailActions(store, boss, folder, { inbox: async () => inbox(new Map([[1, message]])), send });
     expect(await mail.poll()).toEqual({ imported: 0, quarantined: 1 });

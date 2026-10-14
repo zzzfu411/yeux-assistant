@@ -96,7 +96,7 @@ export function goalDTO(r: Row) {
     updatedAt: iso(r.updated_at),
   };
 }
-export function sessionDTO(r: Row) {
+export function sessionDTO(r: Row): import('../../contracts/src/index.js').LearningSession {
   return {
     id: r.id,
     goalId: r.goal_id,
@@ -106,10 +106,23 @@ export function sessionDTO(r: Row) {
     state: r.state,
     revision: r.revision,
     currentRunId: r.current_run_id,
+    research: r.research ?? null,
     content: r.content,
     citations: r.citations,
     error: r.error,
     recipient: r.recipient,
+    flow: r.flow ?? null,
+    flowId: r.flow_id ?? null,
+    parentSessionId: r.parent_session_id ?? null,
+    mail: r.mail
+      ? {
+          threadId: r.mail.threadId,
+          inReplyTo: r.mail.inReplyTo ?? null,
+          references: r.mail.references ?? [],
+          cc: r.mail.cc ?? [],
+          questions: r.mail.questions ?? [],
+        }
+      : null,
     createdAt: iso(r.created_at),
     updatedAt: iso(r.updated_at),
   };
@@ -123,6 +136,8 @@ export function sessionSummaryDTO(r: Row) {
     state: r.state,
     promptPreview: r.prompt_preview,
     errorPreview: r.error_preview,
+    flow: r.flow ?? null,
+    isResearch: Boolean(r.is_research),
     createdAt: iso(r.created_at),
     updatedAt: iso(r.updated_at),
   };

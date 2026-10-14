@@ -23,7 +23,9 @@ export function LibraryPage() {
     action = useAction(),
     client = useQueryClient();
   const [adding, setAdding] = useState(false),
-    [tab, setTab] = useState<'sources' | 'memories'>('sources');
+    [tab, setTab] = useState<'sources' | 'memories'>(
+      new URLSearchParams(window.location.hash.split('?')[1] || '').get('tab') === 'memories' ? 'memories' : 'sources',
+    );
   const [duplicate, setDuplicate] = useState<SourceImportResult | null>(null);
   const [draft, setDraft] = useDraft('source', { title: '', content: '' });
   const sourceDraft = useRef(draft);
@@ -224,6 +226,86 @@ export function LibraryPage() {
                 )}
               </form>
             )}
+            {!archived && (
+              <section className={s.searchPanel} aria-labelledby="body-search-title">
+                <div className={s.searchPanelHead}>
+                  <Icon name="search" />
+                  <div>
+                    <h2 id="body-search-title">检索正文片段</h2>
+                    <p className={s.muted}>在使用中的资料正文里查找，结果可跳转并高亮原文位置；课程筛选同时生效。</p>
+                  </div>
+                </div>
+                <form className={s.search} onSubmit={find}>
+                  <label className={s.srOnly} htmlFor="body-search">
+                    正文关键词
+                  </label>
+                  <input
+                    id="body-search"
+                    type="search"
+                    value={search}
+                    maxLength={2000}
+                    onChange={(event) => {
+                      setSearch(event.target.value);
+                      if (!event.target.value) setSubmitted(null);
+                    }}
+                    placeholder="例如：隔离级别、验收标准"
+                  />
+                  <button className={s.primary} disabled={!search.trim()}>
+                    检索正文
+                  </button>
+                </form>
+                {submitted !== null && (
+                  <section className={s.searchResults} aria-label="正文片段结果">
+                    <div className={s.sectionHeading}>
+                      <h3>
+                        “{submitted}”的正文片段{searchQuery.data ? `（${results.length}）` : ''}
+                      </h3>
+                      <button
+                        type="button"
+                        className={s.textButton}
+                        onClick={() => {
+                          setSubmitted(null);
+                          setSearch('');
+                        }}
+                      >
+                        清除检索
+                      </button>
+                    </div>
+                    <QueryState
+                      pending={searchQuery.isPending}
+                      error={searchQuery.error}
+                      retry={() => void searchQuery.refetch()}
+                    />
+                    {results.map((hit, index) => (
+                      <article className={s.searchResult} key={hit.sourceId + ':' + index}>
+                        <a
+                          href={
+                            '#/source/' +
+                            encodeURIComponent(hit.sourceId) +
+                            '?version=' +
+                            hit.version +
+                            '&start=' +
+                            hit.start +
+                            '&end=' +
+                            hit.end
+                          }
+                        >
+                          {hit.title}
+                        </a>
+                        <p>{hit.quote}</p>
+                        <span className={s.muted}>
+                          {hit.courseName || hit.course || '未分类'} ·{' '}
+                          {hit.location || `字符 ${hit.start + 1}–${hit.end}`} · 第 {hit.version} 版
+                        </span>
+                      </article>
+                    ))}
+                    {!searchQuery.isPending && !searchQuery.error && !results.length && (
+                      <p className={s.empty}>没有找到。试试更短的关键词或其他课程。</p>
+                    )}
+                  </section>
+                )}
+              </section>
+            )}
             <div className={s.libraryTools}>
               <label>
                 资料范围
@@ -274,13 +356,15 @@ export function LibraryPage() {
               <div className={`${s.rows} ${s.sourceRows}`}>
                 {current.map((source) => (
                   <a className={s.row} key={source.id} href={'#/source/' + encodeURIComponent(source.id)}>
-                    <span className={s.sourceIcon}>
-                      <Icon name="library" />
+                    <span className={s.sourceIcon} data-format={source.metadata?.format || 'text'}>
+                      <Icon name={isExtracted(source.metadata) ? 'work' : 'library'} />
                     </span>
                     <div>
                       <strong>{source.title}</strong>
                       <p>
-                        {courseName(source.metadata)} · {sourceFormat(source.metadata)} · 第 {source.version} 版
+                        {courseName(source.metadata)} · {sourceFormat(source.metadata)} · 第 {source.version} 版{' '}
+                        {source.missingAt ? '· 原文件已移除' : ''}{' '}
+                        {source.possibleRenameOf ? '· 可能由“' + source.possibleRenameOf + '”改名' : ''}
                       </p>
                       <span className={s.sourceMeta}>更新于 {date(source.updatedAt)}</span>
                     </div>
@@ -303,68 +387,6 @@ export function LibraryPage() {
             )}
             {query.data && (
               <SourceCatalogPages page={currentPage} total={visible.length} onChange={setPage} label="资料库分页" />
-            )}
-            {!archived && (
-              <details className={s.disclosure}>
-                <summary>检索正文片段</summary>
-                <p className={s.muted}>在使用中的资料正文查找关键词，结果包含原文位置。课程筛选同时生效。</p>
-                <form className={s.search} onSubmit={find}>
-                  <label className={s.srOnly} htmlFor="body-search">
-                    正文关键词
-                  </label>
-                  <input
-                    id="body-search"
-                    type="search"
-                    value={search}
-                    maxLength={2000}
-                    onChange={(event) => {
-                      setSearch(event.target.value);
-                      if (!event.target.value) setSubmitted(null);
-                    }}
-                    placeholder="输入正文关键词"
-                  />
-                  <button className={s.secondary} disabled={!search.trim()}>
-                    检索正文
-                  </button>
-                </form>
-                {submitted !== null && (
-                  <section className={s.section} aria-label="正文片段结果">
-                    <div className={s.sectionHeading}>
-                      <h2>正文片段</h2>
-                      <button
-                        type="button"
-                        className={s.textButton}
-                        onClick={() => {
-                          setSubmitted(null);
-                          setSearch('');
-                        }}
-                      >
-                        清除检索
-                      </button>
-                    </div>
-                    <QueryState
-                      pending={searchQuery.isPending}
-                      error={searchQuery.error}
-                      retry={() => void searchQuery.refetch()}
-                    />
-                    {results.map((hit, index) => (
-                      <article className={s.searchResult} key={hit.sourceId + ':' + index}>
-                        <a href={'#/source/' + encodeURIComponent(hit.sourceId) + '?version=' + hit.version}>
-                          {hit.title}
-                        </a>
-                        <p>{hit.quote}</p>
-                        <span className={s.muted}>
-                          {hit.courseName || hit.course || '未分类'} ·{' '}
-                          {hit.location || `字符 ${hit.start + 1}–${hit.end}`} · 第 {hit.version} 版
-                        </span>
-                      </article>
-                    ))}
-                    {!searchQuery.isPending && !searchQuery.error && !results.length && (
-                      <p className={s.empty}>没有找到。试试更短的关键词或其他课程。</p>
-                    )}
-                  </section>
-                )}
-              </details>
             )}
           </>
         )}
@@ -419,10 +441,49 @@ function SourceOrigin({ metadata }: { metadata: SourceMetadata }) {
     </details>
   );
 }
-export function SourcePage({ id, version }: { id: string; version?: string }) {
+export function SourcePage({
+  id,
+  version,
+  start,
+  end,
+}: {
+  id: string;
+  version?: string;
+  start?: string;
+  end?: string;
+}) {
   const query = useData<SourceDetail>(
     '/sources/' + encodeURIComponent(id) + (version ? '?version=' + encodeURIComponent(version) : ''),
   );
+  const highlight = useRef<HTMLElement>(null);
+  const content = query.data?.content || '';
+  const from = Number(start),
+    to = Number(end),
+    splitPair = (offset: number) =>
+      offset > 0 &&
+      offset < content.length &&
+      /[\uD800-\uDBFF]/.test(content[offset - 1]!) &&
+      /[\uDC00-\uDFFF]/.test(content[offset]!);
+  const located = Boolean(
+    start !== undefined &&
+    end !== undefined &&
+    /^\d+$/.test(start) &&
+    /^\d+$/.test(end) &&
+    Number.isSafeInteger(from) &&
+    Number.isSafeInteger(to) &&
+    from >= 0 &&
+    to > from &&
+    to <= content.length &&
+    !splitPair(from) &&
+    !splitPair(to),
+  );
+  useEffect(() => {
+    if (located && highlight.current) {
+      highlight.current.scrollIntoView({ block: 'center' });
+      highlight.current.focus({ preventScroll: true });
+    }
+  }, [located, content, from, to]);
+
   const api = useApi(),
     action = useAction(),
     client = useQueryClient(),
@@ -495,6 +556,7 @@ export function SourcePage({ id, version }: { id: string; version?: string }) {
               void query.refetch();
             }}
           />
+          {query.data.missingAt && <p className={s.notice}>原文件已移除，暂不参与新检索；历史版本和引用仍可阅读。</p>}
           {query.data.archivedAt && (
             <p className={s.notice}>已归档，不参与新检索。历史引用与已出题的资料依据继续保留。</p>
           )}
@@ -532,7 +594,25 @@ export function SourcePage({ id, version }: { id: string; version?: string }) {
             </details>
           )}
           {query.data.metadata && <SourceOrigin metadata={query.data.metadata} />}
-          <Result>{query.data.content}</Result>
+          {located ? (
+            <section aria-label="引用原文">
+              <p className={s.muted}>
+                已定位引用：字符 {from + 1}–{to}
+              </p>
+              <pre className={s.raw}>
+                {content.slice(0, from)}
+                <mark ref={highlight} tabIndex={-1} aria-label="引用片段">
+                  {content.slice(from, to)}
+                </mark>
+                {content.slice(to)}
+              </pre>
+            </section>
+          ) : (
+            <>
+              <Result>{query.data.content}</Result>
+              {(start !== undefined || end !== undefined) && <p role="status">引用范围无效，已显示完整原文。</p>}
+            </>
+          )}
           <details className={s.disclosure}>
             <summary>{isExtracted(query.data.metadata) ? '提取文本原文' : '原文'}</summary>
             <pre className={s.raw}>{query.data.content}</pre>

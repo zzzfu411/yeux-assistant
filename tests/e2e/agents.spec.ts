@@ -136,7 +136,7 @@ test('创建响应丢失后复用请求键，并引导撤销无法恢复令牌�
 test('设置页按钮可到连接管理，窄屏和放大字体保留操作', async ({ page }) => {
   await setup(page);
   await page.getByRole('link', { name: '返回设置' }).click();
-  await page.getByRole('link', { name: '管理连接', exact: true }).click();
+  await page.getByRole('link', { name: /外部 Agent/ }).click();
   await page.setViewportSize({ width: 375, height: 812 });
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.addStyleTag({ content: 'html { font-size: 20px }' });

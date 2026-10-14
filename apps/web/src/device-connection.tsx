@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import type { IssuedDeviceBridge } from '../../../packages/contracts/src/device-bridge';
+import type { IssuedDeviceBridge, BridgeConfig } from '../../../packages/contracts/src/device-bridge';
 import { useAction, useApi } from './api';
 import { date, ErrorNotice } from './ui';
 import s from './styles.module.css';
@@ -10,13 +10,14 @@ export function DeviceConnection() {
     action = useAction(),
     client = useQueryClient();
   const [editing, setEditing] = useState(false),
-    [name, setName] = useState('我的 Mac 音量');
+    [name, setName] = useState('我的 Mac 音量'),
+    [adapter, setAdapter] = useState<BridgeConfig['adapter']>('macos.audio');
   const [issued, setIssued] = useState<IssuedDeviceBridge | null>(null),
     [copied, setCopied] = useState(false);
   const connect = (event: FormEvent) => {
     event.preventDefault();
     void action.run(
-      () => api.write<IssuedDeviceBridge>('/devices/bridges', { name, adapter: 'macos.audio', expiresInDays: 30 }),
+      () => api.write<IssuedDeviceBridge>('/devices/bridges', { name, adapter, expiresInDays: 30 }),
       (value) => {
         setIssued(value);
         setEditing(false);
@@ -35,12 +36,31 @@ export function DeviceConnection() {
   return (
     <section className={s.section} aria-label="设备连接">
       <div className={s.sectionHeading}>
-        <h2>连接真实设备</h2>
-        <button className={s.secondary} disabled={action.busy || Boolean(issued)} onClick={() => setEditing(!editing)}>
+        <h2>连接执行器</h2>
+        <button
+          className={s.secondary}
+          disabled={action.busy || Boolean(issued)}
+          onClick={() => {
+            setAdapter('macos.audio');
+            setName('我的 Mac 音量');
+            setEditing(!editing);
+          }}
+        >
           {editing ? '收起连接表单' : '连接 Mac'}
         </button>
       </div>
-      <p className={s.muted}>当前支持 Mac 默认输出音量。电脑运行执行器后，选择操作并确认执行。</p>
+      <button
+        className={s.textButton}
+        disabled={action.busy || Boolean(issued)}
+        onClick={() => {
+          setAdapter('browser.ehall');
+          setName('ehall 模拟连接');
+          setEditing(true);
+        }}
+      >
+        连接模拟 ehall
+      </button>
+      <p className={s.muted}>Mac 输出音量与 ehall 模拟事务分别连接。电脑运行执行器后，选择操作并确认执行。</p>
       {editing && (
         <form className={s.form} onSubmit={connect}>
           <label>
@@ -53,7 +73,10 @@ export function DeviceConnection() {
               autoComplete="off"
             />
           </label>
-          <p className={s.muted}>音量范围 0–50%，保持静音设置。连接有效期 30 天，可随时撤销。</p>
+          <p className={s.muted}>
+            {adapter === 'macos.audio' ? '音量范围 0–50%，保持静音设置。' : '仅连接本机模拟站点，不使用学校账号。'}
+            连接有效期 30 天，可随时撤销。
+          </p>
           <button className={s.primary} disabled={action.busy || !name.trim()}>
             {action.busy ? '正在创建连接…' : '生成连接配置'}
           </button>
@@ -63,7 +86,7 @@ export function DeviceConnection() {
         <div className={s.form} aria-label="设备连接配置">
           {issued.token ? (
             <>
-              <p>连接已创建，有效至 {date(issued.expiresAt)}。将配置保存到运行执行器的 Mac，保持这个文件私密。</p>
+              <p>连接已创建，有效至 {date(issued.expiresAt)}。将配置保存到运行执行器的电脑，保持这个文件私密。</p>
               <label htmlFor="device-bridge-config">连接配置</label>
               <textarea
                 id="device-bridge-config"
@@ -123,6 +146,9 @@ export function DeviceConnection() {
           </p>
           <p>
             <code>pnpm install --frozen-lockfile</code>
+          </p>
+          <p className={s.muted}>
+            模拟 ehall 先在另一个终端运行 <code>pnpm ehall:simulate</code>，再启动执行器，在 Chrome 窗口点击“模拟登录”。
           </p>
           <p>
             <code>pnpm device:run --config private/device.json</code>

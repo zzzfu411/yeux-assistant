@@ -1,17 +1,18 @@
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import nodemailer from 'nodemailer';
-import { ImapFlow } from 'imapflow';
-import { simpleParser } from 'mailparser';
 import { z } from 'zod';
 import type { PgBoss } from 'pg-boss';
 import { Tx, type Store, type Row } from '../../storage/src/index.js';
 import { ApprovalDecision, ApprovalResolution } from '../../contracts/src/index.js';
 import { AppError, checkVersion, digest, event, id, notify, once, requireRow } from './common.js';
-import { config } from './config.js';
-import { createSession, lockSession } from './sessions.js';
-import { putSource } from './knowledge.js';
+import { config, mailMode } from './config.js';
+import { lockSession } from './sessions.js';
+import { SessionMail } from '../../contracts/src/mail.js';
+import { compose, openImapFolder, SimulatedMailbox, type FolderRole, type ReadonlyInbox } from './mail/mailbox.js';
+import { parseMail } from './mail/parse.js';
+import { ingestMessage } from './mail/ingest.js';
+export type { ReadonlyInbox } from './mail/mailbox.js';
 
 const address = z.string().regex(/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/);
 const snapshotSchema = z
@@ -23,20 +24,19 @@ const snapshotSchema = z
     recipient: address,
     sender: address,
     draft: z.string(),
+    // Reply headers and copies are part of what the owner confirms; older approvals omit them.
+    inReplyTo: z.string().nullable().optional(),
+    references: z.array(z.string()).max(20).optional(),
+    cc: z.array(address).max(10).optional(),
   })
   .strict();
 type MailSnapshot = z.infer<typeof snapshotSchema>;
 type Receipt = { approvalId: string; digest: string; sent: boolean; at: string };
-export interface ReadonlyInbox {
-  uidValidity: string;
-  list(watermark: number): Promise<number[]>;
-  read(uid: number): Promise<Buffer>;
-  close(): Promise<void>;
-  abort?(): void;
-}
 export type MailAdapters = {
   send?: (settings: Row, payload: MailSnapshot, messageId: string) => Promise<boolean>;
   inbox?: (settings: Row, signal?: AbortSignal) => Promise<ReadonlyInbox>;
+  /** The Sent folder is read only when a test supplies it or a real / simulated mailbox is used. */
+  sent?: (settings: Row, signal?: AbortSignal) => Promise<ReadonlyInbox | null>;
 };
 
 function pollStopped() {
@@ -87,12 +87,18 @@ async function closeInbox(inbox: ReadonlyInbox, signal: AbortSignal) {
 }
 
 function credentials(settings: Row) {
+  const mode = mailMode(settings);
   if (
+    mode === 'off' ||
     !address.safeParse(settings.mail_user).success ||
-    typeof settings.mail_password !== 'string' ||
-    !settings.mail_password
+    (mode === 'imap' && (typeof settings.mail_password !== 'string' || !settings.mail_password))
   )
-    throw new AppError('邮箱尚未配置，请检查 private/config.json 中的客户端账号。');
+    throw new AppError('邮箱尚未配置，请在“设置 → 邮箱”填写账号或启用模拟邮箱。');
+}
+function replyFields(session: Row) {
+  const parsed = SessionMail.safeParse(session.mail);
+  if (!parsed.success) return { inReplyTo: null, references: [] as string[], cc: [] as string[] };
+  return { inReplyTo: parsed.data.inReplyTo, references: parsed.data.references, cc: parsed.data.cc };
 }
 function matching(approval: Row, session: Row, sender: string) {
   const result = snapshotSchema.safeParse(approval.payload);
@@ -106,6 +112,9 @@ function matching(approval: Row, session: Row, sender: string) {
     p.subject === session.title &&
     p.recipient === session.recipient &&
     p.draft === session.content &&
+    (p.inReplyTo ?? null) === replyFields(session).inReplyTo &&
+    JSON.stringify(p.references ?? []) === JSON.stringify(replyFields(session).references) &&
+    JSON.stringify(p.cc ?? []) === JSON.stringify(replyFields(session).cc) &&
     digest(p) === approval.digest
   );
 }
@@ -119,6 +128,20 @@ async function invalidate(tx: Tx, approval: Row, reason: string) {
   ]);
   await event(tx, 'mail.invalidated', approval.session_id, { approvalId: approval.id });
   await notify(tx, 'mail-invalid:' + approval.id, approval.session_id, '需要重新核对发送', reason);
+}
+async function simulatedSend(folder: string, payload: MailSnapshot, messageId: string) {
+  const raw = await compose({
+    from: payload.sender,
+    to: payload.recipient,
+    cc: payload.cc,
+    subject: payload.subject,
+    text: payload.draft,
+    messageId,
+    inReplyTo: payload.inReplyTo,
+    references: payload.references,
+  });
+  await new SimulatedMailbox(folder).append('sent', raw);
+  return true;
 }
 async function defaultSend(settings: Row, payload: MailSnapshot, messageId: string): Promise<boolean> {
   const transport = nodemailer.createTransport({
@@ -139,10 +162,13 @@ async function defaultSend(settings: Row, payload: MailSnapshot, messageId: stri
       transport.sendMail({
         from: payload.sender,
         to: payload.recipient,
+        cc: payload.cc?.length ? payload.cc : undefined,
         subject: payload.subject,
         text: payload.draft,
         messageId,
-        envelope: { from: payload.sender, to: [payload.recipient] },
+        inReplyTo: payload.inReplyTo || undefined,
+        references: payload.references?.length ? payload.references : undefined,
+        envelope: { from: payload.sender, to: [payload.recipient, ...(payload.cc || [])] },
       }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
@@ -161,57 +187,6 @@ async function defaultSend(settings: Row, payload: MailSnapshot, messageId: stri
     transport.close();
   }
 }
-async function defaultInbox(settings: Row, signal?: AbortSignal): Promise<ReadonlyInbox> {
-  const client = new ImapFlow({
-    host: settings.imap_host || 'imap.exmail.qq.com',
-    port: Number(settings.imap_port || 993),
-    secure: true,
-    auth: { user: settings.mail_user, pass: settings.mail_password },
-    logger: false,
-    connectionTimeout: 10000,
-    greetingTimeout: 15000,
-    socketTimeout: 25000,
-    tls: { rejectUnauthorized: true },
-  });
-  client.on('error', () => {});
-  const abort = () => client.close();
-  signal?.addEventListener('abort', abort, { once: true });
-  try {
-    guardPoll(signal);
-    await client.connect();
-    const lock = await client.getMailboxLock('INBOX', { readOnly: true });
-    if (!client.mailbox || !client.mailbox.uidValidity) throw new AppError('邮箱未返回 UIDVALIDITY，未推进同步水位。');
-    return {
-      uidValidity: client.mailbox.uidValidity.toString(),
-      list: async (watermark) =>
-        (await client.search(watermark ? { uid: `${watermark + 1}:*` } : { all: true }, { uid: true })) || [],
-      read: async (uid) => {
-        const result = await client.fetchOne(uid, { source: true }, { uid: true });
-        if (!result || !result.source) throw new AppError('邮箱未返回正文，下次继续读取。');
-        return result.source;
-      },
-      abort,
-      close: async () => {
-        signal?.removeEventListener('abort', abort);
-        lock.release();
-        if (signal?.aborted) {
-          client.close();
-          return;
-        }
-        try {
-          await client.logout();
-        } finally {
-          client.close();
-        }
-      },
-    };
-  } catch (error) {
-    signal?.removeEventListener('abort', abort);
-    client.close();
-    throw error;
-  }
-}
-
 /** All external sends pass through an exact, version-bound approval snapshot. */
 export class MailActions {
   readonly pending = new Map<string, Receipt>();
@@ -255,6 +230,7 @@ export class MailActions {
           return approval;
         await invalidate(tx, approval, '草稿、账号或确认期限已改变，请重新核对。');
       }
+      const reply = replyFields(session);
       const payload: MailSnapshot = {
         action: 'mail.send',
         sessionId,
@@ -263,6 +239,7 @@ export class MailActions {
         recipient: session.recipient,
         sender: settings.mail_user,
         draft: session.content,
+        ...(session.mail ? { inReplyTo: reply.inReplyTo, references: reply.references, cc: reply.cc } : {}),
       };
       const approvalId = id(),
         messageId = `<gse-${approvalId}@${settings.mail_user.split('@')[1]}>`;
@@ -354,6 +331,50 @@ export class MailActions {
       [id(), approval.session_id, content, manual ? 'user_confirmation' : 'smtp_receipt', 'mail-sent:' + approval.id],
     );
   }
+  /** A confirmed reply joins its thread at once; the Sent-folder copy later deduplicates by Message-ID. */
+  private async recordOutgoing(tx: Tx, approval: Row) {
+    const payload = snapshotSchema.safeParse(approval.payload);
+    if (!payload.success) return;
+    const session = await tx.one('SELECT mail FROM app.sessions WHERE id=$1', [approval.session_id]);
+    const mail = SessionMail.safeParse(session?.mail);
+    if (!mail.success) return;
+    const thread = await tx.one('SELECT id FROM app.mail_threads WHERE id=$1', [mail.data.threadId]);
+    if (!thread) return;
+    await ingestMessage(
+      tx,
+      this.boss,
+      {
+        messageId: approval.message_id,
+        inReplyTo: payload.data.inReplyTo ?? null,
+        references: payload.data.references ?? [],
+        from: payload.data.sender,
+        to: [payload.data.recipient],
+        cc: payload.data.cc ?? [],
+        replyTo: null,
+        subject: payload.data.subject,
+        sentAt: new Date(),
+        body: payload.data.draft,
+        origin: 'composed',
+        bulk: false,
+        attachments: [],
+        rawDigest: digest(payload.data),
+      },
+      {
+        account: payload.data.sender,
+        folder: 'yeux-sent',
+        uidValidity: approval.id,
+        uid: 0,
+        role: 'local',
+        draft: false,
+        autoDraft: 'none',
+        dailyLimit: 0,
+        sourceIdentity: 'email:' + payload.data.sender + ':' + approval.message_id,
+      },
+    );
+    await tx.exec("UPDATE app.mail_threads SET triage='replied',revision=revision+1,updated_at=now() WHERE id=$1", [
+      thread.id,
+    ]);
+  }
   private receiptPath(approvalId: string) {
     return join(this.folder, 'receipts', 'mail-' + digest(approvalId) + '.json');
   }
@@ -384,7 +405,10 @@ export class MailActions {
         error,
         receipt.at,
       ]);
-      if (receipt.sent) await this.sentArtifact(tx, approval);
+      if (receipt.sent) {
+        await this.sentArtifact(tx, approval);
+        await this.recordOutgoing(tx, approval);
+      }
       await event(tx, 'mail.result', approval.session_id, { approvalId: approval.id, state });
       await notify(
         tx,
@@ -475,11 +499,12 @@ export class MailActions {
       if (!claimed) return true;
       let sent = false;
       try {
-        sent = await (this.adapters.send || defaultSend)(
-          settings,
-          snapshotSchema.parse(claimed.payload),
-          claimed.message_id,
-        );
+        const payload = snapshotSchema.parse(claimed.payload);
+        sent = this.adapters.send
+          ? await this.adapters.send(settings, payload, claimed.message_id)
+          : mailMode(settings) === 'simulation'
+            ? await simulatedSend(this.folder, payload, claimed.message_id)
+            : await defaultSend(settings, payload, claimed.message_id);
       } catch {
         sent = false;
       }
@@ -542,11 +567,18 @@ export class MailActions {
       );
     });
   }
-  /** Reads BODY.PEEK through an IMAP mailbox opened read-only; never flags mail. */
+  private async openFolder(settings: Row, role: FolderRole, signal: AbortSignal): Promise<ReadonlyInbox | null> {
+    if (role === 'inbox' && this.adapters.inbox) return this.adapters.inbox(settings, signal);
+    if (role === 'sent' && this.adapters.sent) return this.adapters.sent(settings, signal);
+    if (this.adapters.inbox) return null; // A test inbox without a Sent adapter reads INBOX only.
+    if (mailMode(settings) === 'simulation') return new SimulatedMailbox(this.folder).open(role);
+    return openImapFolder(settings, role, signal);
+  }
+  /** Reads BODY.PEEK through mailboxes opened read-only; never flags or moves mail. */
   async poll(externalSignal?: AbortSignal): Promise<{ imported: number; quarantined: number }> {
     if (this.polling) return { imported: 0, quarantined: 0 };
     this.polling = true;
-    let inbox: ReadonlyInbox | undefined;
+    let inbox: ReadonlyInbox | null | undefined;
     const deadline = AbortSignal.timeout(60000),
       signal = externalSignal ? AbortSignal.any([deadline, externalSignal]) : deadline;
     const waitFor = <T>(operation: () => Promise<T>): Promise<T> =>
@@ -574,131 +606,132 @@ export class MailActions {
             },
           );
       });
+    let imported = 0,
+      quarantined = 0;
     try {
       const settings = await waitFor(() => config(this.folder));
       credentials(settings);
-      inbox = await waitFor(() => (this.adapters.inbox || defaultInbox)(settings, signal));
-      const key = 'mail:' + settings.mail_user + ':' + inbox.uidValidity;
-      const watermark = Number(
-        (await this.store.one('SELECT value FROM app.settings WHERE key=$1', [key]))?.value || 0,
-      );
-      if (!Number.isSafeInteger(watermark) || watermark < 0) throw new AppError('邮箱读取水位无效，未执行读取。');
-      const available = [...new Set(await waitFor(() => inbox!.list(watermark)))]
-        .filter((n) => Number.isSafeInteger(n) && n > watermark)
-        .sort((a, b) => a - b);
-      const uids = watermark ? available.slice(0, 50) : available.slice(-20);
-      let imported = 0,
-        quarantined = 0;
-      for (const uid of uids) {
-        guardPoll(signal);
-        const raw = await waitFor(() => inbox!.read(uid)),
-          identity = key + ':' + uid;
-        let body = '',
-          subject = '',
-          sender = '',
-          sourceIdentity = '';
+      const autoDraft = ['none', 'direct', 'all'].includes(settings.mail_auto_draft)
+        ? settings.mail_auto_draft
+        : 'direct';
+      const dailyLimit = Number.isInteger(settings.mail_daily_limit) ? settings.mail_daily_limit : 10;
+      for (const role of ['inbox', 'sent'] as const) {
+        inbox = await waitFor(() => this.openFolder(settings, role, signal));
+        if (!inbox) continue;
         try {
-          if (raw.length > 10_000_000) throw new AppError('邮件超过 10 MB，原文已保留。');
-          const parsed = await waitFor(() =>
-            simpleParser(raw, { skipHtmlToText: true, skipTextToHtml: true, skipImageLinks: true }),
+          // INBOX keeps the original watermark key so upgrades continue where they stopped.
+          const key = 'mail:' + settings.mail_user + (role === 'sent' ? ':sent:' : ':') + inbox.uidValidity;
+          const watermark = Number(
+            (await this.store.one('SELECT value FROM app.settings WHERE key=$1', [key]))?.value || 0,
           );
-          if (typeof parsed.text !== 'string') throw new AppError('邮件没有纯文本正文，原文已隔离保留，请在邮箱查看。');
-          body = parsed.text.trim();
-          if (!body) throw new AppError('邮件正文为空，原文已隔离保留，请在邮箱查看。');
-          subject = (parsed.subject || '(无主题)').replace(/[\r\n]+/g, ' ').trim();
-          sender = (parsed.replyTo?.value[0]?.address || parsed.from?.value[0]?.address || '').trim();
-          if (
-            [...body].length > 100000 ||
-            [...subject].length > 300 ||
-            sender.length > 320 ||
-            /[\x00]/.test(body + subject + sender)
-          )
-            throw new AppError('邮件内容超出可导入范围，原文已完整保留。');
-          sourceIdentity =
-            'email:' + settings.mail_user + ':' + (parsed.messageId || createHash('sha256').update(raw).digest('hex'));
-        } catch (error) {
-          guardPoll(signal);
-          await this.quarantine(
-            identity,
-            raw,
-            error instanceof AppError ? error.message : '邮件解析失败，原文已保留。',
-            key,
-            uid,
-            signal,
-          );
-          quarantined++;
-          continue;
-        }
-        try {
-          const count = await this.store.transaction(async (original) => {
-            const tx = pollTransaction(original, signal);
-            const sourceKey = 'mail-source:' + digest(sourceIdentity);
-            await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [sourceKey]);
-            const requestDigest = digest([subject, body, sender, 'work', 1, null]);
-            const saved = (await tx.one('SELECT value FROM app.settings WHERE key=$1', [sourceKey]))?.value;
-            const legacy = (
-              await tx.one(
-                "SELECT payload FROM app.legacy_rows WHERE table_name='tasks' AND payload->>'source_key'=$1",
-                [sourceIdentity],
-              )
-            )?.payload;
-            const prior =
-              saved ||
-              (legacy
-                ? {
-                    sessionId: legacy.id,
-                    digest:
-                      legacy.request_digest ||
-                      digest([
-                        legacy.subject,
-                        legacy.notice,
-                        legacy.recipient,
-                        legacy.kind,
-                        legacy.priority,
-                        legacy.due_at,
-                      ]),
-                  }
-                : null);
-            if (prior && prior.digest !== requestDigest)
-              throw new AppError('相同 Message-ID 对应不同原文，已隔离保留。', 409, 'mail_source_conflict');
-            let count = 0;
-            if (!prior) {
-              const created = await createSession(tx, this.boss, { title: subject, prompt: body, kind: 'work' });
-              await tx.exec('UPDATE app.sessions SET recipient=$2 WHERE id=$1', [created.sessionId, sender]);
-              const sourceId = 'mail-source-' + digest(sourceIdentity).slice(0, 24);
-              await putSource(tx, { id: sourceId, title: subject, content: body });
-              await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [
-                sourceKey,
-                JSON.stringify({
-                  identity: sourceIdentity,
-                  digest: requestDigest,
-                  sessionId: created.sessionId,
-                  sourceId,
-                }),
-              ]);
-              count = 1;
+          if (!Number.isSafeInteger(watermark) || watermark < 0) throw new AppError('邮箱读取水位无效，未执行读取。');
+          const available = [...new Set(await waitFor(() => inbox!.list(watermark)))]
+            .filter((n) => Number.isSafeInteger(n) && n > watermark)
+            .sort((a, b) => a - b);
+          const uids = watermark ? available.slice(0, 50) : available.slice(role === 'inbox' ? -20 : -50);
+          for (const uid of uids) {
+            guardPoll(signal);
+            const raw = await waitFor(() => inbox!.read(uid)),
+              identity = key + ':' + uid;
+            let parsed: Awaited<ReturnType<typeof parseMail>>;
+            try {
+              parsed = await waitFor(() => parseMail(raw, settings.mail_user));
+            } catch (error) {
+              guardPoll(signal);
+              await this.quarantine(
+                identity,
+                raw,
+                error instanceof AppError ? error.message : '邮件解析失败，原文已保留。',
+                key,
+                uid,
+                signal,
+              );
+              quarantined++;
+              continue;
             }
-            await tx.exec(
-              'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-              [key, JSON.stringify(String(uid))],
-            );
-            return count;
-          });
-          imported += count;
-        } catch (error) {
-          guardPoll(signal);
-          if (!(error instanceof AppError) || error.code !== 'mail_source_conflict') throw error;
-          await this.quarantine(identity, raw, error.message, key, uid, signal);
-          quarantined++;
+            const sender = (parsed.replyTo || parsed.from).trim(),
+              sourceIdentity = 'email:' + settings.mail_user + ':' + (parsed.messageId || parsed.rawDigest);
+            // The first sync records history; only recent mail may start a draft.
+            const recent = !parsed.sentAt || Date.now() - parsed.sentAt.getTime() < 3 * 86400000;
+            try {
+              const count = await this.store.transaction(async (original) => {
+                const tx = pollTransaction(original, signal);
+                const sourceKey = 'mail-source:' + digest(sourceIdentity);
+                await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [sourceKey]);
+                const requestDigest = digest([parsed.subject, parsed.body, sender, 'work', 1, null]);
+                const saved = (await tx.one('SELECT value FROM app.settings WHERE key=$1', [sourceKey]))?.value;
+                const legacy = (
+                  await tx.one(
+                    "SELECT payload FROM app.legacy_rows WHERE table_name='tasks' AND payload->>'source_key'=$1",
+                    [sourceIdentity],
+                  )
+                )?.payload;
+                const prior =
+                  saved ||
+                  (legacy
+                    ? {
+                        sessionId: legacy.id,
+                        digest:
+                          legacy.request_digest ||
+                          digest([
+                            legacy.subject,
+                            legacy.notice,
+                            legacy.recipient,
+                            legacy.kind,
+                            legacy.priority,
+                            legacy.due_at,
+                          ]),
+                      }
+                    : null);
+                if (prior && prior.digest !== requestDigest)
+                  throw new AppError('相同 Message-ID 对应不同原文，已隔离保留。', 409, 'mail_source_conflict');
+                let count = 0;
+                if (!prior) {
+                  const result = await ingestMessage(tx, this.boss, parsed, {
+                    account: settings.mail_user,
+                    folder: role === 'inbox' ? 'INBOX' : 'Sent',
+                    uidValidity: inbox!.uidValidity,
+                    uid,
+                    role,
+                    draft: role === 'inbox' && (watermark > 0 || recent),
+                    autoDraft,
+                    dailyLimit,
+                    sourceIdentity,
+                  });
+                  await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING', [
+                    sourceKey,
+                    JSON.stringify({
+                      identity: sourceIdentity,
+                      digest: requestDigest,
+                      threadId: result.threadId,
+                      sourceId: 'mail-source-' + digest(sourceIdentity).slice(0, 24),
+                    }),
+                  ]);
+                  count = result.created && role === 'inbox' ? 1 : 0;
+                }
+                await tx.exec(
+                  'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                  [key, JSON.stringify(String(uid))],
+                );
+                return count;
+              });
+              imported += count;
+            } catch (error) {
+              guardPoll(signal);
+              if (!(error instanceof AppError) || error.code !== 'mail_source_conflict') throw error;
+              await this.quarantine(identity, raw, error.message, key, uid, signal);
+              quarantined++;
+            }
+          }
+        } finally {
+          const current = inbox;
+          inbox = undefined;
+          await closeInbox(current, signal);
         }
       }
       return { imported, quarantined };
     } finally {
-      try {
-        if (inbox) await closeInbox(inbox, signal);
-      } finally {
-        this.polling = false;
-      }
+      this.polling = false;
     }
   }
 }

@@ -185,6 +185,70 @@ export async function diagnose({
   )
     add('legacy_data', 'error', '检测到尚未确认切换的旧版数据。', '按 docs/development.md 完成迁移核对后再启动。');
 
+  const workspace = join(folder, 'workspace');
+  if (!(await exists(workspace)))
+    add('workspace', 'warning', '个人规则工作区尚未初始化。', '下次正常启动时会建立本地 Git 仓库。');
+  else {
+    const head = run('git', ['-C', workspace, '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--verify', 'HEAD']);
+    const status = run('git', [
+      '-C',
+      workspace,
+      '-c',
+      'core.hooksPath=/dev/null',
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+    ]);
+    const locked = await exists(join(workspace, '.git', 'index.lock'));
+    const valid =
+      !head.error &&
+      head.status === 0 &&
+      /^[a-f0-9]{40,64}$/.test(head.stdout?.trim() || '') &&
+      !status.error &&
+      status.status === 0;
+    const changes = status.stdout?.split('\0').filter(Boolean).length || 0;
+    add(
+      'workspace',
+      !valid ? 'error' : locked || changes ? 'warning' : 'ok',
+      !valid
+        ? '工作区 Git 仓库不可读取。'
+        : locked
+          ? '工作区存在 Git 锁。'
+          : `工作区正常，${changes} 项手工修改未提交。`,
+      !valid
+        ? '检查 private/workspace，保留已有内容；不要重新初始化覆盖。'
+        : locked
+          ? '先确认没有运行中的 Git 操作，再人工处理 .git/index.lock；助手不会自动删除。'
+          : changes
+            ? '在设置的规则工作区核对并提交修改。'
+            : undefined,
+    );
+  }
+  const configuredBind = environment.ASSISTANT_BIND || '127.0.0.1',
+    publicOrigin = environment.ASSISTANT_PUBLIC_ORIGIN || '';
+  add(
+    'mobile_access',
+    configuredBind === '127.0.0.1' || configuredBind === '::1' ? 'warning' : 'ok',
+    configuredBind === '127.0.0.1' || configuredBind === '::1'
+      ? '当前仅本机可访问。'
+      : '当前允许通过配置的网卡地址访问。',
+    '手机接入需明确选择可信局域网或 HTTPS 入口；同一 Wi-Fi 也可能隔离设备。',
+  );
+  if (publicOrigin) {
+    try {
+      const url = new URL(publicOrigin);
+      if (url.protocol !== 'https:' || url.origin !== publicOrigin) throw new Error();
+      add('public_origin', 'ok', '已配置 HTTPS 来源；手机实际访问地址须与它一致。');
+    } catch {
+      add(
+        'public_origin',
+        'error',
+        '公开来源不是完整的 HTTPS origin。',
+        '核对 ASSISTANT_PUBLIC_ORIGIN，不应包含路径、查询或片段。',
+      );
+    }
+  }
   const docker = run('docker', ['--version']);
   const dockerAvailable = !docker.error && docker.status === 0;
   add(
@@ -199,7 +263,7 @@ export async function diagnose({
     ownershipConflict = false;
   const project = env.COMPOSE_PROJECT_NAME || 'yeux-assitant',
     port = Number(environment.ASSISTANT_PORT || 8765),
-    bind = environment.ASSISTANT_BIND || '0.0.0.0';
+    bind = environment.ASSISTANT_BIND || '127.0.0.1';
   const validProject = /^[a-z0-9][a-z0-9_-]*$/.test(project);
   if (!validProject)
     add(

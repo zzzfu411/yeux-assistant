@@ -69,7 +69,12 @@ describe('read-only startup diagnosis', () => {
         probePort: async () => 'occupied',
       });
       expect(report.ok).toBe(true);
-      expect(report.checks.every((check: any) => check.status === 'ok')).toBe(true);
+      expect(
+        report.checks
+          .filter((check: any) => !['workspace', 'mobile_access'].includes(check.id))
+          .every((check: any) => check.status === 'ok'),
+      ).toBe(true);
+      expect(report.checks.find((check: any) => check.id === 'workspace').status).toBe('warning');
       expect(report.checks.find((check: any) => check.id === 'port').message).toContain('本项目');
       expect(JSON.stringify(report)).not.toContain('synthetic-');
       expect(await readdir(folder)).toEqual(files);
@@ -122,6 +127,8 @@ describe('read-only startup diagnosis', () => {
         'administrator',
         'access_token',
         'model_config',
+        'workspace',
+        'mobile_access',
       ]);
       expect(await readdir(folder)).toEqual([]);
       expect(calls.some((call) => call.args.includes('config'))).toBe(false);

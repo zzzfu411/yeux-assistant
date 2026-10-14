@@ -28,6 +28,11 @@ export function registerLearningRoutes(server: ApiServer, app: Application) {
   server.get('/sessions', { schema: { querystring: pageQuery } }, (r) => app.history(r.query.page));
   server.get('/sessions/list', { schema: { querystring: SessionListQuery } }, (r) => app.sessionList(r.query));
   server.get('/sessions/:id', { schema: { params } }, (r) => app.session(r.params.id));
+  server.get('/sessions/:id/research/export', { schema: { params } }, async (r, p) => {
+    const detail = await app.session(r.params.id);
+    p.header('Content-Disposition', `attachment; filename="research-${encodeURIComponent(r.params.id)}.json"`);
+    return { question: detail.session.prompt, research: detail.research };
+  });
   server.post('/sessions', { schema: { body: CreateSession } }, async (r, p) => {
     p.code(202);
     return app.addSession(key(r), r.body);

@@ -30,6 +30,9 @@ const roots = [
   '.npmrc',
   '.dockerignore',
   '.gitignore',
+  '.prettierrc',
+  '.prettierignore',
+  '.git-blame-ignore-revs',
 ];
 const excluded = new Set([
   'private',

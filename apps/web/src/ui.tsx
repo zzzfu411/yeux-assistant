@@ -51,19 +51,46 @@ const states: Record<string, string> = {
   practicing: '当前这一步',
   pending: '待开始',
 };
+const tones: Record<string, 'info' | 'accent' | 'danger' | 'success' | 'neutral'> = {
+  queued: 'info',
+  running: 'info',
+  waiting_feedback: 'accent',
+  failed: 'danger',
+  ready: 'success',
+  completed: 'success',
+  goal_completed: 'success',
+  practiced: 'success',
+  practicing: 'accent',
+  active: 'info',
+};
 export function Status({ state }: { state: string }) {
+  const tone = tones[state] || 'neutral';
   return (
     <span
       className={`${s.status} ${state === 'failed' ? s.dangerText : state === 'waiting_feedback' ? s.accentText : ''}`}
+      data-tone={tone}
+      data-live={state === 'running' || state === 'queued' ? 'true' : undefined}
     >
+      <i aria-hidden="true" />
       {states[state] || state}
     </span>
   );
 }
-export function Heading({ title, children, action }: { title: string; children?: ReactNode; action?: ReactNode }) {
+export function Heading({
+  title,
+  children,
+  action,
+  eyebrow,
+}: {
+  title: string;
+  children?: ReactNode;
+  action?: ReactNode;
+  eyebrow?: ReactNode;
+}) {
   return (
     <header className={s.heading}>
       <div>
+        {eyebrow && <p className={s.eyebrow}>{eyebrow}</p>}
         <h1>{title}</h1>
         {children && <p className={s.muted}>{children}</p>}
       </div>
@@ -108,7 +135,7 @@ export function QueryState({ pending, error, retry }: { pending: boolean; error:
 export function Result({ children }: { children: string }) {
   return (
     <div className={s.prose}>
-      <Suspense fallback={<p className={s.muted}>正在载入内容…</p>}>
+      <Suspense fallback={<p className={s.prewrap}>{children}</p>}>
         <Markdown
           components={{
             a: ({ children, href }) => (
@@ -410,7 +437,18 @@ export function Sources({ citations }: { citations: Citation[] }) {
       <summary>参考资料 · {citations.length}</summary>
       {citations.map((citation, i) => (
         <div className={s.citation} key={citation.sourceId + ':' + i}>
-          <a href={'#/source/' + encodeURIComponent(citation.sourceId) + '?version=' + citation.version}>
+          <a
+            href={
+              '#/source/' +
+              encodeURIComponent(citation.sourceId) +
+              '?version=' +
+              citation.version +
+              '&start=' +
+              citation.start +
+              '&end=' +
+              citation.end
+            }
+          >
             {citation.title}
           </a>
           <span className={s.muted}>

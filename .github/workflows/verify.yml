@@ -31,6 +31,6 @@ jobs:
       - name: Formatting, types, build and isolated PostgreSQL tests
         run: pnpm verify
       - name: Desktop and phone interactions
-        run: pnpm exec playwright test tests/e2e/assistant.spec.ts tests/e2e/devices.spec.ts tests/e2e/sources.spec.ts tests/e2e/source-catalog.spec.ts
+        run: pnpm exec playwright test tests/e2e/assistant.spec.ts tests/e2e/devices.spec.ts tests/e2e/sources.spec.ts tests/e2e/source-catalog.spec.ts tests/e2e/workspace.spec.ts tests/e2e/ehall.spec.ts tests/e2e/device-connection.spec.ts
       - name: API, Worker and complete backup restore
         run: pnpm verify:e2e

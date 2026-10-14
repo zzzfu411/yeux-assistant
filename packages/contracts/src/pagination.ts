@@ -45,6 +45,8 @@ export const SessionSummary = z
     state: z.enum(['queued', 'running', 'waiting_feedback', 'ready', 'completed', 'failed', 'cancelled', 'archived']),
     promptPreview: z.string().max(320),
     errorPreview: z.string().max(480),
+    flow: z.enum(['mail-reply', 'errand']).nullable(),
+    isResearch: z.boolean(),
     createdAt: z.string(),
     updatedAt: z.string(),
   })
@@ -61,6 +63,11 @@ export type TodayOverview = {
   modelConfigured: boolean;
   workerOnline: boolean;
   backgroundIssues: number;
+  /** Reply drafts ready for the owner to check, plus approvals waiting for a decision. */
+  mailWaiting: number;
+  /** New, unhandled mail threads. */
+  mailNew: number;
+  mailMode: 'off' | 'imap' | 'simulation';
 };
 export type GoalPage = CursorPage<Goal>;
 export type SessionPage = CursorPage<SessionSummary>;

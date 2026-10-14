@@ -13,7 +13,8 @@ export class Sources {
 
   async list(archived = false) {
     const rows = await this.store.rows(
-      `SELECT s.id,s.title,s.version,s.revision,s.digest,s.updated_at,s.archived_at,s.managed,
+      `SELECT s.id,s.title,s.version,s.revision,s.digest,s.updated_at,s.archived_at,s.missing_at,s.managed,
+      (SELECT old.title FROM app.sources old WHERE old.missing_at IS NOT NULL AND old.digest=s.digest AND old.id<>s.id ORDER BY old.updated_at DESC LIMIT 1) AS possible_rename,
       CASE WHEN v.metadata IS NULL THEN NULL ELSE jsonb_build_object('course',v.metadata->'course','courseName',v.metadata->'courseName','format',v.metadata->'format') END AS metadata
       FROM app.sources s JOIN app.source_versions v ON v.source_id=s.id AND v.version=s.version
       WHERE (s.archived_at IS NOT NULL)=$1 ORDER BY s.updated_at DESC,s.id`,
@@ -26,6 +27,8 @@ export class Sources {
       revision: r.revision,
       digest: r.digest,
       updatedAt: iso(r.updated_at),
+      possibleRenameOf: r.possible_rename ?? null,
+      missingAt: r.missing_at ? iso(r.missing_at) : null,
       archivedAt: r.archived_at ? iso(r.archived_at) : null,
       managed: r.managed,
       metadata: r.metadata,
@@ -37,7 +40,7 @@ export class Sources {
       const source = await requireRow(
         tx,
         `SELECT s.id,v.title,v.version,v.content,v.digest,v.metadata,s.version AS current_version,
-        s.revision,s.archived_at,s.managed,current.metadata AS current_metadata
+        s.revision,s.archived_at,s.missing_at,s.managed,current.metadata AS current_metadata
         FROM app.sources s JOIN app.source_versions v ON s.id=v.source_id
         JOIN app.source_versions current ON current.source_id=s.id AND current.version=s.version
         WHERE s.id=$1 AND v.version=coalesce($2,s.version)`,
@@ -59,6 +62,7 @@ export class Sources {
         current_version: Number(source.current_version),
         revision: Number(source.revision),
         managed: Boolean(source.managed),
+        missingAt: source.missing_at ? iso(source.missing_at) : null,
         archivedAt: source.archived_at ? iso(source.archived_at) : null,
         editableText: Boolean(source.managed && source.current_metadata === null),
         versions,

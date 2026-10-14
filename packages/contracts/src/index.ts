@@ -1,3 +1,5 @@
+import { ResearchOptions } from './research.js';
+import { RuleScope } from './workspace.js';
 import { z } from 'zod';
 
 export const Id = z.string().min(1).max(160);
@@ -113,10 +115,26 @@ export const LearningSession = z.object({
   state: SessionState,
   revision: Revision,
   currentRunId: Id.nullable(),
+  research: ResearchOptions.nullable().optional(),
   content: z.string(),
   citations: z.array(Citation),
   error: z.string(),
   recipient: z.string().default(''),
+  /** 'mail-reply' or 'errand' choose dedicated executors; null for learning and research. */
+  flow: z.enum(['mail-reply', 'errand']).nullable().optional(),
+  flowId: z.string().nullable().optional(),
+  parentSessionId: z.string().nullable().optional(),
+  mail: z
+    .object({
+      threadId: z.string(),
+      inReplyTo: z.string().nullable(),
+      references: z.array(z.string()),
+      cc: z.array(z.string()),
+      questions: z.array(z.string()),
+    })
+    .partial()
+    .nullable()
+    .optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -166,13 +184,18 @@ export const CreateSession = z
     title: z.string().max(200).default(''),
     prompt: Text,
     kind: z.enum(['study', 'work', 'manage']).default('study'),
+    research: ResearchOptions.optional(),
   })
-  .strict();
+  .strict()
+  .refine((value) => !value.research || value.kind === 'work', {
+    message: '深入研究使用工作任务类型。',
+    path: ['research'],
+  });
 export const MemoryInput = z
   .object({
     key: z.string().min(1).max(100),
     content: Text,
-    scope: z.enum(['preference', 'fact', 'correction', 'all', 'study', 'work', 'manage']).default('preference'),
+    scope: RuleScope.default('preference'),
     confirmed: z.boolean().default(true),
     enabled: z.boolean().default(true),
     revision: z.number().int().nonnegative(),
@@ -199,6 +222,10 @@ export const ModelSettingsInput = z
     model: z.string().max(300),
     api_key: z.string().max(10000).default(''),
     tools: z.boolean().default(true),
+    // Optional independent reviewer for deep research. Omitted keeps the current value; both empty clears it.
+    review_base_url: z.string().max(2000).optional(),
+    review_model: z.string().max(300).optional(),
+    review_api_key: z.string().max(10000).optional(),
   })
   .strict();
 export const ApprovalDecision = z.object({ digest: z.string().length(64), approve: z.boolean() }).strict();
@@ -215,6 +242,10 @@ export { ModelAssessment, AssessmentCitation } from './assessment.js';
 
 export type GoalDetail = { goal: Goal; plan: PlanRevision | null; sessions: LearningSession[]; attempts: Attempt[] };
 export type SessionDetail = {
+  research?: import('./research.js').ResearchDetail | null;
+  errand?: import('./errands.js').ErrandDetail | null;
+  related?: Array<{ id: string; title: string; state: string; flow: string | null; relation: 'parent' | 'child' }>;
+  ruleUsage?: import('./workspace.js').RuleUsage[];
   session: LearningSession;
   attempts: Attempt[];
   artifacts: Array<{ id: string; content: string; kind: string; provenance: string; createdAt: string }>;
@@ -229,6 +260,8 @@ export type SourceSummary = {
   updatedAt: string;
   metadata?: Pick<SourceMetadata, 'course' | 'courseName' | 'format'> | null;
   revision?: number;
+  possibleRenameOf?: string | null;
+  missingAt?: string | null;
   archivedAt?: string | null;
   managed?: boolean;
 };
@@ -241,6 +274,8 @@ export type SourceDetail = {
   digest: string;
   metadata?: SourceMetadata | null;
   revision: number;
+  possibleRenameOf?: string | null;
+  missingAt?: string | null;
   archivedAt: string | null;
   managed: boolean;
   editableText: boolean;

@@ -141,6 +141,33 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
     vi.stubGlobal('fetch', request);
     return { started, request, timeout };
   }
+  it('streams by default and asks once more plainly when a provider rejects streaming fields', async () => {
+    const { runId, gateway } = await run();
+    const bodies: Array<Record<string, unknown>> = [];
+    const answer = JSON.stringify({ result: 'plain' });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init: RequestInit) => {
+        const body = JSON.parse(String(init.body));
+        bodies.push(body);
+        if (body.stream) return new Response('{"error":"stream unsupported"}', { status: 400 });
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: answer } }], usage: { total_tokens: 4 } }),
+          {
+            headers: { 'content-type': 'application/json' },
+          },
+        );
+      }),
+    );
+    await expect(gateway.json(schema, '返回结构化结果', context)).resolves.toEqual({ result: 'plain' });
+    expect(bodies.map((body) => body.stream)).toEqual([true, undefined]);
+    expect(bodies[0]!.stream_options).toEqual({ include_usage: true });
+    // The rejected attempt generated nothing; the run is charged one call.
+    expect((await store.one('SELECT model_calls,usage FROM app.runs WHERE id=$1', [runId]))!).toEqual({
+      model_calls: 1,
+      usage: [{ total_tokens: 4 }],
+    });
+  });
   it('accepts a 60-second response within the original 180-second run deadline', async () => {
     const { runId, claimed, gateway } = await run(),
       mock = clockedModel(60000);
@@ -153,6 +180,19 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
     expect(saved.model_calls).toBe(1);
     expect(saved.deadline).toEqual(claimed.deadline);
     expect(saved.usage).toEqual([{ total_tokens: 3 }]);
+  });
+  it('allows a research call beyond 90 seconds without extending the persisted run deadline', async () => {
+    const { runId, claimed, gateway } = await run(),
+      mock = clockedModel(95000);
+    const pending = gateway.json(schema, '返回结构化结果', context, { timeoutMs: 180000 });
+    await mock.started;
+    await vi.advanceTimersByTimeAsync(95000);
+    await expect(pending).resolves.toEqual({ result: 'synthetic-response' });
+    expect(mock.timeout.mock.calls[0]![0]).toBeGreaterThan(95000);
+    expect(mock.timeout.mock.calls[0]![0]).toBeLessThanOrEqual(180000);
+    const saved = (await store.one('SELECT model_calls,deadline FROM app.runs WHERE id=$1', [runId]))!;
+    expect(saved.model_calls).toBe(1);
+    expect(saved.deadline).toEqual(claimed.deadline);
   });
   it('aborts a response beyond 90 seconds without consuming a retry or extending the run deadline', async () => {
     const { runId, claimed, gateway } = await run(),
@@ -172,7 +212,7 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
     const { runId, claimed, gateway } = await run(),
       mock = clockedModel(60000);
     vi.setSystemTime(new Date(claimed.deadline).getTime() - 20000);
-    const pending = gateway.json(schema, '返回结构化结果', context);
+    const pending = gateway.json(schema, '返回结构化结果', context, { timeoutMs: 180000 });
     const rejected = expect(pending).rejects.toMatchObject({ code: 'model_unavailable' });
     await mock.started;
     expect(mock.timeout).toHaveBeenCalledWith(20000);

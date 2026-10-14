@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { Device, DeviceCommand, DeviceOverview } from '../../../packages/contracts/src/devices';
 import { useAction, useApi, useDraft } from './api';
 import { date, ErrorNotice, Heading, QueryState } from './ui';
+import { EhallForm, EhallPreview } from './ehall-card';
 import { DeviceConnection } from './device-connection';
 import { Icon } from './icons';
 import s from './styles.module.css';
@@ -21,6 +22,8 @@ const commandLabels: Record<DeviceCommand['state'], string> = {
 };
 const shortId = (id: string) => id.replace(/-/g, '').slice(-8);
 function power(state: Device['observedState']) {
+  if (state?.simulation === true && typeof state.loggedIn === 'boolean')
+    return state.loggedIn ? '模拟账号已登录' : '模拟账号未登录';
   if (typeof state?.volume === 'number') return '输出音量 ' + state.volume + '%' + (state.muted ? ' · 静音' : '');
   return state?.power === true ? '开启' : state?.power === false ? '关闭' : '尚未核验';
 }
@@ -262,6 +265,22 @@ export function DevicesPage({ commandId = '' }: { commandId?: string }) {
                       </button>
                     )}
                   </div>
+                  {device.adapter === 'browser.ehall' && (
+                    <EhallForm
+                      device={device}
+                      disabled={
+                        action.busy ||
+                        Boolean(active) ||
+                        !device.available ||
+                        !device.enabled ||
+                        !data.control.enabled ||
+                        history.isPending ||
+                        Boolean(history.error) ||
+                        Boolean(query.error)
+                      }
+                      preview={(cap, args) => preview(device, cap, args)}
+                    />
+                  )}
                   {active && (
                     <div className={s.devicePending}>
                       <span>{commandLabels[active.state]}</span>
@@ -304,6 +323,27 @@ export function DevicesPage({ commandId = '' }: { commandId?: string }) {
                     key={command.id}
                     now={now}
                     verifiedOverview={!query.isError && Boolean(data)}
+                    submitEhall={
+                      command.state === 'succeeded' && command.capability === 'ehall.form.prepare'
+                        ? (args) => {
+                            const device = data?.devices.find((row) => row.id === command.deviceId);
+                            if (device) preview(device, 'ehall.form.submit', args);
+                          }
+                        : undefined
+                    }
+                    submitDisabled={
+                      action.busy ||
+                      history.isPending ||
+                      history.isError ||
+                      query.isError ||
+                      !data?.control.enabled ||
+                      !data.devices.find((row) => row.id === command.deviceId)?.available ||
+                      commands.some(
+                        (row) =>
+                          row.deviceId === command.deviceId &&
+                          ['pending', 'approved', 'executing', 'uncertain'].includes(row.state),
+                      )
+                    }
                   />
                 ))}
               </div>
@@ -319,10 +359,14 @@ function CommandCard({
   command,
   now,
   verifiedOverview,
+  submitEhall,
+  submitDisabled,
 }: {
   command: DeviceCommand;
   now: number;
   verifiedOverview: boolean;
+  submitEhall?: (args: Record<string, unknown>) => void;
+  submitDisabled: boolean;
 }) {
   const api = useApi(),
     action = useAction(),
@@ -359,7 +403,17 @@ function CommandCard({
       <div className={s.sectionHeading}>
         <h3>
           {prefix}
-          {command.deviceName} · {command.summary}
+          {command.deviceName} ·{' '}
+          {command.capability.startsWith('ehall.')
+            ? (
+                {
+                  'ehall.form.prepare': '准备表单',
+                  'ehall.form.submit': '提交申请',
+                  'ehall.query': '查询课表',
+                  'ehall.session.check': '检查登录',
+                } as Record<string, string>
+              )[command.capability]
+            : command.summary}
         </h3>
         <span
           className={`${s.status} ${command.state === 'uncertain' ? s.dangerText : command.state === 'pending' ? s.accentText : ''}`}
@@ -370,6 +424,9 @@ function CommandCard({
       <p className={s.muted}>
         {date(command.createdAt)} · 设备编号 <span title={command.deviceId}>{shortId(command.deviceId)}</span>
       </p>
+      {command.capability.startsWith('ehall.') && (
+        <EhallPreview command={command} onSubmit={submitEhall} disabled={submitDisabled} />
+      )}
       {command.state === 'pending' && (
         <div className={s.deviceConfirmation}>
           <p>
@@ -383,7 +440,11 @@ function CommandCard({
               disabled={action.busy || !verifiedOverview || !inTime(command, now)}
               onClick={() => write('decision', { revision: command.revision, digest: command.digest, approve: true })}
             >
-              确认{command.summary}
+              {command.capability === 'ehall.form.submit'
+                ? '确认提交模拟申请'
+                : command.capability.startsWith('ehall.')
+                  ? '确认执行'
+                  : '确认' + command.summary}
             </button>
             <button
               className={s.textButton}

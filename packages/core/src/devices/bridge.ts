@@ -1,10 +1,12 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Row, Store, Tx } from '../../../storage/src/index.js';
 import {
   AudioInput,
   AudioState,
   BridgePoll,
+  BridgeCall as CallSchema,
+  BridgeEvidence,
   BridgeReport,
   CreateDeviceBridge,
   type BridgeCall,
@@ -13,12 +15,19 @@ import {
 import { AppError, digest, event, id, iso, notify, once, requireRow } from '../common.js';
 import { DeviceNotApplied, type DeviceAdapter, type ExecutionContext } from './driver.js';
 
+import { mkdir, lstat, readFile, writeFile, rename } from 'node:fs/promises';
+import { join } from 'node:path';
+import { EhallState, bridgeGrantMs, bridgeVersions } from '../../../contracts/src/ehall.js';
+
 export type BridgePrincipal = { deviceId: string; tokenHash: string };
 const denied = () => new AppError('设备连接无效、已到期或已撤销。', 401, 'device_bridge_unauthorized');
 const stale = () => new AppError('设备指令已失效，请停止本次操作。', 409, 'device_bridge_stale');
 
 export class DeviceBridges {
-  constructor(readonly store: Store) {}
+  constructor(
+    readonly store: Store,
+    readonly folder?: string,
+  ) {}
   async issue(key: string, input: unknown) {
     const data = CreateDeviceBridge.parse(input);
     let token: string | null = null;
@@ -82,7 +91,7 @@ export class DeviceBridges {
       command.payload.deviceRevision === device.revision &&
       command.payload.controlRevision === control.revision &&
       command.payload.adapter === device.adapter &&
-      command.payload.adapterVersion === '1' &&
+      command.payload.adapterVersion === bridgeVersions[device.adapter as keyof typeof bridgeVersions] &&
       digest(command.payload) === command.digest;
     return {
       call,
@@ -119,7 +128,7 @@ export class DeviceBridges {
       const lease = id();
       await tx.exec("UPDATE app.device_bridge_calls SET state='claimed',lease=$2 WHERE id=$1", [row.id, lease]);
       return {
-        call: {
+        call: CallSchema.parse({
           id: row.id,
           lease,
           deviceId: actor.deviceId,
@@ -129,20 +138,21 @@ export class DeviceBridges {
           kind: row.kind,
           capability: row.payload.capability,
           arguments: row.payload.arguments,
-        },
+          ...(data.adapter === 'browser.ehall' ? { phase: row.phase } : {}),
+        }),
       };
     });
   }
   async start(actor: BridgePrincipal, callId: string, lease: string) {
     return this.store.transaction(async (tx) => {
-      const { call, valid } = await this.current(tx, actor, callId, lease);
+      const { call, command, valid } = await this.current(tx, actor, callId, lease);
       if (!valid || call.state !== 'claimed') throw stale();
       const row = await requireRow(
         tx,
         `UPDATE app.device_bridge_calls SET state='started',
-        active_until=LEAST(deadline,clock_timestamp()+interval '5 seconds') WHERE id=$1
+        active_until=LEAST(deadline,clock_timestamp()+$2::double precision*interval '1 millisecond') WHERE id=$1
         RETURNING GREATEST(0,FLOOR(EXTRACT(epoch FROM active_until-clock_timestamp())*1000))::integer AS remaining`,
-        [callId],
+        [callId, bridgeGrantMs(command.payload.adapter)],
       );
       return { remainingMs: row.remaining as number };
     });
@@ -151,7 +161,7 @@ export class DeviceBridges {
     const data = BridgeReport.parse(input),
       hash = digest(data.result);
     return this.store.transaction(async (tx) => {
-      const { call, valid } = await this.current(tx, actor, callId, data.lease);
+      const { call, command, valid } = await this.current(tx, actor, callId, data.lease);
       if (call.state === 'completed') {
         if (call.result_digest !== hash) throw stale();
         return { ok: true };
@@ -163,8 +173,20 @@ export class DeviceBridges {
       )
         throw stale();
       if (data.result.ok) {
-        if (call.kind === 'read') AudioState.parse(data.result.state);
-        else if (data.result.state !== undefined) throw new AppError('执行回执不能替代独立状态读取。');
+        if (call.kind === 'read') {
+          if (command.payload.adapter === 'browser.ehall') {
+            const state = EhallState.parse(data.result.state);
+            if (call.phase === 'after' && !state.screenshotDigest) throw new AppError('缺少页面核验截图。');
+            if (
+              state.screenshotDigest &&
+              !(await tx.one('SELECT digest FROM app.action_evidence WHERE call_id=$1 AND digest=$2', [
+                call.id,
+                state.screenshotDigest,
+              ]))
+            )
+              throw new AppError('截图未上传或摘要不匹配。');
+          } else AudioState.parse(data.result.state);
+        } else if (data.result.state !== undefined) throw new AppError('执行回执不能替代独立状态读取。');
       }
       await tx.exec(
         "UPDATE app.device_bridge_calls SET state='completed',result=$2,result_digest=$3,finished_at=clock_timestamp() WHERE id=$1",
@@ -172,6 +194,72 @@ export class DeviceBridges {
       );
       return { ok: true };
     });
+  }
+  async evidence(actor: BridgePrincipal, callId: string, input: unknown) {
+    const data = BridgeEvidence.parse(input),
+      png = Buffer.from(data.png, 'base64');
+    if (
+      !this.folder ||
+      png.length > 2 * 1024 * 1024 ||
+      png.length < 24 ||
+      png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a' ||
+      createHash('sha256').update(png).digest('hex') !== data.digest
+    )
+      throw new AppError('需要不超过 2 MB、摘要匹配的 PNG。');
+    // Validate authority before writing. Revalidate after writing; a cancelled call cannot publish evidence.
+    const target = await this.store.transaction(async (tx) => {
+      const { call, command, valid } = await this.current(tx, actor, callId, data.lease);
+      if (!valid || call.state !== 'started' || command.payload.adapter !== 'browser.ehall' || call.kind !== 'read')
+        throw stale();
+      if (
+        await tx.one('SELECT digest FROM app.action_evidence WHERE call_id=$1 AND digest<>$2', [call.id, data.digest])
+      )
+        throw stale();
+      return command.id as string;
+    });
+    const relative = 'ehall-evidence/' + target + '/' + data.digest + '.png';
+    for (const dir of [join(this.folder, 'ehall-evidence'), join(this.folder, 'ehall-evidence', target)]) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const info = await lstat(dir);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new AppError('证据目录无效。');
+    }
+    const file = join(this.folder, relative),
+      temporary = file + '.' + id() + '.tmp';
+    await writeFile(temporary, png, { flag: 'wx', mode: 0o600 });
+    await rename(temporary, file);
+    return this.store.transaction(async (tx) => {
+      const { call, valid } = await this.current(tx, actor, callId, data.lease);
+      if (
+        !valid ||
+        call.state !== 'started' ||
+        !(await tx.one('SELECT $1::timestamptz>clock_timestamp() valid', [call.active_until]))!.valid
+      )
+        throw stale();
+      await tx.exec(
+        "INSERT INTO app.action_evidence(command_id,call_id,kind,path,digest,bytes) VALUES($1,$2,'screenshot',$3,$4,$5) ON CONFLICT(call_id) DO NOTHING",
+        [target, callId, relative, data.digest, png.length],
+      );
+      if (
+        !(await tx.one('SELECT digest FROM app.action_evidence WHERE call_id=$1 AND digest=$2', [callId, data.digest]))
+      )
+        throw stale();
+      return { ok: true };
+    });
+  }
+  async readEvidence(commandId: string, hash: string) {
+    const row = await requireRow(
+      this.store,
+      'SELECT path,digest FROM app.action_evidence WHERE command_id=$1 AND digest=$2',
+      [commandId, hash],
+    );
+    if (!this.folder) throw new AppError('证据目录未配置。');
+    // Construct from validated identities, never a path supplied by the browser or database.
+    const file = join(this.folder, 'ehall-evidence', commandId, hash + '.png'),
+      info = await lstat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 2 * 1024 * 1024) throw new AppError('证据文件无效。');
+    const png = await readFile(file);
+    if (createHash('sha256').update(png).digest('hex') !== row.digest) throw new AppError('证据文件摘要不匹配。');
+    return png;
   }
   async revoke(key: string, deviceId: string) {
     return this.store.transaction((tx) =>
@@ -212,23 +300,7 @@ export class DeviceBridges {
   }
 }
 
-/** Only a registered profile can request RPCs; public input never contains a URL or program. */
-export class BridgedAudio implements DeviceAdapter {
-  readonly id = 'macos.audio';
-  readonly version = '1';
-  readonly mode = 'physical' as const;
-  readonly capabilities = [
-    {
-      id: 'audio.volume.set',
-      version: '1',
-      label: '输出音量',
-      schema: AudioInput,
-      choices: [0, 10, 25, 50].map((percent) => ({ label: '音量 ' + percent + '%', arguments: { percent } })),
-      summary: (input: Record<string, unknown>) => '将默认输出音量设为 ' + input.percent + '%（保持静音设置）',
-      matches: (input: Record<string, unknown>, state: Record<string, unknown>, before?: Record<string, unknown>) =>
-        AudioState.safeParse(state).success && state.volume === input.percent && state.muted === before?.muted,
-    },
-  ];
+export class BridgeTransport {
   constructor(readonly store: Store) {}
   async validateDevice(tx: Tx, deviceId: string) {
     const row = await tx.one(
@@ -237,7 +309,7 @@ export class BridgedAudio implements DeviceAdapter {
     );
     if (!row) throw new AppError('设备连接已到期或已撤销，请重新连接。', 409, 'device_bridge_unavailable');
   }
-  private async rpc(deviceId: string, kind: 'read' | 'execute', context: ExecutionContext): Promise<BridgeResult> {
+  protected async rpc(deviceId: string, kind: 'read' | 'execute', context: ExecutionContext): Promise<BridgeResult> {
     context.signal.throwIfAborted();
     const phase = kind === 'execute' ? 'write' : context.phase || 'before',
       callId = id();
@@ -271,10 +343,29 @@ export class BridgedAudio implements DeviceAdapter {
         "SELECT EXTRACT(epoch FROM active_until-clock_timestamp())*1000 AS remaining FROM app.device_bridge_calls WHERE id=$1 AND state='cancelled'",
         [callId],
       );
-      const remaining = Math.min(5000, Math.max(0, Math.ceil(Number(pending?.remaining || 0))));
+      const remaining = Math.min(30000, Math.max(0, Math.ceil(Number(pending?.remaining || 0))));
       if (remaining) await delay(remaining);
     }
   }
+}
+
+/** Only a registered profile can request RPCs; public input never contains a URL or program. */
+export class BridgedAudio extends BridgeTransport implements DeviceAdapter {
+  readonly id = 'macos.audio';
+  readonly version = '1';
+  readonly mode = 'physical' as const;
+  readonly capabilities = [
+    {
+      id: 'audio.volume.set',
+      version: '1',
+      label: '输出音量',
+      schema: AudioInput,
+      choices: [0, 10, 25, 50].map((percent) => ({ label: '音量 ' + percent + '%', arguments: { percent } })),
+      summary: (input: Record<string, unknown>) => '将默认输出音量设为 ' + input.percent + '%（保持静音设置）',
+      matches: (input: Record<string, unknown>, state: Record<string, unknown>, before?: Record<string, unknown>) =>
+        AudioState.safeParse(state).success && state.volume === input.percent && state.muted === before?.muted,
+    },
+  ];
   async readState(deviceId: string, signal: AbortSignal, context?: ExecutionContext) {
     if (!context) throw new DeviceNotApplied('A bounded execution context is required');
     const result = await this.rpc(deviceId, 'read', { ...context, signal });
@@ -285,7 +376,7 @@ export class BridgedAudio implements DeviceAdapter {
     AudioInput.parse(input);
     const result = await this.rpc(deviceId, 'execute', context);
     if (!result.ok) {
-      if (result.effect === 'not_applied') throw new DeviceNotApplied('Local executor did not dispatch the action');
+      if (result.effect !== 'unknown') throw new DeviceNotApplied('Local executor did not dispatch the action');
       throw new Error('Device action needs verification');
     }
   }

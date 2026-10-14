@@ -1,1 +1,5 @@
-{"name":"@assistant/contracts","private":true,"type":"module"}
+{
+  "name": "@assistant/contracts",
+  "private": true,
+  "type": "module"
+}

@@ -6,6 +6,7 @@ import { buildServer } from '../apps/api/src/server.js';
 import { Store } from '../packages/storage/src/index.js';
 import { chunks } from '../packages/core/src/knowledge.js';
 import { digest, notify } from '../packages/core/src/common.js';
+import { SessionDetailResponse, TodayOverviewResponse } from '../packages/contracts/src/responses.js';
 
 const url = process.env.API_TEST_DATABASE_URL;
 describe.skipIf(!url)('API and transactional application contracts', () => {
@@ -176,6 +177,11 @@ describe.skipIf(!url)('API and transactional application contracts', () => {
     const original = (await call('GET', '/sources/' + source.body.id + '?version=1')).body;
     expect(original.content).toBe(content);
     expect((await call('GET', '/sources')).body).toHaveLength(1);
+  });
+  it('answers the main pages in the shape the shared contracts describe', async () => {
+    const created = await call('POST', '/sessions', { prompt: '契约核对', kind: 'work' }, 'contract-check');
+    SessionDetailResponse.parse((await call('GET', '/sessions/' + created.body.sessionId)).body);
+    TodayOverviewResponse.parse((await call('GET', '/today/overview')).body);
   });
   it('preserves immutable drafts, detects version conflicts and keeps legacy revision zero editable', async () => {
     const created = await call('POST', '/sessions', { prompt: '整理回复', kind: 'work' }, 'work-one');

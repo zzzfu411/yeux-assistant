@@ -10,6 +10,7 @@ import { RunSupervisor } from '../packages/core/src/runtime.js';
 import { claimRun, failRun } from '../packages/core/src/runtime-state.js';
 import { executeResearchRun } from '../packages/core/src/research/service.js';
 import { putSource } from '../packages/core/src/knowledge.js';
+import { SessionDetailResponse } from '../packages/contracts/src/responses.js';
 import { openCheckpoints } from '../packages/core/src/learning.js';
 
 const url = process.env.RUNTIME_TEST_DATABASE_URL;
@@ -145,6 +146,8 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     // Two roots, their comparison, then two revisions each compared with the kept version.
     expect(calls).toBe(7);
     expect(detail.research?.state.version).toBe(2);
+    // The page reads exactly this shape; a real response must satisfy the shared contract.
+    SessionDetailResponse.parse(JSON.parse(JSON.stringify(detail)));
     expect(detail.research?.state.best).toBe(3);
     expect(detail.research?.state.candidates).toHaveLength(4);
     expect(detail.research?.state.candidates.map((c) => c.parent)).toEqual([null, null, expect.any(Number), 2]);

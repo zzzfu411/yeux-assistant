@@ -196,6 +196,8 @@ export async function main(args = process.argv.slice(2)) {
         status: detail.session.state,
         error: detail.session.error,
         research: detail.research,
+        // Per-step timing and tokens of this run, from the trace.
+        trace: (await app.trace(created.sessionId)).runs.find((run) => run.id === created.runId) ?? null,
         markerMatches: selected!.markers.filter((text) => answer?.answer.content.includes(text)),
         note: '关键词匹配仅是检查线索，不是语义正确率。',
       });

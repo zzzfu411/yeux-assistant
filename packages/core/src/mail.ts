@@ -12,6 +12,7 @@ import { SessionMail } from '../../contracts/src/mail.js';
 import { compose, openImapFolder, SimulatedMailbox, type FolderRole, type ReadonlyInbox } from './mail/mailbox.js';
 import { parseMail } from './mail/parse.js';
 import { ingestMessage } from './mail/ingest.js';
+import { addValue, getValue, putValue } from './kv.js';
 export type { ReadonlyInbox } from './mail/mailbox.js';
 
 const address = z.string().regex(/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/);
@@ -526,7 +527,7 @@ export class MailActions {
     identity: string,
     raw: Buffer,
     reason: string,
-    watermarkKey: string,
+    account: string,
     uid: number,
     signal?: AbortSignal,
   ) {
@@ -542,18 +543,12 @@ export class MailActions {
     }
     await this.store.transaction(async (original) => {
       const tx = pollTransaction(original, signal);
-      await tx.exec(
-        'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-        [
-          'mail-quarantine:' + identity,
-          JSON.stringify({
-            identity,
-            rawPath: 'mail-quarantine/' + filename,
-            error: reason,
-            createdAt: new Date().toISOString(),
-          }),
-        ],
-      );
+      await putValue(tx, 'mail-quarantine', identity, {
+        identity,
+        rawPath: 'mail-quarantine/' + filename,
+        error: reason,
+        createdAt: new Date().toISOString(),
+      });
       await notify(
         tx,
         'quarantine:' + identity,
@@ -561,10 +556,7 @@ export class MailActions {
         '有一封邮件需要手动查看',
         '原邮件已保存在本地隔离区，其他邮件继续导入。',
       );
-      await tx.exec(
-        'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-        [watermarkKey, JSON.stringify(String(uid))],
-      );
+      await putValue(tx, 'mail', account, String(uid));
     });
   }
   private async openFolder(settings: Row, role: FolderRole, signal: AbortSignal): Promise<ReadonlyInbox | null> {
@@ -620,10 +612,9 @@ export class MailActions {
         if (!inbox) continue;
         try {
           // INBOX keeps the original watermark key so upgrades continue where they stopped.
-          const key = 'mail:' + settings.mail_user + (role === 'sent' ? ':sent:' : ':') + inbox.uidValidity;
-          const watermark = Number(
-            (await this.store.one('SELECT value FROM app.settings WHERE key=$1', [key]))?.value || 0,
-          );
+          const account = settings.mail_user + (role === 'sent' ? ':sent:' : ':') + inbox.uidValidity,
+            key = 'mail:' + account;
+          const watermark = (await getValue(this.store, 'mail', account)) ?? 0;
           if (!Number.isSafeInteger(watermark) || watermark < 0) throw new AppError('邮箱读取水位无效，未执行读取。');
           const available = [...new Set(await waitFor(() => inbox!.list(watermark)))]
             .filter((n) => Number.isSafeInteger(n) && n > watermark)
@@ -642,7 +633,7 @@ export class MailActions {
                 identity,
                 raw,
                 error instanceof AppError ? error.message : '邮件解析失败，原文已保留。',
-                key,
+                account,
                 uid,
                 signal,
               );
@@ -659,7 +650,7 @@ export class MailActions {
                 const sourceKey = 'mail-source:' + digest(sourceIdentity);
                 await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [sourceKey]);
                 const requestDigest = digest([parsed.subject, parsed.body, sender, 'work', 1, null]);
-                const saved = (await tx.one('SELECT value FROM app.settings WHERE key=$1', [sourceKey]))?.value;
+                const saved = await getValue(tx, 'mail-source', digest(sourceIdentity));
                 const legacy = (
                   await tx.one(
                     "SELECT payload FROM app.legacy_rows WHERE table_name='tasks' AND payload->>'source_key'=$1",
@@ -698,28 +689,22 @@ export class MailActions {
                     dailyLimit,
                     sourceIdentity,
                   });
-                  await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING', [
-                    sourceKey,
-                    JSON.stringify({
-                      identity: sourceIdentity,
-                      digest: requestDigest,
-                      threadId: result.threadId,
-                      sourceId: 'mail-source-' + digest(sourceIdentity).slice(0, 24),
-                    }),
-                  ]);
+                  await addValue(tx, 'mail-source', digest(sourceIdentity), {
+                    identity: sourceIdentity,
+                    digest: requestDigest,
+                    threadId: result.threadId,
+                    sourceId: 'mail-source-' + digest(sourceIdentity).slice(0, 24),
+                  });
                   count = result.created && role === 'inbox' ? 1 : 0;
                 }
-                await tx.exec(
-                  'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                  [key, JSON.stringify(String(uid))],
-                );
+                await putValue(tx, 'mail', account, String(uid));
                 return count;
               });
               imported += count;
             } catch (error) {
               guardPoll(signal);
               if (!(error instanceof AppError) || error.code !== 'mail_source_conflict') throw error;
-              await this.quarantine(identity, raw, error.message, key, uid, signal);
+              await this.quarantine(identity, raw, error.message, account, uid, signal);
               quarantined++;
             }
           }

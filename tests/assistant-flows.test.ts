@@ -13,6 +13,7 @@ import { SimulatedMailbox, compose } from '../packages/core/src/mail/mailbox.js'
 import { putSource } from '../packages/core/src/knowledge.js';
 import { simpleParser } from 'mailparser';
 import { proposeRule } from '../packages/core/src/proposals.js';
+import { SessionDetailResponse, TodayOverviewResponse } from '../packages/contracts/src/responses.js';
 
 const url = process.env.RUNTIME_TEST_DATABASE_URL;
 const me = 'me@smail.example.edu';
@@ -385,6 +386,8 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
     const detail = (await api('GET', '/sessions/' + created.sessionId)).json();
     expect(detail.session.state).toBe('ready');
     expect(detail.errand.mailSession).toMatchObject({ recipient: 'gse-ta@example.edu' });
+    SessionDetailResponse.parse(detail);
+    TodayOverviewResponse.parse((await api('GET', '/today/overview')).json());
     // The trace shows both runs: the failed letter, then the restart that reused the plan.
     const trace = (await api('GET', `/sessions/${created.sessionId}/trace`)).json();
     expect(trace.runs.map((run: any) => [run.state, run.resumeFrom])).toEqual([

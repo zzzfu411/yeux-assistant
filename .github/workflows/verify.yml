@@ -13,8 +13,10 @@ concurrency:
   group: verify-${{ github.ref }}
   cancel-in-progress: true
 
+# Three independent jobs, each within its own limit; a full browser run alone takes several minutes.
 jobs:
-  verify:
+  checks:
+    name: Formatting, architecture, types, build and isolated PostgreSQL tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -27,10 +29,43 @@ jobs:
           node-version: '24'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm verify
+
+  browser:
+    name: Desktop and phone interactions (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/2', '2/2']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
-      - name: Formatting, types, build and isolated PostgreSQL tests
-        run: pnpm verify
-      - name: Desktop and phone interactions
-        run: pnpm exec playwright test tests/e2e/assistant.spec.ts tests/e2e/devices.spec.ts tests/e2e/sources.spec.ts tests/e2e/source-catalog.spec.ts tests/e2e/workspace.spec.ts tests/e2e/ehall.spec.ts tests/e2e/device-connection.spec.ts
-      - name: API, Worker and complete backup restore
-        run: pnpm verify:e2e
+      # Mocked API; tests/e2e/real.spec.ts skips itself without a dedicated instance.
+      - run: pnpm exec playwright test --shard=${{ matrix.shard }}
+
+  instance:
+    name: API, Worker and complete backup restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm verify:e2e

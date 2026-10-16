@@ -16,6 +16,7 @@ import { Icon } from './icons';
 
 import { MemoryEditor, scopeNames, type Memory } from './memory-editor';
 import { SourceEditor } from './source-editor';
+import { refresh } from './live';
 export function LibraryPage() {
   const [archived, setArchived] = useState(false);
   const query = useData<SourceSummary[]>('/sources' + (archived ? '?archived=true' : '')),
@@ -74,7 +75,7 @@ export function LibraryPage() {
           setAdding(false);
           navigate('/source/' + result.id);
         } else action.setMessage('上一份内容已保存，保留了你继续输入的文字。');
-        void client.invalidateQueries();
+        void refresh(client, '/sources', '/search', '/today');
       },
     );
   };
@@ -499,7 +500,7 @@ export function SourcePage({
           'PATCH',
         ),
       () => {
-        void client.invalidateQueries();
+        void refresh(client, '/sources', '/search', '/today');
       },
     );
   };

@@ -6,6 +6,7 @@ import type { Store, Tx, Row } from '../../storage/src/index.js';
 import { SourceMetadata, type Citation } from '../../contracts/src/index.js';
 import type { SourceImportResult } from '../../contracts/src/source-inputs.js';
 import { candidateTerms, rankBM25, searchTerms, selectTerms, type TermStats } from './search.js';
+import { LOCKS } from '../../storage/src/locks.js';
 
 export function chunks(content: string, size = 1800, overlap = 200) {
   if (size < 2 || overlap < 0 || overlap >= size - 1) throw new Error('Invalid chunk size/overlap');
@@ -227,10 +228,10 @@ export class Knowledge {
   async scan() {
     const connection = await this.store.pool.connect();
     try {
-      await connection.query('SELECT pg_advisory_lock(847392031)');
+      await connection.query('SELECT pg_advisory_lock($1)', [LOCKS.knowledgeScan]);
       return await this.scanRoots();
     } finally {
-      await connection.query('SELECT pg_advisory_unlock(847392031)').catch(() => {});
+      await connection.query('SELECT pg_advisory_unlock($1)', [LOCKS.knowledgeScan]).catch(() => {});
       connection.release();
     }
   }

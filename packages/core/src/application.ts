@@ -2,6 +2,7 @@ import { researchDetail } from './research/service.js';
 import { sessionTrace } from './trace.js';
 import { archiveErrand, createErrand, errandCalendar, errandDetail, flowSuggestion } from './errands/service.js';
 import { CreateErrandInput, ErrandActionInput } from '../../contracts/src/errands.js';
+import { ClearComposeDraft, SaveComposeDraft, type ComposeDraft } from '../../contracts/src/drafts.js';
 import { proposeRule } from './proposals.js';
 import { MailInbox } from './mail/inbox.js';
 import { openImapFolder, SimulatedMailbox } from './mail/mailbox.js';
@@ -37,6 +38,7 @@ import {
   iso,
   canonical,
 } from './common.js';
+import { LOCKS } from '../../storage/src/locks.js';
 import { createRun, createSession, lockSession } from './sessions.js';
 export { createRun, createSession, lockSession } from './sessions.js';
 import { Knowledge, retrieve } from './knowledge.js';
@@ -467,6 +469,43 @@ export class Application {
         )?.payload || null,
     }));
   }
+  /** The Today entry that has not been sent yet, shared by every signed-in device. */
+  async composeDraft(): Promise<ComposeDraft> {
+    const row = await this.store.one("SELECT * FROM app.drafts WHERE key='compose'");
+    return row
+      ? { content: row.content, revision: row.revision, updatedAt: iso(row.updated_at) }
+      : { content: null, revision: 0, updatedAt: null };
+  }
+  /**
+   * Saves only on top of the version this device last saw; otherwise 409. Autosave runs often, so it
+   * keeps no idempotency receipt: the version check already makes a repeated request harmless.
+   */
+  async saveComposeDraft(input: unknown) {
+    const data = SaveComposeDraft.parse(input);
+    return this.store.transaction(async (tx) => {
+      await tx.exec("SELECT pg_advisory_xact_lock(hashtextextended('draft:compose',0))");
+      const current = await tx.one("SELECT revision FROM app.drafts WHERE key='compose'");
+      if ((current?.revision ?? 0) !== data.revision)
+        throw new AppError('另一台设备刚更新了这份草稿，请选择保留哪一份。', 409, 'draft_conflict');
+      const saved = (await tx.one(
+        `INSERT INTO app.drafts(key,content) VALUES('compose',$1)
+        ON CONFLICT(key) DO UPDATE SET content=excluded.content,revision=app.drafts.revision+1,updated_at=now()
+        RETURNING revision,updated_at`,
+        [JSON.stringify(data.content)],
+      ))!;
+      await event(tx, 'draft.updated', 'compose', { revision: saved.revision });
+      return { content: data.content, revision: saved.revision, updatedAt: iso(saved.updated_at) };
+    });
+  }
+  /** Removes the draft after it was sent, unless another device has changed it since. */
+  async clearComposeDraft(input: unknown) {
+    const data = ClearComposeDraft.parse(input);
+    return this.store.transaction(async (tx) => {
+      const removed = await tx.exec("DELETE FROM app.drafts WHERE key='compose' AND revision=$1", [data.revision]);
+      if (removed.rowCount) await event(tx, 'draft.updated', 'compose', { revision: 0 });
+      return { cleared: Boolean(removed.rowCount) };
+    });
+  }
   async trace(sessionId: string) {
     return this.store.snapshot(async (tx) => {
       await requireRow(tx, 'SELECT id FROM app.sessions WHERE id=$1', [sessionId]);
@@ -735,13 +774,13 @@ export class Application {
   }
   async saveSettings(key: string, input: unknown) {
     return this.command(key, 'settings.model', input, async (tx) => {
-      await tx.exec('SELECT pg_advisory_xact_lock(847392003)');
+      await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.configWrite]);
       return this.settings.save(input, key);
     });
   }
   async saveMailSettings(key: string, input: unknown) {
     return this.command(key, 'settings.mail', input, async (tx) => {
-      await tx.exec('SELECT pg_advisory_xact_lock(847392003)');
+      await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.configWrite]);
       return this.settings.saveMail(input, key);
     });
   }

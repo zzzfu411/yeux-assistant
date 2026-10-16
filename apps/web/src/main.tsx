@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent } 
 import { createRoot } from 'react-dom/client';
 import { QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ApiClient, ApiContext, ApiError, storage, authRequest, useAction, useData, useEvents } from './api';
+import { LiveContext } from './live';
 import { ErrorNotice, PageBoundary } from './ui';
 import { TodayPage } from './today';
 import { GoalPage, GoalsPage } from './goals';
@@ -377,129 +378,131 @@ function Shell({
     );
   const now = new Date();
   return (
-    <div className={s.layout}>
-      <a
-        href="#main-content"
-        className={s.skip}
-        onClick={(event) => {
-          event.preventDefault();
-          const main = document.getElementById('main-content');
-          main?.focus();
-          main?.scrollIntoView();
-        }}
-      >
-        跳到内容
-      </a>
-      <aside className={s.sidebar}>
-        <Brand />
-        <nav className={s.navigation} aria-label="主导航">
-          {(
-            [
-              ['today', '今天'],
-              ['goals', '目标'],
-              ['library', '资料'],
-            ] as const
-          ).map(([path, label]) => (
-            <a
-              href={'#/' + path}
-              aria-current={primary === path ? 'page' : undefined}
-              className={primary === path ? s.activeNav : s.navLink}
-              key={path}
-            >
-              <Icon name={path} />
-              <span>{label}</span>
-            </a>
-          ))}
-        </nav>
-        <button
-          ref={toggle}
-          type="button"
-          className={s.moreToggle}
-          aria-label="更多"
-          aria-expanded={menu}
-          aria-controls="more-panel"
-          onClick={() => setMenu(!menu)}
+    <LiveContext.Provider value={connected}>
+      <div className={s.layout}>
+        <a
+          href="#main-content"
+          className={s.skip}
+          onClick={(event) => {
+            event.preventDefault();
+            const main = document.getElementById('main-content');
+            main?.focus();
+            main?.scrollIntoView();
+          }}
         >
-          <Icon name={menu ? 'close' : 'more'} />
-          <span>更多</span>
-          {unread + mailBadge > 0 && <span className={s.unreadDot} aria-label="有新消息" />}
-        </button>
-        <div id="more-panel" className={s.morePanel} data-open={menu}>
-          <p className={s.navCaption}>更多功能</p>
-          <nav className={s.secondaryNav} aria-label="更多功能">
-            {secondary.map(([path, label, icon, current]) => (
+          跳到内容
+        </a>
+        <aside className={s.sidebar}>
+          <Brand />
+          <nav className={s.navigation} aria-label="主导航">
+            {(
+              [
+                ['today', '今天'],
+                ['goals', '目标'],
+                ['library', '资料'],
+              ] as const
+            ).map(([path, label]) => (
               <a
-                key={path}
                 href={'#/' + path}
-                className={current ? s.activeNav : s.navLink}
-                aria-current={current ? 'page' : undefined}
+                aria-current={primary === path ? 'page' : undefined}
+                className={primary === path ? s.activeNav : s.navLink}
+                key={path}
               >
-                <Icon name={icon} />
+                <Icon name={path} />
                 <span>{label}</span>
               </a>
             ))}
           </nav>
-          <div className={s.account}>
-            <span className={s.userAvatar} aria-hidden="true">
-              {username.slice(0, 1).toUpperCase()}
-            </span>
-            <span className={s.accountName}>
-              {username}
-              <small>
+          <button
+            ref={toggle}
+            type="button"
+            className={s.moreToggle}
+            aria-label="更多"
+            aria-expanded={menu}
+            aria-controls="more-panel"
+            onClick={() => setMenu(!menu)}
+          >
+            <Icon name={menu ? 'close' : 'more'} />
+            <span>更多</span>
+            {unread + mailBadge > 0 && <span className={s.unreadDot} aria-label="有新消息" />}
+          </button>
+          <div id="more-panel" className={s.morePanel} data-open={menu}>
+            <p className={s.navCaption}>更多功能</p>
+            <nav className={s.secondaryNav} aria-label="更多功能">
+              {secondary.map(([path, label, icon, current]) => (
+                <a
+                  key={path}
+                  href={'#/' + path}
+                  className={current ? s.activeNav : s.navLink}
+                  aria-current={current ? 'page' : undefined}
+                >
+                  <Icon name={icon} />
+                  <span>{label}</span>
+                </a>
+              ))}
+            </nav>
+            <div className={s.account}>
+              <span className={s.userAvatar} aria-hidden="true">
+                {username.slice(0, 1).toUpperCase()}
+              </span>
+              <span className={s.accountName}>
+                {username}
+                <small>
+                  <i className={connected ? s.online : s.offline} />
+                  管理员<span className={s.accountConnection}> · {connected ? '已连接' : '正在重连'}</span>
+                </small>
+              </span>
+              <button
+                type="button"
+                className={s.iconButton}
+                disabled={action.busy}
+                onClick={() => void action.run(logout)}
+                title="退出登录"
+                aria-label="退出"
+              >
+                <Icon name="logout" />
+                <span>退出</span>
+              </button>
+            </div>
+            <ErrorNotice error={action.error} />
+          </div>
+        </aside>
+        {menu && <div className={s.scrim} aria-hidden="true" onClick={() => setMenu(false)} />}
+        <div className={s.workspace}>
+          <header className={s.workbar}>
+            <a className={s.compactBrand} href="#/today" aria-label="返回今天">
+              <span className={s.mascot}>
+                <img src="/sardina-secretary.png" alt="" width="1280" height="1280" />
+              </span>
+              <strong>yeux</strong>
+            </a>
+            <span className={s.crumb}>{section}</span>
+            <div>
+              <span className={s.workConnection} title={connected ? '实时更新已连接' : '正在重新连接实时更新'}>
                 <i className={connected ? s.online : s.offline} />
-                管理员<span className={s.accountConnection}> · {connected ? '已连接' : '正在重连'}</span>
-              </small>
-            </span>
-            <button
-              type="button"
-              className={s.iconButton}
-              disabled={action.busy}
-              onClick={() => void action.run(logout)}
-              title="退出登录"
-              aria-label="退出"
-            >
-              <Icon name="logout" />
-              <span>退出</span>
-            </button>
-          </div>
-          <ErrorNotice error={action.error} />
+                <span>{connected ? '已连接' : '正在重连'}</span>
+              </span>
+              <time dateTime={now.toISOString().slice(0, 10)}>
+                {new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }).format(now)}
+              </time>
+            </div>
+          </header>
+          <main className={s.main} id="main-content" tabIndex={-1} key={name}>
+            <PageBoundary key={route}>
+              <Suspense
+                fallback={
+                  <p className={s.muted} role="status">
+                    正在载入…
+                  </p>
+                }
+              >
+                {page}
+              </Suspense>
+            </PageBoundary>
+          </main>
         </div>
-      </aside>
-      {menu && <div className={s.scrim} aria-hidden="true" onClick={() => setMenu(false)} />}
-      <div className={s.workspace}>
-        <header className={s.workbar}>
-          <a className={s.compactBrand} href="#/today" aria-label="返回今天">
-            <span className={s.mascot}>
-              <img src="/sardina-secretary.png" alt="" width="1280" height="1280" />
-            </span>
-            <strong>yeux</strong>
-          </a>
-          <span className={s.crumb}>{section}</span>
-          <div>
-            <span className={s.workConnection} title={connected ? '实时更新已连接' : '正在重新连接实时更新'}>
-              <i className={connected ? s.online : s.offline} />
-              <span>{connected ? '已连接' : '正在重连'}</span>
-            </span>
-            <time dateTime={now.toISOString().slice(0, 10)}>
-              {new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }).format(now)}
-            </time>
-          </div>
-        </header>
-        <main className={s.main} id="main-content" tabIndex={-1} key={name}>
-          <PageBoundary key={route}>
-            <Suspense
-              fallback={
-                <p className={s.muted} role="status">
-                  正在载入…
-                </p>
-              }
-            >
-              {page}
-            </Suspense>
-          </PageBoundary>
-        </main>
       </div>
-    </div>
+    </LiveContext.Provider>
   );
 }
 

@@ -4,6 +4,7 @@ import { WorkspaceCommitInput, type WorkspaceView } from '../../../packages/cont
 import { useAction, useApi, useData, useDraft } from './api';
 import { ErrorNotice, QueryState } from './ui';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 export function WorkspacePanel() {
   const api = useApi(),
@@ -26,7 +27,7 @@ export function WorkspacePanel() {
         ),
       (result) => {
         if (draftRef.current === sent) clear();
-        void client.invalidateQueries();
+        void refresh(client, '/workspace', '/memories', '/flows', '/today');
         action.setMessage('已保存本地版本 ' + result.commitSha.slice(0, 7) + '。');
       },
     );
@@ -49,7 +50,7 @@ export function WorkspacePanel() {
                 void action.run(
                   () => api.write('/workspace/scan', {}),
                   () => {
-                    void client.invalidateQueries();
+                    void refresh(client, '/workspace', '/memories', '/flows', '/today');
                     action.setMessage('规则与流程已重新载入。');
                   },
                 )

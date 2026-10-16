@@ -4,9 +4,10 @@ import { mkdir, lstat, readFile, writeFile, rename, unlink } from 'node:fs/promi
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { AppError, digest, id } from '../common.js';
+import { LOCKS } from '../../../storage/src/locks.js';
 
 const exec = promisify(execFile);
-export const WORKSPACE_LOCK = 847392030;
+export const WORKSPACE_LOCK = LOCKS.workspace;
 export type WorkspaceChange = { path: string; status: string; digest: string | null };
 export type WorkspaceStatus = { head: string; revision: string; changes: WorkspaceChange[]; locked: boolean };
 const sha = /^[a-f0-9]{40,64}$/;

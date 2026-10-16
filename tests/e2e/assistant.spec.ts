@@ -2,6 +2,12 @@ import type { ResearchDetail } from '../../packages/contracts/src/research';
 import { test, expect, type Page, type Route } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import type { Citation, SourceMetadata, SourceSummary } from '../../packages/contracts/src/index';
+import { SessionDetailResponse, TodayOverviewResponse } from '../../packages/contracts/src/responses';
+
+const contractViolations: string[] = [];
+test.afterEach(() => {
+  expect(contractViolations.splice(0), '模拟响应与共享契约不一致').toEqual([]);
+});
 
 /** Choose a tab on the page edge, then write in the single Today composer. */
 async function compose(page: Page, mode: string, text: string) {
@@ -58,6 +64,14 @@ function fixture() {
   };
   return {
     research: null as ResearchDetail | null,
+    // Off by default: the composer then keeps its draft in the browser only, as before.
+    serverDrafts: false,
+    draft: { content: null, revision: 0, updatedAt: null } as {
+      content: Record<string, unknown> | null;
+      revision: number;
+      updatedAt: string | null;
+    },
+    draftWrites: [] as Array<{ path: string; body: Record<string, unknown> }>,
     runtimeError: false,
     modelConfigured: true,
     workerOnline: true,
@@ -160,6 +174,8 @@ async function setup(page: Page, state = fixture(), login = true) {
     state: item.state,
     promptPreview: item.prompt.slice(0, 160),
     errorPreview: item.error.slice(0, 240),
+    flow: item.flow ?? null,
+    isResearch: Boolean(item.research),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   });
@@ -168,8 +184,23 @@ async function setup(page: Page, state = fixture(), login = true) {
       url = new URL(request.url()),
       path = url.pathname.replace('/api/v2', ''),
       method = request.method();
-    const json = (data: unknown, status = 200) =>
-      route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) });
+    const json = (data: unknown, status = 200) => {
+      // Mock answers for the main pages must keep the shape the real API is tested to return.
+      const contract =
+        method !== 'GET' || status !== 200
+          ? null
+          : path === '/today/overview'
+            ? TodayOverviewResponse
+            : /^\/sessions\/[^/]+$/.test(path) && path !== '/sessions/list'
+              ? SessionDetailResponse
+              : null;
+      const checked = contract?.safeParse(data);
+      if (checked && !checked.success)
+        contractViolations.push(
+          path + '：' + checked.error.issues.map((issue) => issue.path.join('.') + ' ' + issue.message).join('；'),
+        );
+      return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) });
+    };
     if (path === '/auth/login') {
       const body = request.postDataJSON();
       if (body.username !== 'tester' || body.password !== 'test-password')
@@ -192,6 +223,20 @@ async function setup(page: Page, state = fixture(), login = true) {
           JSON.stringify({ id: '7', kind: 'session.updated', entityId: 'session-1', data: {}, createdAt: timestamp }) +
           '\n\n: heartbeat\n\n',
       });
+    }
+    if (path.startsWith('/drafts/compose') && state.serverDrafts) {
+      if (method === 'GET') return json(state.draft);
+      const body = request.postDataJSON();
+      state.draftWrites.push({ path, body });
+      if (path === '/drafts/compose/clear') {
+        const cleared = body.revision === state.draft.revision;
+        if (cleared) state.draft = { content: null, revision: 0, updatedAt: null };
+        return json({ cleared });
+      }
+      if (body.revision !== state.draft.revision)
+        return json({ error: { code: 'draft_conflict', message: '另一台设备刚更新了这份草稿。' } }, 409);
+      state.draft = { content: body.content, revision: state.draft.revision + 1, updatedAt: timestamp };
+      return json(state.draft);
     }
     if (method !== 'GET') {
       const body = request.postDataJSON() || {};
@@ -1492,11 +1537,9 @@ test('评阅核对记录需展开查看，原始JSON不渲染成学习正文', a
   state.artifacts = [
     {
       id: 'audit-1',
-      sessionId: 'session-1',
       kind: 'assessment_audit',
-      version: 1,
       content: audit,
-      provenance: 'model',
+      provenance: 'model_estimate',
       createdAt: timestamp,
     },
   ];
@@ -1704,6 +1747,33 @@ test('深入研究保留投入和资料草稿，明确提交后创建任务', as
   expect(state.posts[0]?.body).toMatchObject({ kind: 'work', research: { effort: 'high', sourceIds: ['source-1'] } });
 });
 
+test('今天页草稿在设备间同步，另一台设备的修改不会被静默覆盖', async ({ page }) => {
+  const state = fixture();
+  state.serverDrafts = true;
+  const draft = (text: string) => ({ text, mode: 'goal', locked: true, outcome: '', sourceIds: [] });
+  state.draft = { content: draft('手机上写了一半'), revision: 3, updatedAt: timestamp };
+  await setup(page, state);
+  const box = page.getByLabel('写下来', { exact: true });
+  // A new tab or a relaunched phone app finds the unsent entry from the other device.
+  await expect(box).toHaveValue('手机上写了一半');
+  await expect(page.getByText('并在你的手机和电脑之间同步')).toBeVisible();
+  // Meanwhile the other device saved again. Whether this device learns of it from a refused save or
+  // from a refresh, it offers a choice and never writes over the other version on its own.
+  state.draft = { content: draft('电脑上的另一版'), revision: 5, updatedAt: timestamp };
+  await box.fill('理解事务隔离级别');
+  const offer = page.getByRole('alert').filter({ hasText: '另一台设备上保存了不同的草稿' });
+  await expect(offer).toBeVisible();
+  expect(state.draft).toMatchObject({ revision: 5, content: { text: '电脑上的另一版' } });
+  expect(state.draftWrites.every((write) => write.body.revision === 3)).toBe(true);
+  await expect(box).toHaveValue('理解事务隔离级别');
+  await offer.getByRole('button', { name: '保留这里的' }).click();
+  await expect.poll(() => state.draft.revision).toBe(6);
+  expect(state.draft.content).toMatchObject({ text: '理解事务隔离级别' });
+  await page.getByRole('button', { name: '创建学习计划', exact: true }).click();
+  await expect.poll(() => state.draftWrites.at(-1)).toEqual({ path: '/drafts/compose/clear', body: { revision: 6 } });
+  expect(state.draft.content).toBeNull();
+  expect(state.posts.map((post) => post.path)).toEqual(['/goals']);
+});
 test('未连接模型时深入研究不能提交，并指向设置', async ({ page }) => {
   const state = fixture();
   state.modelConfigured = false;

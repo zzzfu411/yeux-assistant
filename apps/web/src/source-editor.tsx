@@ -4,6 +4,7 @@ import { SourceUpdateInput, type SourceDetail } from '../../../packages/contract
 import { useAction, useApi, useDraft } from './api';
 import { ErrorNotice } from './ui';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 export function SourceEditor({ source, done }: { source: SourceDetail; done: () => void }) {
   const api = useApi(),
@@ -32,7 +33,7 @@ export function SourceEditor({ source, done }: { source: SourceDetail; done: () 
           'PATCH',
         ),
       (result) => {
-        void client.invalidateQueries();
+        void refresh(client, '/sources', '/search');
         if (JSON.stringify(current.current) === JSON.stringify(sent)) {
           clear();
           done();

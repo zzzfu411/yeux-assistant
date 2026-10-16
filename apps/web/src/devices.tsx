@@ -7,6 +7,7 @@ import { EhallForm, EhallPreview } from './ehall-card';
 import { DeviceConnection } from './device-connection';
 import { Icon } from './icons';
 import s from './styles.module.css';
+import { refresh as refreshReads } from './live';
 
 const commandLabels: Record<DeviceCommand['state'], string> = {
   pending: '待确认',
@@ -84,7 +85,7 @@ export function DevicesPage({ commandId = '' }: { commandId?: string }) {
     return () => cancelAnimationFrame(frame);
   }, [commandId, target?.id]);
   const refresh = () => {
-    void client.invalidateQueries();
+    void refreshReads(client, '/devices', '/device-commands', '/notifications', '/today');
   };
   const write = (path: string, body: unknown, method = 'POST') =>
     void action.run(() => api.write(path, body, method), refresh);
@@ -378,7 +379,7 @@ function CommandCard({
       action.setError(null);
   }, [command.revision, action.error, action.setError]);
   const refresh = () => {
-    void client.invalidateQueries();
+    void refreshReads(client, '/devices', '/device-commands', '/notifications', '/today');
   };
   const write = (operation: string, body: unknown) => {
     submittedRevision.current = command.revision;

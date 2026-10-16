@@ -3,6 +3,8 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { sql, type SQL } from 'drizzle-orm';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { LOCKS } from './locks.js';
+export { LOCKS } from './locks.js';
 
 // Registered, reviewed migrations only; never resolve database or user-supplied paths.
 const migrations = [
@@ -23,6 +25,7 @@ const migrations = [
   { version: 15, file: 'packages/storage/migrations/0015.sql' },
   { version: 16, file: 'packages/storage/migrations/0016.sql' },
   { version: 17, file: 'packages/storage/migrations/0017.sql' },
+  { version: 18, file: 'packages/storage/migrations/0018.sql' },
 ] as const;
 
 export type Row = Record<string, any>;
@@ -81,7 +84,7 @@ export class Store extends Tx {
   }
   async migrate() {
     await this.transaction(async (tx) => {
-      await tx.exec('SELECT pg_advisory_xact_lock(847392001)');
+      await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.migrations]);
       await tx.exec('CREATE SCHEMA IF NOT EXISTS app');
       await tx.exec(
         'CREATE TABLE IF NOT EXISTS app.migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())',

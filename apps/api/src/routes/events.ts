@@ -2,11 +2,15 @@ import { z } from 'zod';
 import type { FastifyRequest } from 'fastify';
 import type { Application } from '../../../../packages/core/src/application.js';
 import { AppError } from '../../../../packages/core/src/common.js';
+import type { EventWake } from '../../../../packages/core/src/event-wake.js';
 import type { ApiServer } from './shared.js';
 export function registerEventRoutes(
   server: ApiServer,
   app: Application,
   authorized: (request: FastifyRequest) => Promise<boolean>,
+  wake?: EventWake,
+  // With a healthy listener a committed event wakes the stream at once; this is only a safety net.
+  idleMs = 10000,
 ) {
   const connections = new Set<() => void>();
   server.get(
@@ -34,8 +38,10 @@ export function registerEventRoutes(
       });
       let after = r.query.after,
         busy = false,
+        again = false,
         closed = false,
-        blocked = false;
+        blocked = false,
+        lastFlush = 0;
       let pressureTimer: ReturnType<typeof setTimeout> | undefined;
       const drain = () => {
         blocked = false;
@@ -45,6 +51,7 @@ export function registerEventRoutes(
       const cleanup = () => {
         if (closed) return;
         closed = true;
+        unsubscribe?.();
         clearInterval(poll);
         clearInterval(heartbeat);
         clearTimeout(pressureTimer);
@@ -67,27 +74,43 @@ export function registerEventRoutes(
         }
         return true;
       };
-      const flush = async () => {
-        if (busy || closed) return;
+      const flush = async (): Promise<void> => {
+        if (closed) return;
+        // A wake-up during a read is not lost: one more read follows.
+        if (busy) return void (again = true);
         busy = true;
+        lastFlush = Date.now();
         try {
           if (!(await authorized(r))) {
             stop();
             return;
           }
           if (blocked) return;
-          for (const item of await app.events(after)) {
+          const page = await app.events(after);
+          for (const item of page) {
             if (closed) break;
             after = item.id;
             if (!write('id: ' + item.id + '\ndata: ' + JSON.stringify(item) + '\n\n')) break;
           }
+          // A full page means more is waiting; keep reading rather than waiting for the next wake-up.
+          if (page.length >= 100 && !blocked) again = true;
         } catch {
           stop();
         } finally {
           busy = false;
         }
+        if (again && !closed) {
+          again = false;
+          await flush();
+        }
       };
-      const poll = setInterval(() => void flush(), 1000),
+      const unsubscribe = wake?.subscribe(() => void flush());
+      // Every second: read when not listening or idle too long; otherwise only confirm the login is still valid.
+      const check = async () => {
+        if (!wake?.healthy || Date.now() - lastFlush >= idleMs) return flush();
+        if (!busy && !closed && !(await authorized(r).catch(() => false))) stop();
+      };
+      const poll = setInterval(() => void check(), 1000),
         heartbeat = setInterval(() => {
           if (!closed && !blocked) write(': heartbeat\n\n');
         }, 15000);

@@ -108,11 +108,36 @@ describe.skipIf(!url)('committed event cursors and real HTTP SSE connections', (
     await publish('fixture.ready');
     expect((await stream.next())?.kind).toBe('fixture.ready');
   });
+  it('wakes the stream as soon as an event commits instead of waiting for a poll', async () => {
+    expect(built.wake.healthy).toBe(true);
+    const stream = await open();
+    expect(await bounded(stream.frame(), 1500)).toBe(': connected');
+    for (const kind of ['fixture.wake-1', 'fixture.wake-2', 'fixture.wake-3']) {
+      const started = Date.now();
+      await publish(kind);
+      expect((await bounded(stream.next(), 900))?.kind).toBe(kind);
+      // The safety-net poll runs every ten seconds while listening works; this came from the notification.
+      expect(Date.now() - started).toBeLessThan(900);
+    }
+  });
+  it('falls back to polling every second while the listener is down', async () => {
+    const stream = await open();
+    expect(await bounded(stream.frame(), 1500)).toBe(': connected');
+    built.wake.healthy = false;
+    try {
+      await built.store.exec("INSERT INTO app.events(kind) VALUES('fixture.unannounced')");
+      expect((await bounded(stream.next(), 2500))?.kind).toBe('fixture.unannounced');
+    } finally {
+      built.wake.healthy = true;
+    }
+  });
   it('delivers a late commit after an earlier allocation without losing it behind the cursor', async () => {
     const early = await built.store.pool.connect();
     try {
       await early.query('BEGIN');
       await early.query("INSERT INTO app.events(kind) VALUES('fixture.late-commit')");
+      // As event() does: the wake-up is delivered only when this transaction commits.
+      await early.query("SELECT pg_notify('app_events','')");
       await publish('fixture.first-commit');
       const stream = await open(),
         first = await stream.next();

@@ -15,6 +15,7 @@ import { ResearchBanner, ResearchProgress } from './research';
 import { RunTrace } from './trace';
 import s from './styles.module.css';
 import { Icon } from './icons';
+import { refresh as refreshReads } from './live';
 
 export const attemptSource: Record<Attempt['source'], string> = {
   user_report: '含本人反馈',
@@ -109,7 +110,11 @@ function LegacyRecord({ record, sessionId }: { record: Record<string, unknown>; 
   );
 }
 export function SessionPage({ id }: { id: string }) {
-  const query = useData<SessionDetail>('/sessions/' + encodeURIComponent(id), { refetchInterval: 5000 });
+  const query = useData<SessionDetail>('/sessions/' + encodeURIComponent(id), {
+    refetchInterval: 5000,
+    // Steps arrive as events; while a task runs, an occasional read keeps its elapsed time current.
+    whileLive: (data) => (data && ['queued', 'running'].includes(data.session.state) ? 15_000 : false),
+  });
   return (
     <>
       <a className={s.back} href={query.data?.session.goalId ? '#/goal/' + query.data.session.goalId : '#/today'}>
@@ -165,7 +170,7 @@ function SessionContent({
       setDraft((current) => ({ ...current, revision: session.revision }));
   }, [session.revision, editing, session.content]);
   const refresh = () => {
-    void client.invalidateQueries();
+    void refreshReads(client, '/sessions', '/goals', '/today', '/mail', '/sources');
   };
   const active = ['queued', 'running'].includes(session.state),
     canAnswer =

@@ -4,6 +4,7 @@ import { MemoryInput } from '../../../packages/contracts/src/index';
 import { useAction, useApi, useDraft } from './api';
 import { date, ErrorNotice } from './ui';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 export type Memory = {
   key: string;
@@ -62,7 +63,7 @@ export function MemoryEditor({
     void action.run(
       () => api.write<{ version: number }>('/memories', MemoryInput.parse(sent)),
       (result) => {
-        void client.invalidateQueries();
+        void refresh(client, '/memories', '/workspace', '/today');
         if (JSON.stringify(draftRef.current) === JSON.stringify(sent)) {
           clear();
           done(true);

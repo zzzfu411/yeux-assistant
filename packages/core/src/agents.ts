@@ -9,6 +9,7 @@ import {
   type AgentAudit,
 } from '../../contracts/src/agents.js';
 import { AppError, digest, id, iso, once, requireRow, type CommandBoundary } from './common.js';
+import { LOCKS } from '../../storage/src/locks.js';
 
 export type AgentPrincipal = { id: string; tokenHash: string; scopes: AgentScope[] };
 const unauthorized = () => new AppError('Agent 凭据无效、已到期或已撤销。', 401, 'agent_unauthorized');
@@ -44,7 +45,7 @@ export class AgentAccess {
     let token: string | null = null;
     const result = await this.store.transaction((tx) =>
       once(tx, 'agent.issue:' + AgentRequestKey.parse(key), 'agent.issue', data, async () => {
-        await tx.exec('SELECT pg_advisory_xact_lock(847392009)');
+        await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.agentCredentials]);
         const count = await tx.one(
           'SELECT count(*) n FROM app.agent_credentials WHERE revoked_at IS NULL AND expires_at>now()',
         );

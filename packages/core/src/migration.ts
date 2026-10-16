@@ -5,6 +5,8 @@ import type { Store, Tx, Row } from '../../storage/src/index.js';
 import { AppError, canonical, digest, event, id } from './common.js';
 import { chunks } from './knowledge.js';
 import type { Citation } from '../../contracts/src/index.js';
+import { LOCKS } from '../../storage/src/locks.js';
+import { importLegacyValue } from './kv.js';
 
 const TABLES = [
   'approvals',
@@ -460,8 +462,7 @@ async function mapRows(tx: Tx, snapshot: LegacySnapshot) {
         date(row.created, 'notifications.created'),
       ],
     );
-  for (const row of rows(snapshot, 'settings'))
-    await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [row.key, JSON.stringify(row.value)]);
+  for (const row of rows(snapshot, 'settings')) await importLegacyValue(tx, row.key, row.value);
   for (const row of rows(snapshot, 'approvals')) {
     let state = row.state,
       error = row.error;
@@ -540,7 +541,7 @@ export async function migrateLegacy(
     if (apply) {
       if (!store) throw new AppError('实际导入需要 PostgreSQL 连接。');
       await store.transaction(async (tx) => {
-        await tx.exec('SELECT pg_advisory_xact_lock(847392002)');
+        await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.legacyImport]);
         const previous = await tx.one('SELECT * FROM app.imports WHERE source_digest=$1', [snapshot.sourceDigest]);
         if (previous) {
           report.verifiedRows = await verifyLegacy(tx, snapshot);

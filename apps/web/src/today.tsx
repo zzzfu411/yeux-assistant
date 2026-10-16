@@ -4,14 +4,16 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { CreateGoal, CreateSession } from '../../../packages/contracts/src/index';
 import { storage, useAction, useApi, useData, useDraft } from './api';
+import { useSharedDraft } from './shared-draft';
 import type { SessionSummary, TodayOverview } from '../../../packages/contracts/src/pagination';
 import { CreateErrandInput } from '../../../packages/contracts/src/errands';
-import { ErrorNotice, navigate, QueryState } from './ui';
+import { date, ErrorNotice, navigate, QueryState } from './ui';
 import { FlowList } from './errand';
 import { GoalSourcePicker } from './goals';
 import { detectIntent, type TaskMode } from './intent';
 import s from './styles.module.css';
 import { Icon, type IconName } from './icons';
+import { refresh } from './live';
 
 const taskModes = {
   research: {
@@ -276,6 +278,7 @@ function Composer({ data, initialMode }: { data?: TodayOverview; initialMode?: s
     client = useQueryClient();
   const [legacy] = useState(legacyDraft);
   const [draft, setDraft] = useDraft<ComposeDraft>('compose', legacy ?? emptyDraft);
+  const shared = useSharedDraft(draft, setDraft, emptyDraft);
   useEffect(() => {
     // An empty composer takes over the old unsent draft even if the new key was already created.
     if (legacy) setDraft((current) => (current.text.trim() ? current : legacy));
@@ -333,12 +336,13 @@ function Composer({ data, initialMode }: { data?: TodayOverview; initialMode?: s
         );
       },
       (result) => {
+        shared.sent();
         setDraft((current) =>
           current.text === sent.text
             ? { ...current, text: '', outcome: '', locked: false, flowId: undefined }
             : current,
         );
-        void client.invalidateQueries();
+        void refresh(client, '/today', '/goals', '/sessions', '/drafts');
         navigate('/session/' + result.sessionId);
       },
     );
@@ -361,6 +365,23 @@ function Composer({ data, initialMode }: { data?: TodayOverview; initialMode?: s
               </li>
             )}
           </ul>
+        </div>
+      )}
+      {shared.offer && (
+        <div className={s.annotation} role="alert">
+          <strong>另一台设备</strong>
+          <p>
+            {shared.offer.content?.text ? '另一台设备上保存了不同的草稿' : '另一台设备已经发出或清空了这份草稿'}
+            {shared.offer.updatedAt ? '（' + date(shared.offer.updatedAt) + '）' : ''}。这里的内容尚未覆盖它。
+          </p>
+          <div className={s.toolbar}>
+            <button type="button" className={s.secondary} onClick={shared.takeOffer}>
+              使用那一份
+            </button>
+            <button type="button" className={s.secondary} onClick={shared.keepMine}>
+              保留这里的
+            </button>
+          </div>
         </div>
       )}
       <div className={s.modeTabs} role="group" aria-label="选择功能">
@@ -548,7 +569,11 @@ function Composer({ data, initialMode }: { data?: TodayOverview; initialMode?: s
         </div>
       </form>
       <ErrorNotice error={action.error} />
-      <p className={s.composerHint}>输入自动暂存，刷新后可以接着写。关闭页面后任务仍在后台继续。</p>
+      <p className={s.composerHint}>
+        {shared.synced
+          ? '输入自动保存，并在你的手机和电脑之间同步。关闭页面后任务仍在后台继续。'
+          : '输入自动暂存，刷新后可以接着写。关闭页面后任务仍在后台继续。'}
+      </p>
     </section>
   );
 }

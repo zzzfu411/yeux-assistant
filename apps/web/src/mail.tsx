@@ -6,6 +6,7 @@ import { useAction, useApi, useData, useDraft } from './api';
 import { date, ErrorNotice, Heading, navigate, Pages, QueryState, Status } from './ui';
 import { Icon } from './icons';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 const filters = [
   ['all', '全部'],
@@ -70,7 +71,7 @@ export function MailPage() {
                 () => api.write('/mail/poll', {}),
                 () => {
                   action.setMessage('已请求收取，新邮件会在几秒内出现。');
-                  setTimeout(() => void client.invalidateQueries(), 3000);
+                  setTimeout(() => void refresh(client, '/mail', '/sessions', '/today'), 3000);
                 },
               )
             }
@@ -168,7 +169,7 @@ function SimulatedLetter({ threadId }: { threadId?: string }) {
         clear();
         setDraft({ from: draft.from, name: draft.name, subject: '', body: '' });
         action.setMessage('来信已放入模拟收件箱，正在收取。');
-        setTimeout(() => void client.invalidateQueries(), 2500);
+        setTimeout(() => void refresh(client, '/mail', '/sessions', '/today'), 2500);
       },
     );
   };
@@ -247,7 +248,7 @@ export function MailThreadPage({ id }: { id: string }) {
     void action.run(
       () => api.write<any>('/mail/threads/' + encodeURIComponent(id) + path, body),
       (result) => {
-        void client.invalidateQueries();
+        void refresh(client, '/mail', '/sessions', '/today');
         done?.(result);
       },
     );

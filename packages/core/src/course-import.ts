@@ -7,6 +7,7 @@ import { SourceMetadata } from '../../contracts/src/index.js';
 import type { Store } from '../../storage/src/index.js';
 import { AppError, canonical, digest, id, once } from './common.js';
 import { putSource } from './knowledge.js';
+import { LOCKS } from '../../storage/src/locks.js';
 
 const MAX_ASSET_BYTES = 256 * 1024 * 1024;
 const assetKey = /^[a-f0-9]{64}\.(pdf|ppt|pptx|doc|docx|html|md|txt)$/;
@@ -155,7 +156,7 @@ export async function importCourses(store: Store | undefined, bundlePath: string
   if (!store) throw new AppError('正式导入需要 PostgreSQL。');
   const receipt = await store.transaction((tx) =>
     once(tx, 'courses:' + summary.bundleDigest, 'courses.import', summary, async () => {
-      await tx.exec('SELECT pg_advisory_xact_lock(847392020)');
+      await tx.exec('SELECT pg_advisory_xact_lock($1)', [LOCKS.courseImport]);
       const results: Array<{ key: string; sourceId: string; version: number; action: string }> = [];
       for (const document of bundle.documents) {
         const sourceId = 'course-' + digest(document.key).slice(0, 32);

@@ -39,6 +39,8 @@ export const iso = (value: unknown): string =>
   value instanceof Date ? value.toISOString() : new Date(value as string | number).toISOString();
 export async function event(tx: Tx, kind: string, entityId: string | null, data: Row = {}) {
   await tx.exec('INSERT INTO app.events(kind,entity_id,data) VALUES($1,$2,$3)', [kind, entityId, JSON.stringify(data)]);
+  // Delivered after commit and folded into one per transaction; live readers wake instead of polling.
+  await tx.exec("SELECT pg_notify('app_events','')");
 }
 export async function notify(tx: Tx, key: string, sessionId: string | null, title: string, body = '') {
   await tx.exec(

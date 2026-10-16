@@ -22,6 +22,7 @@ import { registerIntegrationRoutes } from './routes/integrations.js';
 import { registerAssistantRoutes } from './routes/assistant.js';
 import { registerDeviceRoutes } from './routes/devices.js';
 import { registerEventRoutes } from './routes/events.js';
+import { EventWake } from '../../../packages/core/src/event-wake.js';
 import { registerStatusRoutes } from './routes/status.js';
 import { DeviceBridges } from '../../../packages/core/src/devices/bridge.js';
 import { registerDeviceBridgeManagement, registerDeviceBridgeRoutes } from './routes/device-bridge.js';
@@ -37,9 +38,25 @@ export async function buildServer(
   const token = await initializeData(folder);
   const store = new Store(options.url);
   let boss: Awaited<ReturnType<typeof createBoss>> | undefined;
+  const wake = new EventWake(options.url || process.env.DATABASE_URL!);
   let closing = false;
   const server = Fastify({
-    logger: false,
+    // Method, route pattern, status and timing only: query strings can hold search terms, and
+    // credentials and cookies are never written.
+    logger:
+      process.env.VITEST || process.env.ASSISTANT_LOG === 'off'
+        ? false
+        : {
+            level: 'info',
+            redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]'],
+            serializers: {
+              req: (request: FastifyRequest) => ({
+                id: request.id,
+                method: request.method,
+                route: request.routeOptions?.url ?? request.url.split('?')[0],
+              }),
+            },
+          },
     bodyLimit: 2_100_000,
     requestTimeout: 20000,
     connectionTimeout: 20000,
@@ -51,7 +68,7 @@ export async function buildServer(
     closing = true;
   });
   server.addHook('onClose', async () => {
-    const results = await Promise.allSettled([boss?.stop(), store.close()]);
+    const results = await Promise.allSettled([wake.close(), boss?.stop(), store.close()]);
     const failure = results.find((result) => result.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
   });
@@ -114,6 +131,8 @@ export async function buildServer(
   try {
     await store.migrate();
     boss = await createBoss(options.url || process.env.DATABASE_URL!);
+    // Not awaited for success: if listening fails, live updates fall back to polling and keep retrying.
+    await wake.start();
     const app = new Application(store, boss, folder, token);
     const mail = new MailActions(store, boss, folder);
     const devices = new DeviceActions(store, boss);
@@ -195,7 +214,7 @@ export async function buildServer(
         registerDeviceBridgeManagement(api, bridges, administrator);
         registerStatusRoutes(api, store);
         registerAgentManagement(api, agents, administrator);
-        registerEventRoutes(api, app, authorized);
+        registerEventRoutes(api, app, authorized, wake);
       },
       { prefix: '/api/v2' },
     );
@@ -213,7 +232,7 @@ export async function buildServer(
           : reply.sendFile('index.html'),
       );
     }
-    return { server, app, store, boss, mail, devices, agents, bridges };
+    return { server, app, store, boss, mail, devices, agents, bridges, wake };
   } catch (error) {
     await server.close().catch(() => {});
     throw error;

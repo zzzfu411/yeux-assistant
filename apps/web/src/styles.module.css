@@ -209,6 +209,8 @@
 .annotation{margin:16px 0;padding:12px 16px;background:var(--annot-bg);border-left:3px solid var(--annot);border-radius:0 8px 8px 0;color:var(--ink)}
 .annotation>strong{display:block;color:var(--annot);font-family:var(--hand);font-size:15px;margin-bottom:4px}
 .annotation ul{margin:0;padding-left:18px;font-size:14px}
+.annotation>p{margin:0 0 8px;font-size:14px}
+.annotation>.toolbar{margin:0}
 .runningNotice{display:flex;align-items:center;gap:14px;padding:14px 16px 14px 18px;margin:18px 0;border-radius:var(--radius);background:var(--info-bg);color:var(--info);font-size:14px}
 .runningNotice>p{flex:1;min-width:0}
 .runningNotice>.secondary{flex:none}

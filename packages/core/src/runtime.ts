@@ -15,9 +15,12 @@ import { ArtifactExporter, Scheduler } from './scheduler.js';
 import { claimRun, failRun, publicRuntimeError, type RunIdentity } from './runtime-state.js';
 import { DeviceActions, DEVICE_QUEUE } from './devices/service.js';
 import { lockSession } from './sessions.js';
+import { pruneDerived } from './retention.js';
+import { log } from './log.js';
+import { LOCKS } from '../../storage/src/locks.js';
 
 type ChildResult = { ok: boolean; error?: string; permanent?: boolean };
-const SLOT_LOCKS = [847392010, 847392011];
+const SLOT_LOCKS = [LOCKS.runSlotA, LOCKS.runSlotB];
 export class RunSupervisor {
   readonly children = new Map<string, ChildProcess>();
   readonly pending = new Set<Promise<void>>();
@@ -74,8 +77,16 @@ export class RunSupervisor {
       if (slot === undefined) throw new Error('Both execution slots are busy');
       const run = await claimRun(this.store, runId);
       if (!run) return;
-      const identity = { runId, generation: run.generation };
+      const identity = { runId, generation: run.generation },
+        started = Date.now();
       const result = await this.child(identity, new Date(run.deadline).getTime(), signal);
+      log('run.finished', {
+        runId,
+        attempt: run.generation,
+        ok: result.ok,
+        ...(result.ok ? {} : { permanent: Boolean(result.permanent), error: result.error }),
+        ms: Date.now() - started,
+      });
       if (!result.ok) {
         const retry = await failRun(
           this.store,
@@ -215,11 +226,11 @@ export async function recoverInterruptedRuns(store: Store, boss: PgBoss) {
 export async function startWorker(store: Store, boss: PgBoss, folder: string) {
   // A personal deployment has one supervisor. PostgreSQL enforces this across accidental double starts.
   const ownership = await store.pool.connect();
-  if (!(await ownership.query('SELECT pg_try_advisory_lock(847392007) locked')).rows[0].locked) {
+  if (!(await ownership.query('SELECT pg_try_advisory_lock($1) locked', [LOCKS.workerOwnership])).rows[0].locked) {
     ownership.release();
     throw new AppError('已有 Worker 正在运行，请使用现有进程。');
   }
-  await withLock(store, 847392004, async () => {
+  await withLock(store, LOCKS.checkpointSetup, async () => {
     const saver = await openCheckpoints(process.env.DATABASE_URL!, true);
     await saver.end();
   });
@@ -230,7 +241,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
     exporter = new ArtifactExporter(store, folder),
     mail = new MailActions(store, boss, folder),
     push = new Push(store, folder);
-  await withLock(store, 847392005, () => mail.recover());
+  await withLock(store, LOCKS.mail, () => mail.recover());
   const devices = new DeviceActions(store, boss);
   await devices.recover();
   let stopping = false,
@@ -280,7 +291,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
   await boss.createQueue('mail-poll', { retryLimit: 1, expireInSeconds: 80, policy: 'exclusive' });
   await boss.work('maintenance', { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 }, async () => {
     await track(() =>
-      withLock(store, 847392006, async () => {
+      withLock(store, LOCKS.maintenance, async () => {
         await operation('devices', () => devices.sweep());
         await operation('scheduler', () => scheduler.tick());
         await operation('knowledge', async () => {
@@ -288,6 +299,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
           await knowledge.scan();
         });
         await operation('exports', () => exporter.tick());
+        await operation('retention', () => pruneDerived(store));
         // Phone notifications ride on the same tick; each notification is claimed before sending.
         await operation('push', () => push.deliver());
         // Recover queued but unconsumed approvals too; sendOne rechecks exact content and state.
@@ -308,7 +320,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
     { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 },
     async (jobs) => {
       await track(() =>
-        operation('mail-send', () => withLock(store, 847392005, () => mail.sendOne(jobs[0]?.data.approvalId))),
+        operation('mail-send', () => withLock(store, LOCKS.mail, () => mail.sendOne(jobs[0]?.data.approvalId))),
       );
     },
   );
@@ -318,7 +330,7 @@ export async function startWorker(store: Store, boss: PgBoss, folder: string) {
     async (jobs) => {
       await track(() =>
         operation('mail-poll', () =>
-          withLock(store, 847392008, async () => {
+          withLock(store, LOCKS.mailPoll, async () => {
             const settings = await config(folder);
             // Periodic polling follows the setting; "收取新邮件" and simulated delivery poll once on request.
             if (mailMode(settings) !== 'off' && (settings.poll_mail || jobs[0]?.data?.manual)) await mail.poll();

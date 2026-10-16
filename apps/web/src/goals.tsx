@@ -17,6 +17,7 @@ import {
 import { attemptSource } from './session';
 import s from './styles.module.css';
 import { Icon } from './icons';
+import { refresh as refreshReads } from './live';
 
 export function GoalSourcePicker({ value, onChange }: { value: string[]; onChange: (ids: string[]) => void }) {
   const query = useData<SourceSummary[]>('/sources');
@@ -155,7 +156,7 @@ function GoalContent({ detail, reload }: { detail: GoalOverview; reload: () => P
   const steps = plan?.steps || [],
     practiced = steps.filter((step) => ['practiced', 'completed'].includes(step.state)).length;
   const refresh = () => {
-    void client.invalidateQueries();
+    void refreshReads(client, '/goals', '/sessions', '/today');
   };
   const changeStatus = (status: Goal['status']) =>
     void action.run(

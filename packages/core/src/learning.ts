@@ -1,6 +1,7 @@
 import { Annotation, Command, END, START, StateGraph, interrupt } from '@langchain/langgraph';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
-import type { Store, Row } from '../../storage/src/index.js';
+import type { Store, Row, Tx } from '../../storage/src/index.js';
+import { addValue, getValue, insertValue, putValue } from './kv.js';
 import { ModelLesson, ModelPlan, Citation } from '../../contracts/src/index.js';
 import { ModelAssessment } from '../../contracts/src/assessment.js';
 import { ASSESSMENT_INSTRUCTION, guardAssessment } from './assessment.js';
@@ -9,6 +10,11 @@ import { CHUNK_COLUMNS, citationFromRow, retrieve } from './knowledge.js';
 import { ModelGateway, type ModelContext } from './model.js';
 import { commitNode, fence, nodeReceipt, readContext, traced, type RunIdentity } from './runtime-state.js';
 
+/** A saved assessment in the same `{ value }` shape as a step receipt. */
+async function assessmentReceipt(tx: Tx, attemptId: string) {
+  const value = await getValue(tx, 'assessment', attemptId);
+  return value ? { value } : undefined;
+}
 type Step = { id: string; title: string; objective: string; state: 'pending' | 'practicing' | 'practiced' };
 const LearningState = Annotation.Root({
   sessionId: Annotation<string>,
@@ -95,14 +101,9 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
       "SELECT * FROM app.memories WHERE enabled AND (scope IN ('all','preference','fact','correction') OR scope=$1) ORDER BY updated_at DESC,key",
       [context.session.kind],
     );
-    const snapshotKey = 'run-rules:' + context.run.id;
-    const savedRules = await tx.one('SELECT value FROM app.settings WHERE key=$1', [snapshotKey]);
-    if (savedRules) memories = savedRules.value;
-    else
-      await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING', [
-        snapshotKey,
-        JSON.stringify(memories),
-      ]);
+    const savedRules = await getValue(tx, 'run-rules', context.run.id);
+    if (savedRules) memories = savedRules;
+    else await addValue(tx, 'run-rules', context.run.id, JSON.parse(JSON.stringify(memories)));
     const previous = delivered?.content || context.session.content;
     const modelContext: ModelContext = {
       task: [
@@ -124,15 +125,8 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
     const intent = context.goal
       ? digest({ title: context.goal.title, outcome: context.goal.outcome, sources: context.goal.source_ids })
       : '';
-    const savedIntent = context.goal
-      ? (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['plan-intent:' + context.goal.id]))?.value
-      : undefined;
-    const reviewIndex = context.goal
-      ? Number(
-          (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['review-index:' + context.goal.id]))?.value ||
-            0,
-        )
-      : 0;
+    const savedIntent = context.goal ? await getValue(tx, 'plan-intent', context.goal.id) : undefined;
+    const reviewIndex = context.goal ? ((await getValue(tx, 'review-index', context.goal.id)) ?? 0) : 0;
     return {
       ...context,
       plan,
@@ -211,10 +205,7 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
               'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
               [id(), current.goal.id, version, JSON.stringify(steps), proposed.rationale, current.goal.revision],
             );
-            await tx.exec(
-              'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-              ['plan-intent:' + current.goal.id, JSON.stringify(ctx.intent)],
-            );
+            await putValue(tx, 'plan-intent', current.goal.id, ctx.intent);
             await event(tx, 'plan.updated', current.goal.id, { version });
           }
           return {
@@ -328,7 +319,7 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
           return store.transaction(async (tx) => {
             await fence(tx, identity);
             const receipt =
-              (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['assessment:' + ctx.attempt!.id])) ??
+              (await assessmentReceipt(tx, ctx.attempt!.id)) ??
               (await tx.one(
                 `SELECT st.output AS value FROM app.run_steps st JOIN app.runs r ON r.id=st.run_id
             WHERE st.name='assess' AND r.session_id=$1 AND r.input->>'attemptId'=$2 ORDER BY r.created_at LIMIT 1`,
@@ -466,12 +457,11 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
               const pending = changed.find((s) => s.state !== 'practiced');
               nextStep = pending?.id || null;
               done = !pending;
-              await tx.exec(
-                'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                [
-                  'review-index:' + current.goal.id,
-                  JSON.stringify((changed.findIndex((s) => s.id === ctx.step!.id) + 1) % changed.length),
-                ],
+              await putValue(
+                tx,
+                'review-index',
+                current.goal.id,
+                (changed.findIndex((s) => s.id === ctx.step!.id) + 1) % changed.length,
               );
               await event(tx, 'plan.updated', current.goal.id, { version: latest!.version + 1 });
             }
@@ -502,17 +492,14 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
             verdict: assessment.verdict,
             source,
           });
-          await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [
-            'assessment:' + ctx.attempt!.id,
-            JSON.stringify({
-              attemptId: ctx.attempt!.id,
-              assessedStepId: ctx.step?.id ?? null,
-              artifactId: ctx.delivered?.id ?? null,
-              verdict: assessment.verdict,
-              stepId: nextStep,
-              done,
-            }),
-          ]);
+          await insertValue(tx, 'assessment', ctx.attempt!.id, {
+            attemptId: ctx.attempt!.id,
+            assessedStepId: ctx.step?.id ?? null,
+            artifactId: ctx.delivered?.id ?? null,
+            verdict: assessment.verdict,
+            stepId: nextStep,
+            done,
+          });
           return { stepId: nextStep, done };
         });
       }),

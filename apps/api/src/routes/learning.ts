@@ -8,11 +8,17 @@ import {
 } from '../../../../packages/contracts/src/index.js';
 import { GoalListQuery, SessionListQuery, AttemptListQuery } from '../../../../packages/contracts/src/pagination.js';
 import { SessionTrace } from '../../../../packages/contracts/src/trace.js';
+import { ComposeDraft, SaveComposeDraft, ClearComposeDraft } from '../../../../packages/contracts/src/drafts.js';
 import { type ApiServer, key, params, pageQuery, revisionBody } from './shared.js';
 export function registerLearningRoutes(server: ApiServer, app: Application) {
   server.get('/today', async () => app.today());
   server.get('/today/overview', () => app.today(true));
   server.get('/goals', async () => app.goals());
+  server.get('/drafts/compose', { schema: { response: { 200: ComposeDraft } } }, () => app.composeDraft());
+  server.put('/drafts/compose', { schema: { body: SaveComposeDraft, response: { 200: ComposeDraft } } }, (r) =>
+    app.saveComposeDraft(r.body),
+  );
+  server.post('/drafts/compose/clear', { schema: { body: ClearComposeDraft } }, (r) => app.clearComposeDraft(r.body));
   server.get('/goals/list', { schema: { querystring: GoalListQuery } }, (r) => app.goalList(r.query));
   server.get('/goals/:id/overview', { schema: { params } }, (r) => app.goal(r.params.id, true));
   server.get('/goals/:id/attempts/list', { schema: { params, querystring: AttemptListQuery } }, (r) =>

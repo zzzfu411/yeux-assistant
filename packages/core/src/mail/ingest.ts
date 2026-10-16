@@ -5,6 +5,7 @@ import { createRun } from '../sessions.js';
 import { createErrand } from '../errands/service.js';
 import { putSource } from '../knowledge.js';
 import { matchesBySubject, normalizeAddress, replyContext, subjectKey } from './thread.js';
+import { getValue, putValue } from '../kv.js';
 
 export type ParsedMail = {
   messageId: string | null;
@@ -100,14 +101,11 @@ async function matchingFlow(tx: Tx, subject: string) {
 }
 
 async function underDailyLimit(tx: Tx, limit: number) {
-  const key = 'mail-drafts:' + new Date().toISOString().slice(0, 10);
-  await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [key]);
-  const used = Number((await tx.one('SELECT value FROM app.settings WHERE key=$1', [key]))?.value || 0);
+  const day = new Date().toISOString().slice(0, 10);
+  await tx.exec('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['mail-drafts:' + day]);
+  const used = (await getValue(tx, 'mail-drafts', day)) ?? 0;
   if (used >= limit) return false;
-  await tx.exec(
-    'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-    [key, JSON.stringify(used + 1)],
-  );
+  await putValue(tx, 'mail-drafts', day, used + 1);
   return true;
 }
 

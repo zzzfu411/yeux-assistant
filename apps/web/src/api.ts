@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { useQuery, type QueryClient } from '@tanstack/react-query';
 import { RunEvent } from '../../../packages/contracts/src/index';
 import { ZodError } from 'zod';
+import { affected, useLive } from './live';
 
 const prefix = 'assistant.v2.';
 export const storage = {
@@ -129,14 +130,27 @@ export function useApi() {
   if (!api) throw new Error('No API client');
   return api;
 }
-export function useData<T>(path: string, options: { refetchInterval?: number } = {}) {
-  const api = useApi();
+/**
+ * A read keyed by its path. `refetchInterval` applies only while the event stream is down; while it is
+ * connected, events refresh the read and `whileLive` (default: never) is the only polling left, for
+ * values that change without an event, such as a running task's elapsed time.
+ */
+export function useData<T>(
+  path: string,
+  options: { refetchInterval?: number; whileLive?: number | false | ((data: T | undefined) => number | false) } = {},
+) {
+  const api = useApi(),
+    live = useLive();
   return useQuery({
     queryKey: [path],
     queryFn: ({ signal }) => api.get<T>(path, signal),
     retry: 1,
     staleTime: 15_000,
-    ...options,
+    refetchInterval: (query) => {
+      if (!live) return options.refetchInterval ?? false;
+      const whileLive = options.whileLive;
+      return typeof whileLive === 'function' ? whileLive(query.state.data as T | undefined) : (whileLive ?? false);
+    },
   });
 }
 export function useDraft<T>(key: string, initial: T) {
@@ -210,23 +224,19 @@ export function useEvents(api: ApiClient, client: QueryClient, onExpired: () => 
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let cursor = storage.get('cursor') || '0';
-    let refreshSources = false;
+    let pending: Array<(path: string) => boolean> = [];
+    // Each event refreshes only the reads it can change; a reconnect refreshes everything once.
     const invalidate = (kind?: string) => {
-      refreshSources ||=
-        kind === undefined || kind === 'stream.reset' || kind === 'legacy.imported' || kind.startsWith('source.');
+      pending.push(kind === undefined ? () => true : affected(kind));
       if (!timer)
         timer = setTimeout(() => {
           timer = undefined;
-          const includeSources = refreshSources;
-          refreshSources = false;
-          // Learning progress cannot change the source catalogue; a source event or
-          // reconnect or legacy import still refreshes every active query, including version details.
+          const tests = pending;
+          pending = [];
           void client.invalidateQueries({
             predicate: (query) => {
               const path = query.queryKey[0];
-              return (
-                includeSources || typeof path !== 'string' || !/^\/(?:sources(?:[/?]|$)|search(?:[?]|$))/.test(path)
-              );
+              return typeof path !== 'string' || tests.some((test) => test(path));
             },
           });
         }, 150);

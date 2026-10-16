@@ -80,6 +80,24 @@ function visit(name) {
   visited.add(name);
 }
 for (const name of edges.keys()) visit(name);
+// Fixed advisory lock keys live in one registry, each used once; text-derived keys are hashed instead.
+const registry = 'packages/storage/src/locks.ts';
+const keys = [...(await readFile(join(root, registry), 'utf8')).matchAll(/:\s*(\d+),/g)].map((match) => match[1]);
+for (const key of keys.filter((key, index) => keys.indexOf(key) !== index))
+  errors.push(`${registry} assigns advisory lock ${key} more than once`);
+for (const path of files) {
+  const name = relative(root, path);
+  if (name !== registry && /\b8473920\d\d\b/.test(await readFile(path, 'utf8')))
+    errors.push(`${name} must take advisory lock keys from ${registry}`);
+}
+// Typed keys in app.settings go through packages/core/src/kv.ts; other modules must not write that table directly.
+const kvModule = 'packages/core/src/kv.ts';
+for (const path of files) {
+  const name = relative(root, path);
+  if (name === kvModule || !name.startsWith('packages/core/')) continue;
+  if (/(INSERT INTO|UPDATE|DELETE FROM)\s+app\.settings\b/.test(await readFile(path, 'utf8')))
+    errors.push(`${name} must write app.settings through ${kvModule}`);
+}
 if (errors.length) {
   console.error([...new Set(errors)].join('\n'));
   process.exitCode = 1;

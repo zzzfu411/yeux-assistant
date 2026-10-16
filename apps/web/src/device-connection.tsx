@@ -4,6 +4,7 @@ import type { IssuedDeviceBridge, BridgeConfig } from '../../../packages/contrac
 import { useAction, useApi } from './api';
 import { date, ErrorNotice } from './ui';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 export function DeviceConnection() {
   const api = useApi(),
@@ -22,7 +23,7 @@ export function DeviceConnection() {
         setIssued(value);
         setEditing(false);
         setCopied(false);
-        void client.invalidateQueries();
+        void refresh(client, '/devices');
       },
     );
   };
@@ -127,7 +128,7 @@ export function DeviceConnection() {
                     () => api.write('/devices/' + issued.deviceId + '/revoke-bridge'),
                     () => {
                       setIssued(null);
-                      void client.invalidateQueries();
+                      void refresh(client, '/devices');
                     },
                   )
                 }

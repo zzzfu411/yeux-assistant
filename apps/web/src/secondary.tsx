@@ -10,6 +10,7 @@ import { Icon } from './icons';
 import { MailSettingsPanel, PushPanel } from './connections';
 import { AgentConnectionsPanel } from './agent-connections';
 import type { SessionSummary } from '../../../packages/contracts/src/pagination';
+import { refresh } from './live';
 
 type Schedule = {
   id: string;
@@ -153,7 +154,7 @@ export function NotificationsPage() {
                         onClick={() =>
                           void action.run(
                             () => api.write('/notifications/' + item.id + '/read'),
-                            () => void client.invalidateQueries(),
+                            () => void refresh(client, '/notifications', '/today'),
                           )
                         }
                       >
@@ -254,7 +255,7 @@ function ScheduleEditor({ schedule, done }: { schedule: Schedule | null; done: (
           savedId ? 'PATCH' : 'POST',
         ),
       (result) => {
-        void client.invalidateQueries();
+        void refresh(client, '/schedules', '/today');
         if (JSON.stringify(draftRef.current) === JSON.stringify(sent)) {
           clear();
           done();
@@ -468,7 +469,7 @@ function SettingsForm({
         setApiKey((current) => (current === submittedKey ? '' : current));
         setReviewKey((current) => (current === submittedReviewKey ? '' : current));
         action.setMessage('配置已保存。可以测试连接。');
-        void client.invalidateQueries();
+        void refresh(client, '/settings', '/today', '/status');
       },
     );
   };

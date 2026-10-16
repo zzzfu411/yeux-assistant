@@ -5,6 +5,7 @@ import { useAction, useApi, useData, useDraft } from './api';
 import { date, ErrorNotice, QueryState } from './ui';
 import { Icon } from './icons';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 const modes = [
   ['off', '关闭', '不读取也不发送邮件'],
@@ -64,7 +65,7 @@ function MailSettingsForm({
         setDraft((current) => ({ ...current, revision: result.revision }));
         setPassword((current) => (current === sent ? '' : current));
         action.setMessage('邮箱设置已保存。可以测试连接。');
-        void client.invalidateQueries();
+        void refresh(client, '/settings', '/today', '/mail', '/status');
       },
     );
   };
@@ -277,7 +278,7 @@ export function PushPanel() {
       },
       () => {
         action.setMessage('已在这台设备开启通知。');
-        void client.invalidateQueries();
+        void refresh(client, '/push');
       },
     );
   const disable = () =>
@@ -292,7 +293,7 @@ export function PushPanel() {
       },
       () => {
         action.setMessage('这台设备不再接收通知。');
-        void client.invalidateQueries();
+        void refresh(client, '/push');
       },
     );
   return (

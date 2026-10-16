@@ -6,6 +6,7 @@ import { useAction, useApi, useData } from './api';
 import { ErrorNotice, Status } from './ui';
 import { Icon } from './icons';
 import s from './styles.module.css';
+import { refresh } from './live';
 
 const labels = {
   organizer: '主办方',
@@ -240,7 +241,7 @@ export function ErrandPanel({ errand, session }: { errand: ErrandDetail; session
                   api.write('/sessions/' + encodeURIComponent(session.id) + '/errand/archive', {
                     revision: session.revision,
                   }),
-                () => void client.invalidateQueries(),
+                () => void refresh(client, '/sessions', '/today', '/sources', '/mail'),
               )
             }
           >
@@ -321,7 +322,7 @@ export function FlowEditor({ draft, done }: { draft: FlowDraft; done: () => void
           },
         }),
       () => {
-        void client.invalidateQueries();
+        void refresh(client, '/flows', '/workspace', '/today');
         action.setMessage('流程已保存并提交到私密 Git。首页“常用流程”可以直接使用它。');
       },
     );

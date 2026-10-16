@@ -353,6 +353,9 @@ async function compare(
     value.winner === 'tie' ? 'tie' : value.winner === of(challenger) ? ('new' as const) : ('incumbent' as const);
   const kept = winner === 'new' ? challenger : incumbent;
   for (const candidate of [incumbent, challenger]) {
+    // A losing incumbent keeps the review from when it was judged; scores from different comparisons are
+    // not comparable, so each version shows the comparison it entered (or, if kept, the latest one).
+    if (candidate === incumbent && candidate !== kept && candidate.review) continue;
     const better = candidate === kept;
     candidate.review = {
       scores: value.scores[of(candidate)],

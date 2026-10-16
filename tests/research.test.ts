@@ -269,6 +269,8 @@ describe('research search and evidence', () => {
       // The newer answer always wins this judge, so each revision replaces the version it improved.
       expect(state.best).toBe(3);
       expect(state.candidates.map((c) => c.comparison?.winner ?? null)).toEqual([null, 'new', 'new', 'new']);
+      // Shown second (B, scored 3s) in the root comparison, then beaten: version 2 keeps that root score.
+      expect(state.candidates[1]!.score).toBe(12);
     }
   });
   it('shows the two answers in a random order and keeps the incumbent on a tie', async () => {

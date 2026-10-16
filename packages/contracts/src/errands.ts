@@ -61,11 +61,11 @@ export const ModelErrandPlan = z
       )
       .max(15),
     questions: z.array(z.string().trim().min(1).max(300)).max(4),
+    // Only whether a letter is needed: the body is written in its own call once nothing is left to ask.
     mail: z
       .object({
         needed: z.boolean(),
         subject: z.string().max(200),
-        body: z.string().max(8000),
       })
       .strict(),
     todos: z
@@ -74,6 +74,10 @@ export const ModelErrandPlan = z
   })
   .strict();
 export type ModelErrandPlan = z.infer<typeof ModelErrandPlan>;
+export const ModelErrandMail = z
+  .object({ subject: z.string().trim().min(1).max(200), body: z.string().trim().min(1).max(8000) })
+  .strict();
+export type ModelErrandMail = z.infer<typeof ModelErrandMail>;
 
 export type VerifiedField = { value: string | null; quote: string; start: number | null; note: string };
 export type ErrandFacts = {
@@ -100,6 +104,8 @@ export type ErrandState = {
         mail: { needed: boolean; subject: string; body: string; to: string | null };
       })
     | null;
+  /** The run that produced `plan`; a retry of that same run reuses it instead of asking the model again. */
+  planRunId?: string;
   questions: string[];
   answers: Array<{ answer: string; at: string; attemptId?: string }>;
   calendar: Array<{ kind: 'start' | 'end' | 'deadline'; title: string; at: string; allDay: boolean }>;

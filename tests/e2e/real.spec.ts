@@ -2,6 +2,12 @@ import { test, expect, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
+/** Choose a tab on the page edge, then write in the single Today composer. */
+async function compose(page: Page, mode: string, text: string) {
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: mode, exact: true }).click();
+  await page.getByLabel('写下来', { exact: true }).fill(text);
+}
+
 async function openMore(page: Page) {
   // Desktop lists secondary pages in the sidebar; phones open them from the tab bar.
   const more = page.getByLabel('更多', { exact: true });
@@ -26,7 +32,7 @@ test('真实 PostgreSQL 与 Worker：资料→目标→自评→复习记录→�
   await page.getByLabel('账号', { exact: true }).fill(credentials.username);
   await page.getByLabel('密码', { exact: true }).fill(credentials.password);
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   const originalContent =
     '需求分析从使用者的具体问题开始。验收标准描述可观察的行为，例如点击保存后 2 秒内显示结果。\n独立用例：' + suffix;
   await page.getByRole('link', { name: '资料', exact: true }).click();
@@ -37,7 +43,7 @@ test('真实 PostgreSQL 与 Worker：资料→目标→自评→复习记录→�
   await expect(page.getByRole('heading', { name: source, exact: true })).toBeVisible();
   const sourceId = decodeURIComponent(page.url().split('/source/')[1]!.split('?')[0]!);
   await page.getByRole('link', { name: '今天', exact: true }).click();
-  await page.getByLabel('学习目标').fill(title);
+  await compose(page, '学习计划', title);
   await page.getByText('学习设置', { exact: true }).click();
   await page.getByLabel('预期成果').fill('理解需求分析，写出可验证的验收标准');
   await page.getByRole('checkbox', { name: source, exact: true }).check();

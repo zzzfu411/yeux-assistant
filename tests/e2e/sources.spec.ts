@@ -177,7 +177,7 @@ async function setup(page: Page, state = fixture()) {
   await page.getByLabel('账号', { exact: true }).fill('tester');
   await page.getByLabel('密码', { exact: true }).fill('test-password');
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   await page.getByRole('link', { name: '资料', exact: true }).click();
   await expect(page.getByRole('heading', { name: '资料', exact: true })).toBeVisible();
   return state;

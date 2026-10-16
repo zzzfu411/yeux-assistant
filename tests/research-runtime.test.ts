@@ -16,7 +16,7 @@ const url = process.env.RUNTIME_TEST_DATABASE_URL;
 describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / executor', () => {
   let built: Awaited<ReturnType<typeof buildServer>>, folder: string, server: Server, supervisor: RunSupervisor;
   let token: string;
-  let calls: number, failAt: number, holdAt: number, reserveBudgetAt: number, release: (() => void) | undefined;
+  let calls: number, failing: number[], holdAt: number, reserveBudgetAt: number, release: (() => void) | undefined;
   const beforeURL = process.env.DATABASE_URL,
     beforeFolder = process.env.ASSISTANT_DATA;
   beforeEach(async () => {
@@ -33,7 +33,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     await saver.end();
     supervisor = new RunSupervisor(built.store);
     calls = 0;
-    failAt = 0;
+    failing = [];
     holdAt = 0;
     reserveBudgetAt = 0;
     release = undefined;
@@ -67,7 +67,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(
           JSON.stringify({
-            choices: [{ message: { content: n === failAt ? 'invalid JSON' : JSON.stringify(content) } }],
+            choices: [{ message: { content: failing.includes(n) ? 'invalid JSON' : JSON.stringify(content) } }],
             usage: { prompt_tokens: 30, completion_tokens: 20, total_tokens: 50 },
           }),
         );
@@ -145,7 +145,8 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
   });
   it('resumes a saved solve after failure, shares budget, and keeps the old source version', async () => {
     const item = await create('low');
-    failAt = 2;
+    // The review fails, and so does its one in-run retry.
+    failing = [2, 3];
     const claim = (await claimRun(built.store, item.runId))!;
     await expect(
       executeResearchRun(built.store, folder, { runId: item.runId, generation: claim.generation }),
@@ -160,10 +161,12 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     expect(detail.session.state).toBe('ready');
     expect(calls).toBe(4);
     expect(detail.research?.state.candidates[0]?.citations[0]?.version).toBe(1);
-    expect(detail.research?.state.candidates).toHaveLength(2);
-    expect(detail.research?.state.candidates[1]?.review).toBeNull();
+    // Two paid failures leave room for only the review: the saved solve is reused, never redone.
+    expect(detail.research?.state.candidates).toHaveLength(1);
+    expect(detail.research?.state.candidates[0]?.review).not.toBeNull();
     expect(detail.research?.state.best).toBe(0);
-    expect(detail.research?.usage.totalTokens).toBe(200); // malformed paid response is counted
+    expect(detail.research?.state.retried).toBe(1);
+    expect(detail.research?.usage.totalTokens).toBe(200); // malformed paid responses are counted
   });
   it('cancels a running review without publishing its late response or erasing the saved candidate', async () => {
     const item = await create();
@@ -179,15 +182,52 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     expect(detail.session.content).toBe('');
     expect(supervisor.children.size).toBe(0);
   });
-  it('returns a prior reviewed answer if a later model response is invalid', async () => {
+  it('returns a prior reviewed answer if a later response fails with no budget left to repeat it', async () => {
     const item = await create('low');
-    failAt = 3;
+    failing = [3];
     await supervisor.handle(item.runId);
     const detail = await built.app.session(item.sessionId);
     expect(detail.session.state).toBe('ready');
     expect(detail.research?.state.stopReason).toBe('error');
     expect(detail.research?.state.best).toBe(0);
+    expect(detail.research?.state.retried ?? 0).toBe(0);
     expect(calls).toBe(3);
+  });
+  it('repeats one failed step inside the run instead of ending the comparison', async () => {
+    const item = await create('high');
+    failing = [3];
+    await supervisor.handle(item.runId);
+    const detail = await built.app.session(item.sessionId);
+    expect(detail.session.state).toBe('ready');
+    // Solve, review, failed solve, its retry, review, solve, review; one call left cannot fund a reviewed version.
+    expect(calls).toBe(7);
+    expect(detail.research?.state.retried).toBe(1);
+    expect(detail.research?.state.candidates).toHaveLength(3);
+    expect(detail.research?.state.candidates.every((candidate) => candidate.review)).toBe(true);
+    expect(detail.research?.state.stopReason).toBe('budget');
+    expect(detail.research?.state.warnings.join()).toContain('已自动重试');
+  });
+  it('continues from the saved candidate when the owner retries a failed research', async () => {
+    const item = await create('low');
+    failing = [2, 3];
+    const claim = (await claimRun(built.store, item.runId))!;
+    await expect(
+      executeResearchRun(built.store, folder, { runId: item.runId, generation: claim.generation }),
+    ).rejects.toThrow();
+    await failRun(built.store, { runId: item.runId, generation: claim.generation }, '模拟失败', true);
+    const failed = await built.app.session(item.sessionId);
+    expect(failed.session.state).toBe('failed');
+    const retry = await built.app.retry('retry-research', item.sessionId, failed.session.revision);
+    await supervisor.handle(retry.runId);
+    const detail = await built.app.session(item.sessionId);
+    expect(detail.session.state).toBe('ready');
+    // The new run reviews the saved first answer instead of solving it again: review, solve, review.
+    expect(calls).toBe(6);
+    expect(detail.research?.state.candidates[0]?.answer.content).toContain('第 1 次生成');
+    expect(detail.research?.state.candidates).toHaveLength(2);
+    expect(detail.research?.state.offset).toBe(0);
+    expect(detail.research?.state.warnings.join()).toContain('接续上一轮');
+    expect(detail.research?.calls).toBe(3);
   });
   it('stops a slow later call before the hard deadline and delivers the retained answer within budget', async () => {
     const item = await create('low');

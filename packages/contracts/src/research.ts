@@ -79,7 +79,13 @@ export type ResearchState = {
   phase: 'solve' | 'review' | 'finished';
   stopReason: 'accepted' | 'budget' | 'direct' | 'error' | null;
   warnings: string[];
+  /** Reviewed candidates carried over from an earlier run of the same research; the new budget counts the rest. */
+  offset?: number;
+  /** Steps of this run repeated after a transient provider failure. */
+  retried?: number;
 };
+/** One transient failure per four calls may repeat the same step instead of ending the run. */
+export const stepRetries = (effort: Effort) => Math.min(2, Math.floor(RESEARCH_BUDGETS[effort].calls / 4));
 export type ResearchDetail = {
   runId: string;
   state: ResearchState;

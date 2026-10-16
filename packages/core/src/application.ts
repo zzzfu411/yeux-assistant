@@ -558,6 +558,8 @@ export class Application {
         answer: prior?.input.answer || '',
         attemptId: prior?.input.attemptId || null,
         freshThread: true,
+        // Research continues from the candidates the failed run already saved.
+        ...(session.research && prior ? { resumeFrom: prior.id } : {}),
       });
       return { sessionId, runId };
     });

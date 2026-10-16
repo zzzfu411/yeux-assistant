@@ -111,15 +111,16 @@ async function setup(page: Page, state = fixture()) {
   await page.getByLabel('账号', { exact: true }).fill('tester');
   await page.getByLabel('密码', { exact: true }).fill('test-password');
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   return state;
 }
 async function openPicker(page: Page) {
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习计划', exact: true }).click();
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await expect(page.getByRole('group', { name: '关联资料', exact: true })).toBeVisible();
 }
 const selected = (page: Page) =>
-  page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.new-goal')!).sourceIds as string[]);
+  page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.compose')!).sourceIds as string[]);
 const sourceReads = (state: State) => state.reads.filter((path) => path === '/sources').length;
 const pickerPages = (page: Page) => page.getByRole('group', { name: '资料选择分页', exact: true });
 

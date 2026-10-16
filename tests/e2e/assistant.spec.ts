@@ -3,6 +3,12 @@ import { test, expect, type Page, type Route } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import type { Citation, SourceMetadata, SourceSummary } from '../../packages/contracts/src/index';
 
+/** Choose a tab on the page edge, then write in the single Today composer. */
+async function compose(page: Page, mode: string, text: string) {
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: mode, exact: true }).click();
+  await page.getByLabel('写下来', { exact: true }).fill(text);
+}
+
 async function openMore(page: Page) {
   // Desktop lists secondary pages in the sidebar; phones open them from the tab bar.
   const more = page.getByLabel('更多', { exact: true });
@@ -452,7 +458,7 @@ async function setup(page: Page, state = fixture(), login = true) {
     await page.getByLabel('账号', { exact: true }).fill('tester');
     await page.getByLabel('密码', { exact: true }).fill('test-password');
     await page.getByRole('button', { name: '登录', exact: true }).click();
-    await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   }
   return state;
 }
@@ -476,12 +482,12 @@ test('今天、目标、资料可用，手机不横向溢出', async ({ page }, 
 });
 test('输入刷新与切页可恢复，退出清除会话草稿', async ({ page }) => {
   await setup(page);
-  await page.getByLabel('学习目标').fill('每天学一点 TypeScript');
+  await compose(page, '学习计划', '每天学一点 TypeScript');
   await page.reload();
-  await expect(page.getByLabel('学习目标')).toHaveValue('每天学一点 TypeScript');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('每天学一点 TypeScript');
   await page.getByRole('link', { name: '目标', exact: true }).click();
   await page.getByRole('link', { name: '今天', exact: true }).click();
-  await expect(page.getByLabel('学习目标')).toHaveValue('每天学一点 TypeScript');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('每天学一点 TypeScript');
   await openMore(page);
   await page.getByRole('button', { name: '退出', exact: true }).click();
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
@@ -491,7 +497,7 @@ test('输入刷新与切页可恢复，退出清除会话草稿', async ({ page 
 });
 test('创建目标携带资料与幂等键，并进入学习步骤', async ({ page }) => {
   const state = await setup(page);
-  await page.getByLabel('学习目标').fill('一周学会需求分析');
+  await compose(page, '学习计划', '一周学会需求分析');
   await page.getByText('学习设置', { exact: true }).click();
   await page.getByLabel('预期成果').fill('写出可验证的验收标准');
   await page.getByRole('checkbox', { name: '第一讲：软件工程' }).check();
@@ -504,10 +510,10 @@ test('连接断开后保留输入，重试复用原请求键', async ({ page }) 
   const state = fixture();
   state.abortCreate = true;
   await setup(page, state);
-  await page.getByLabel('学习目标').fill('学习幂等请求');
+  await compose(page, '学习计划', '学习幂等请求');
   await page.getByRole('button', { name: '创建学习计划', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('输入已保留');
-  await expect(page.getByLabel('学习目标')).toHaveValue('学习幂等请求');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('学习幂等请求');
   await page.getByRole('button', { name: '创建学习计划', exact: true }).click();
   await expect(page.getByRole('heading', { name: '学习幂等请求', exact: true })).toBeVisible();
   expect(state.posts).toHaveLength(2);
@@ -626,16 +632,17 @@ test('提交过程中新增的目标输入仍然保留', async ({ page }) => {
   const state = fixture();
   state.delayCreate = 1200;
   await setup(page, state);
-  await page.getByLabel('学习目标').fill('先提交的目标');
+  await compose(page, '学习计划', '先提交的目标');
   await page.getByRole('button', { name: '创建学习计划', exact: true }).click();
   await expect.poll(() => state.posts.length).toBe(1);
   await expect(
     page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习答疑', exact: true }),
   ).toBeDisabled();
-  await page.getByLabel('学习目标').fill('提交过程中想到的另一个目标');
+  // The tabs are locked while a request is in flight; the page itself stays writable.
+  await page.getByLabel('写下来', { exact: true }).fill('提交过程中想到的另一个目标');
   await expect(page.getByRole('heading', { name: '先提交的目标', exact: true })).toBeVisible();
   await page.getByRole('link', { name: '今天', exact: true }).click();
-  await expect(page.getByLabel('学习目标')).toHaveValue('提交过程中想到的另一个目标');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('提交过程中想到的另一个目标');
 });
 test('保存期间继续改写保留新文字，并推进自己的版本', async ({ page }) => {
   const state = fixture();
@@ -661,7 +668,7 @@ test('保存期间继续改写保留新文字，并推进自己的版本', async
 test('账号会话刷新后保留，浏览器不保存密码或访问令牌', async ({ page }) => {
   const state = await setup(page);
   await page.reload();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   expect(await page.evaluate(() => sessionStorage.getItem('assistant.v2.token'))).toBe(null);
   expect(await page.evaluate(() => JSON.stringify(sessionStorage))).not.toContain('test-password');
   await expect.poll(() => state.events.includes('7')).toBe(true);
@@ -684,7 +691,7 @@ test('管理员登录错误可恢复，密码可查看，Logo 与手机布局正
   await expect(page.getByRole('alert')).toContainText('账号或密码不正确');
   await page.getByLabel('密码', { exact: true }).fill('test-password');
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 test('未评阅的回答不会标为模型估计', async ({ page }) => {
@@ -876,7 +883,7 @@ test('课程资料按课程筛选，检索传课程范围并保留未分类资�
 
 test('课程筛选不改已有勾选，明确关联本页后跨课程保持选择', async ({ page }) => {
   const state = await setup(page, courseFixture());
-  await page.getByLabel('学习目标').fill('学习GSE课程');
+  await compose(page, '学习计划', '学习GSE课程');
   await page.getByText('学习设置', { exact: true }).click();
   await page.getByLabel('筛选课程').selectOption('gse');
   await expect(page.getByRole('checkbox', { name: 'GSE第一讲', exact: true })).not.toBeChecked();
@@ -992,7 +999,7 @@ test('旧草稿超过目标上限时保留原关联并提示本人减少，不�
 
 test('课程资料取消全部后保持空绑定，不扩大到其他课程', async ({ page }) => {
   const state = await setup(page, courseFixture());
-  await page.getByLabel('学习目标').fill('暂不关联资料的学习目标');
+  await compose(page, '学习计划', '暂不关联资料的学习目标');
   await page.getByText('学习设置', { exact: true }).click();
   await page.getByLabel('筛选课程').selectOption('gse');
   await page.getByRole('button', { name: '关联本页', exact: true }).click();
@@ -1013,6 +1020,7 @@ test('首次使用同时提示模型与后台状态，资料关联可直接发�
   await setup(page, state);
   await expect(page.getByText('未连接模型，当前只提供资料摘录与自评练习。')).toBeVisible();
   await expect(page.getByText(/后台尚未运行，任务暂时不会开始/)).toBeVisible();
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习计划', exact: true }).click();
   await page.getByRole('button', { name: '选择资料（当前未关联）' }).click();
   await page.getByRole('checkbox', { name: '第一讲：软件工程' }).check();
   await expect(page.getByRole('button', { name: '已关联 1 份资料' })).toBeVisible();
@@ -1021,6 +1029,7 @@ test('资料请求失败可以重试，不冒充空资料库', async ({ page }) 
   const state = fixture();
   state.sourcesFailed = true;
   await setup(page, state);
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习计划', exact: true }).click();
   await page.getByRole('button', { name: '选择资料（当前未关联）' }).click();
   await expect(page.getByRole('alert')).toContainText('资料载入失败');
   await expect(page.getByText('可先到「资料」添加学习材料。')).toHaveCount(0);
@@ -1030,7 +1039,7 @@ test('资料请求失败可以重试，不冒充空资料库', async ({ page }) 
 });
 test('归档资料的旧目标草稿保留关联，显式移除后可以创建目标', async ({ page }) => {
   const state = await setup(page);
-  await page.getByLabel('学习目标', { exact: true }).fill('继续学习需求分析');
+  await compose(page, '学习计划', '继续学习需求分析');
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
   state.sources = [];
@@ -1038,13 +1047,13 @@ test('归档资料的旧目标草稿保留关联，显式移除后可以创建�
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await expect(page.getByText('有 1 份关联资料已归档或不可用。原关联仍保留。', { exact: true })).toBeVisible();
   expect(
-    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.new-goal')!).sourceIds),
+    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.compose')!).sourceIds),
   ).toEqual(['source-1']);
   expect(state.posts).toHaveLength(0);
   await page.getByRole('button', { name: '移除不可用关联', exact: true }).click();
   await expect(page.getByRole('button', { name: '移除不可用关联', exact: true })).toHaveCount(0);
   expect(
-    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.new-goal')!).sourceIds),
+    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.compose')!).sourceIds),
   ).toEqual([]);
   await page.getByRole('button', { name: '创建学习计划', exact: true }).click();
   await expect(page.getByRole('heading', { name: '继续学习需求分析', exact: true })).toBeVisible();
@@ -1053,7 +1062,7 @@ test('归档资料的旧目标草稿保留关联，显式移除后可以创建�
 test('资料载入失败时不会把旧关联误判为不可用', async ({ page }) => {
   const state = await setup(page),
     originalSources = [...state.sources];
-  await page.getByLabel('学习目标', { exact: true }).fill('保留资料关联');
+  await compose(page, '学习计划', '保留资料关联');
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
   state.sources = [];
@@ -1065,7 +1074,7 @@ test('资料载入失败时不会把旧关联误判为不可用', async ({ page 
   await expect(page.getByRole('alert')).toContainText('资料载入失败');
   await expect(page.getByRole('button', { name: '移除不可用关联', exact: true })).toHaveCount(0);
   expect(
-    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.new-goal')!).sourceIds),
+    await page.evaluate(() => JSON.parse(sessionStorage.getItem('assistant.v2.draft.compose')!).sourceIds),
   ).toEqual(['source-1']);
   state.sourcesFailed = false;
   state.sources = originalSources;
@@ -1123,10 +1132,10 @@ test('文件编码错误可理解，迟到的文件读取不会覆盖新输入',
   await expect(page.getByRole('textbox', { name: '原文', exact: true })).toHaveValue('继续编辑的文字');
 });
 
-for (const [mode, label, field, action, prompt] of [
-  ['study', '学习答疑', '学习问题', '开始答疑', '解释数据库左连接并给出练习。'],
-  ['work', '整理材料', '材料与整理要求', '整理材料', '把这段材料提炼为要点：课程实验需先写验收标准。'],
-  ['manage', '安排复盘', '安排或复盘内容', '生成清单', '把明天的一小时分配给数据库复习和软件工程阅读。'],
+for (const [mode, label, action, prompt] of [
+  ['study', '学习答疑', '开始答疑', '解释数据库左连接并给出练习。'],
+  ['work', '整理材料', '整理材料', '把这段材料提炼为要点：课程实验需先写验收标准。'],
+  ['manage', '安排复盘', '生成清单', '把明天的一小时分配给数据库复习和软件工程阅读。'],
 ] as const) {
   test(`首页直接进入${label}，确认填写后才创建对应任务`, async ({ page }, testInfo) => {
     const state = await setup(page),
@@ -1136,11 +1145,11 @@ for (const [mode, label, field, action, prompt] of [
     await expect(features.getByRole('button', { name: label, exact: true })).toHaveAttribute('aria-pressed', 'true');
     const form = page.getByRole('form', { name: label + '填写区', exact: true });
     await expect(form.getByRole('button', { name: action, exact: true })).toBeDisabled();
-    await expect(page.getByLabel(field, { exact: true })).toBeVisible();
+    await expect(page.getByLabel('写下来', { exact: true })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath(mode + '.png'), fullPage: true, scale: 'css' });
     expect(state.posts).toHaveLength(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
-    await page.getByLabel(field, { exact: true }).fill(prompt);
+    await page.getByLabel('写下来', { exact: true }).fill(prompt);
     await form.getByRole('button', { name: action, exact: true }).click();
     await expect(page.getByRole('heading', { name: prompt, exact: true })).toBeVisible();
     expect(state.posts).toHaveLength(1);
@@ -1148,7 +1157,7 @@ for (const [mode, label, field, action, prompt] of [
     expect(state.posts[0]!.key).toMatch(/^[a-f0-9]{32}$/);
     await expect(page.getByLabel(mode === 'study' ? '练习回答' : '修改意见', { exact: true })).toBeVisible();
     await page.getByRole('link', { name: '今天', exact: true }).click();
-    await expect(page.getByLabel(field, { exact: true })).toHaveValue('');
+    await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('');
   });
 }
 
@@ -1172,7 +1181,7 @@ test('办理通知：粘贴通知、可选流程，确认后才创建办事', as
   await expect(form.getByRole('button', { name: '开始办理', exact: true })).toBeDisabled();
   await expect(page.getByRole('link', { name: /课程展示报名/ })).toBeVisible();
   await page
-    .getByLabel('通知原文', { exact: true })
+    .getByLabel('写下来', { exact: true })
     .fill('课程展示定于 11 月 20 日 14:00 举行，请于 11 月 10 日前报名。');
   await page.getByLabel('按流程办理', { exact: true }).selectOption('showcase');
   expect(state.posts).toHaveLength(0);
@@ -1239,26 +1248,47 @@ test('邮件：按线程查看往来，起草回复与模拟来信都需本人�
   });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
-test('功能草稿独立保存，刷新保留长材料和目标的资料选择', async ({ page }) => {
+test('换功能保留同一页文字，刷新保留所选功能、长材料和资料选择', async ({ page }) => {
   await setup(page);
   const features = page.getByRole('group', { name: '选择功能' }),
     longText = '需要整理的材料。'.repeat(90);
-  await page.getByLabel('学习目标', { exact: true }).fill('原来的学习目标');
+  await compose(page, '学习计划', '原来的学习目标');
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await page.getByLabel('预期成果', { exact: true }).fill('能独立解释概念');
   await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
   await features.getByRole('button', { name: '整理材料', exact: true }).click();
-  await expect(page.getByLabel('材料与整理要求')).toHaveValue('');
-  await page.getByLabel('材料与整理要求').fill(longText);
+  // One sheet of paper: changing the tab never discards what was written.
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('原来的学习目标');
+  await page.getByLabel('写下来', { exact: true }).fill(longText);
   await features.getByRole('button', { name: '学习计划', exact: true }).click();
-  await expect(page.getByLabel('学习目标', { exact: true })).toHaveValue('原来的学习目标');
+  await expect(page.getByText('学习目标最多 200 字')).toBeVisible();
+  await expect(page.getByRole('button', { name: '创建学习计划', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await expect(page.getByLabel('预期成果', { exact: true })).toHaveValue('能独立解释概念');
   await expect(page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true })).toBeChecked();
   await features.getByRole('button', { name: '整理材料', exact: true }).click();
   await page.reload();
-  await expect(page.getByLabel('材料与整理要求')).toHaveValue(longText);
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue(longText);
   await expect(features.getByRole('button', { name: '整理材料', exact: true })).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('按写下的内容自动选择功能，可以改，也可以改回识别结果', async ({ page }) => {
+  const state = await setup(page);
+  const features = page.getByRole('group', { name: '选择功能' }),
+    field = page.getByLabel('写下来', { exact: true });
+  await expect(features.getByRole('button', { pressed: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '开始', exact: true })).toBeDisabled();
+  await field.fill('关于课程展示的通知：请于 11 月 10 日 23:59 前将报名表发送至 ta@example.edu。');
+  await expect(features.getByRole('button', { name: '办理通知', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByText(/像一份要办的通知/)).toBeVisible();
+  await field.fill('比较读已提交与可串行化的优缺点，给出反例。');
+  await expect(features.getByRole('button', { name: '深入研究', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  // The owner's choice wins over the guess until they ask for the guess back.
+  await features.getByRole('button', { name: '学习答疑', exact: true }).click();
+  await expect(page.getByRole('button', { name: '开始答疑', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: /改回识别：深入研究/ }).click();
+  await expect(page.getByRole('button', { name: '开始研究', exact: true })).toBeVisible();
+  expect(state.posts).toHaveLength(0);
 });
 
 test('旧版草稿可继续，示例不覆盖输入也不自动提交', async ({ page }) => {
@@ -1270,45 +1300,52 @@ test('旧版草稿可继续，示例不覆盖输入也不自动提交', async ({
     ),
   );
   await page.reload();
-  await expect(page.getByLabel('学习目标', { exact: true })).toHaveValue('升级前未完成的目标');
+  const features = page.getByRole('group', { name: '选择功能' });
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('升级前未完成的目标');
+  await expect(features.getByRole('button', { name: '学习计划', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: '学习设置', exact: true }).click();
+  await expect(page.getByLabel('预期成果', { exact: true })).toHaveValue('保留已有内容');
+  await expect(page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true })).toBeChecked();
   await expect(page.getByRole('button', { name: '填入示例', exact: true })).toBeDisabled();
-  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习答疑', exact: true }).click();
+  await page.getByLabel('写下来', { exact: true }).fill('');
+  await features.getByRole('button', { name: '学习答疑', exact: true }).click();
   await page.getByRole('button', { name: '填入示例', exact: true }).click();
-  await expect(page.getByLabel('学习问题', { exact: true })).toHaveValue(
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue(
     '用一个例子解释数据库的左连接，再出一道练习题。',
   );
   await expect(page.getByRole('button', { name: '填入示例', exact: true })).toBeDisabled();
   expect(state.posts).toHaveLength(0);
-  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习计划', exact: true }).click();
-  await expect(page.getByLabel('学习目标', { exact: true })).toHaveValue('升级前未完成的目标');
 });
 
-test('目标页添加目标打开学习计划，不误入上次的整理材料', async ({ page }) => {
+test('目标页添加目标打开学习计划，但不把未提交的整理材料改成目标', async ({ page }) => {
   await setup(page);
-  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '整理材料', exact: true }).click();
-  await page.getByLabel('材料与整理要求').fill('仍需保留的工作草稿');
+  const features = page.getByRole('group', { name: '选择功能' });
+  await compose(page, '整理材料', '仍需保留的工作草稿');
   await page.getByRole('link', { name: '目标', exact: true }).click();
   await page.getByRole('link', { name: '添加目标', exact: true }).click();
-  await expect(page.getByLabel('学习目标', { exact: true })).toBeVisible();
-  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '整理材料', exact: true }).click();
-  await expect(page.getByLabel('材料与整理要求')).toHaveValue('仍需保留的工作草稿');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('仍需保留的工作草稿');
+  await expect(features.getByRole('button', { name: '整理材料', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('button', { name: '创建学习计划', exact: true })).toHaveCount(0);
+  await page.getByLabel('写下来', { exact: true }).fill('');
+  await page.getByRole('link', { name: '目标', exact: true }).click();
+  await page.getByRole('link', { name: '添加目标', exact: true }).click();
+  await expect(features.getByRole('button', { name: '学习计划', exact: true })).toHaveAttribute('aria-pressed', 'true');
 });
 
-test('首页待办按状态提供动作，常用入口可直接使用', async ({ page }) => {
+test('首页最多列三件等你的事，按状态提供动作；次级功能在侧栏或“更多”', async ({ page }) => {
   const state = await setup(page);
-  await expect(page.getByRole('link', { name: /继续练习/ })).toBeVisible();
+  const waiting = page.getByRole('region', { name: '等你的事' });
+  await expect(waiting.getByRole('link', { name: /继续练习/ })).toBeVisible();
+  await expect(waiting.getByRole('listitem')).toHaveCount(1);
   state.session.state = 'running';
   await page.reload();
-  await page.getByRole('link', { name: /查看进度/ }).click();
+  await waiting.getByRole('link', { name: /查看进度/ }).click();
   await expect(page.getByRole('button', { name: '停止', exact: true })).toBeVisible();
-  await page.getByRole('link', { name: '今天', exact: true }).click();
-  await page.getByRole('link', { name: /规则与流程 已确认/ }).click();
+  await secondary(page, '规则与流程');
   await expect(page.getByRole('heading', { name: '规则与流程', exact: true })).toBeVisible();
-  await page.getByRole('link', { name: '今天', exact: true }).click();
-  await page.getByRole('link', { name: /定时计划 按时准备/ }).click();
+  await secondary(page, '定时计划');
   await expect(page.getByRole('button', { name: '添加计划', exact: true })).toBeVisible();
-  await page.getByRole('link', { name: '今天', exact: true }).click();
-  await page.getByRole('link', { name: /历史记录/ }).click();
+  await secondary(page, '历史');
   await expect(page.getByRole('heading', { name: '历史', exact: true })).toBeVisible();
 });
 
@@ -1380,7 +1417,7 @@ test('历史翻页在新任务插入和事件刷新后保留范围，主动刷�
     state: 'completed',
   }));
   await setup(page, state);
-  await page.getByRole('link', { name: /历史记录 查看/ }).click();
+  await secondary(page, '历史');
   await page.getByRole('button', { name: '下一页', exact: true }).click();
   await expect(page.locator('a[href^="#/session/"]')).toHaveCount(5);
   const before = await page.locator('a[href^="#/session/"]').allTextContents(),
@@ -1424,16 +1461,17 @@ test('首页显示真实目标与待办总数，只展示3项并按需挂载资�
   }));
   await setup(page, state);
   await expect(page.getByRole('link', { name: /查看全部目标（206）/ })).toBeVisible();
-  await expect(page.getByText('7 项', { exact: true })).toBeVisible();
+  await expect(page.getByText('共 7 项', { exact: true })).toBeVisible();
   await expect(page.locator('a[href^="#/session/"]')).toHaveCount(3);
   await expect(page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true })).toHaveCount(0);
+  await page.getByRole('group', { name: '选择功能' }).getByRole('button', { name: '学习计划', exact: true }).click();
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '学习设置', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true })).toBeChecked();
-  await page.getByRole('link', { name: '查看全部待办', exact: true }).click();
+  await page.getByRole('link', { name: /另有 4 项/ }).click();
   await expect(page.getByLabel('任务状态', { exact: true })).toHaveValue('pending');
   await expect(page.getByText('共 7 条', { exact: true })).toBeVisible();
   expect(state.todayReads).toContain('/today/overview');
@@ -1518,7 +1556,7 @@ test('完成独立答疑后可返回工作台，原记录不会新建回答', as
   await page.goto('/#/session/session-1');
   await expect(page.getByText('本轮练习已完成。新的问题可从学习答疑开始。', { exact: true })).toBeVisible();
   await page.getByRole('link', { name: '返回学习工作台', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
   expect(state.posts).toHaveLength(0);
 });
 for (const stateName of ['completed', 'ready'])
@@ -1543,8 +1581,8 @@ for (const appearance of ['light', 'dark'] as const)
     await page.getByLabel('账号', { exact: true }).fill('tester');
     await page.getByLabel('密码', { exact: true }).fill('test-password');
     await page.getByRole('button', { name: '登录', exact: true }).click();
-    await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
-    await page.getByLabel('学习目标', { exact: true }).fill('理解关系模型，完成一次练习。');
+    await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
+    await compose(page, '学习计划', '理解关系模型，完成一次练习。');
     // Measure rendered text over its actual ancestor surfaces, including alpha.
     await expect(async () => {
       const contrast = await page.getByRole('main').evaluate((main) => {
@@ -1559,7 +1597,7 @@ for (const appearance of ['light', 'dark'] as const)
               return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
             })
             .reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i]!, 0);
-        return [...main.querySelectorAll<HTMLElement>('h1,h2,p,button,textarea,[class*="featureDescription"]')]
+        return [...main.querySelectorAll<HTMLElement>('h1,h2,p,button,textarea,[class*="intentLine"]')]
           .filter((element) => element.getClientRects().length && !element.matches(':disabled'))
           .map((element) => {
             const ancestors: Element[] = [];
@@ -1600,6 +1638,7 @@ test('高对比与减少动态模式保留选中状态和键盘操作', async ({
   await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
   await setup(page);
   const selected = page.getByRole('button', { name: '学习计划', exact: true });
+  await selected.click();
   await selected.focus();
   await expect(selected).toBeFocused();
   await expect(selected).toHaveAttribute('aria-pressed', 'true');
@@ -1609,7 +1648,7 @@ test('高对比与减少动态模式保留选中状态和键盘操作', async ({
   await mode.focus();
   await mode.press('Enter');
   await expect(mode).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.getByLabel('学习问题', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '开始答疑', exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 
@@ -1634,19 +1673,19 @@ test('后台异常可见并有处理入口，刷新后显示恢复状态', async
 test('今天会刷新后台状态，持续保存正在输入的草稿', async ({ page }) => {
   await page.clock.install();
   const state = await setup(page);
-  await page.getByLabel('学习目标').fill('保留输入的学习目标');
+  await compose(page, '学习计划', '保留输入的学习目标');
   state.runtimeError = true;
   state.workerOnline = false;
   await page.clock.fastForward(20_001);
   await expect(page.getByText('后台有 1 项检查需要处理。')).toHaveCount(0);
   await expect(page.getByText(/后台尚未运行/)).toBeVisible();
-  await expect(page.getByLabel('学习目标')).toHaveValue('保留输入的学习目标');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('保留输入的学习目标');
 });
 
 test('深入研究保留投入和资料草稿，明确提交后创建任务', async ({ page }, testInfo) => {
   const state = await setup(page);
   await page.getByRole('button', { name: '深入研究', exact: true }).click();
-  await page.getByLabel('研究问题', { exact: true }).fill('对比数据库隔离级别与适用边界。');
+  await page.getByLabel('写下来', { exact: true }).fill('对比数据库隔离级别与适用边界。');
   await page.getByRole('radio', { name: /深入/ }).check();
   await page.getByText('研究资料 · 自动检索', { exact: true }).click();
   await page.getByRole('checkbox', { name: '第一讲：软件工程', exact: true }).check();
@@ -1654,7 +1693,7 @@ test('深入研究保留投入和资料草稿，明确提交后创建任务', as
   await page.getByRole('button', { name: '深入研究', exact: true }).click();
   await page.reload();
   await expect(page.getByRole('radio', { name: /深入/ })).toBeChecked();
-  await expect(page.getByLabel('研究问题', { exact: true })).toHaveValue('对比数据库隔离级别与适用边界。');
+  await expect(page.getByLabel('写下来', { exact: true })).toHaveValue('对比数据库隔离级别与适用边界。');
   await expect(page.getByText('研究资料 · 已选 1 份')).toBeVisible();
   await expect(page.getByText(/≤ 8 次调用/)).toBeVisible();
   expect(state.posts).toHaveLength(0);
@@ -1670,7 +1709,7 @@ test('未连接模型时深入研究不能提交，并指向设置', async ({ pa
   state.modelConfigured = false;
   await setup(page, state);
   await page.getByRole('button', { name: '深入研究', exact: true }).click();
-  await page.getByLabel('研究问题', { exact: true }).fill('比较两种隔离级别。');
+  await page.getByLabel('写下来', { exact: true }).fill('比较两种隔离级别。');
   await expect(page.getByText('深入研究需要先连接模型')).toBeVisible();
   await expect(page.getByRole('button', { name: '开始研究', exact: true })).toBeDisabled();
   expect(state.posts).toHaveLength(0);

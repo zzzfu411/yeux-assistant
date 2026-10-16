@@ -222,8 +222,11 @@ async function setup(page: Page, state = fixture()) {
   await page.getByLabel('账号', { exact: true }).fill('tester');
   await page.getByLabel('密码', { exact: true }).fill('test-password');
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '学习工作台' })).toBeVisible();
-  await page.getByRole('link', { name: /设备控制/ }).click();
+  await expect(page.getByRole('heading', { name: /^今天/, level: 1 })).toBeVisible();
+  // Secondary features live in the sidebar on a computer and under "更多" on a phone.
+  const more = page.getByLabel('更多', { exact: true });
+  if (await more.isVisible()) await more.click();
+  await page.getByRole('link', { name: '设备', exact: true }).click();
   await expect(page.getByRole('heading', { name: '设备', exact: true })).toBeVisible();
   return state;
 }

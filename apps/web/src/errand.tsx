@@ -36,6 +36,26 @@ function download(blob: Blob, name: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** A seal stamped on the sheet for where the errand stands; finished facts only, never a guess. */
+function Seal({ errand, session }: { errand: ErrandDetail; session: LearningSession }) {
+  const [text, tone] = errand.archivedPath
+    ? ['已归档', 'success']
+    : ['queued', 'running'].includes(session.state)
+      ? ['办理中', 'info']
+      : session.state === 'failed'
+        ? ['需处理', 'danger']
+        : errand.state.questions.length
+          ? ['待补充', 'annot']
+          : ['ready', 'completed'].includes(session.state)
+            ? ['已备妥', 'success']
+            : ['', ''];
+  return text ? (
+    <span className={s.seal} data-tone={tone} role="status">
+      {text}
+    </span>
+  ) : null;
+}
+
 /** Facts with their original sentences, the checklist, produced actions and archiving. */
 export function ErrandPanel({ errand, session }: { errand: ErrandDetail; session: LearningSession }) {
   const api = useApi(),
@@ -86,6 +106,10 @@ export function ErrandPanel({ errand, session }: { errand: ErrandDetail; session
       )}
       {facts && (
         <div className={s.factSheet}>
+          <p className={s.sheetSerial} aria-hidden="true">
+            办 事 单 · No. {session.id.slice(0, 6).toUpperCase()}
+          </p>
+          <Seal errand={errand} session={session} />
           <h2>通知要素</h2>
           <p className={s.muted}>每一项都核对过通知原文：日期必须出现在引文中，截止时间不会被当作活动时间。</p>
           <dl>

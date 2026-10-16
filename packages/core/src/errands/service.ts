@@ -2,6 +2,7 @@ import type { PgBoss } from 'pg-boss';
 import type { Store, Tx, Row } from '../../../storage/src/index.js';
 import type { Citation } from '../../../contracts/src/index.js';
 import {
+  ModelErrandMail,
   ModelErrandPlan,
   ModelNoticeFacts,
   type ErrandDetail,
@@ -98,10 +99,15 @@ const EXTRACT =
   '报名截止、材料提交截止、活动开始、活动结束必须分开：截止时间不是活动开始时间。materials 是需要本人准备的材料；actions 是需要本人做的事及途径。';
 const PLAN =
   'ERRAND_PLAN\n根据已核验的通知要素、本人补充和给定的个人资料，准备办理清单。' +
+  'summary 用一两句话（不超过 150 字）说明要做什么、最晚何时；每条 note 不超过 60 字。' +
   'checklist 逐项说明材料或条件：资料中能找到的标 ready 并给 sourceIds；找不到的标 missing；需要本人确认的标 check。' +
   'questions 只问办理所必需、资料中确实没有的信息，最多 4 个；已在“本人补充”里回答过的不要再问。' +
-  '如果通知要求用邮件报名、回复或提交，在 mail 中写好草稿（主题与正文，落款用资料中的本人姓名），否则 needed=false。' +
-  '收件人由程序从通知原文确定，你不要编造邮箱。不得声称已经提交、发送或办理完成。';
+  '如果通知要求用邮件报名、回复或提交，mail.needed=true 并给出主题（按通知对主题的要求）；正文之后单独撰写，这里不要写。否则 needed=false。' +
+  '不得声称已经提交、发送或办理完成。';
+const DRAFT =
+  'ERRAND_MAIL\n按通知要求写这封邮件。主题沿用给定主题，除非通知对主题格式另有要求；落款用资料中的本人姓名。' +
+  '资料和本人补充里没有的个人信息不要编造，用【待填：…】标出。收件人由程序确定，正文不要写邮箱。' +
+  '不得声称附上了资料中没有的附件，也不得声称已经提交或办理完成。';
 
 function render(notice: ErrandNotice, state: ErrandState) {
   const facts = state.facts;
@@ -168,6 +174,23 @@ async function saveState(store: Store, identity: RunIdentity, state: ErrandState
   });
 }
 
+/** The owner's own edits and anything already confirmed are never overwritten. */
+async function letterLocked(tx: Tx, mailSessionId: string, lock = false) {
+  const child = await tx.one('SELECT * FROM app.sessions WHERE id=$1' + (lock ? ' FOR UPDATE' : ''), [mailSessionId]);
+  const edited = await tx.one("SELECT id FROM app.artifacts WHERE session_id=$1 AND provenance='user_revision'", [
+    mailSessionId,
+  ]);
+  const sending = await tx.one(
+    "SELECT id FROM app.approvals WHERE session_id=$1 AND state IN ('pending','approved','executing','uncertain','sent')",
+    [mailSessionId],
+  );
+  return { child, locked: !child || Boolean(edited) || Boolean(sending) || child.state !== 'ready' };
+}
+/** Asking the model for a letter that would not replace the current one only costs time. */
+async function letterTaken(store: Store, mailSessionId: string | null) {
+  return mailSessionId ? (await store.transaction((tx) => letterLocked(tx, mailSessionId))).locked : false;
+}
+
 /** Create or refresh the confirmable email that the notice asks for. It never sends by itself. */
 async function upsertMailDraft(tx: Tx, parent: Row, notice: ErrandNotice, state: ErrandState) {
   const mail = state.plan?.mail;
@@ -178,16 +201,8 @@ async function upsertMailDraft(tx: Tx, parent: Row, notice: ErrandNotice, state:
       : null;
   const subject = reply ? replySubject(reply.subject) : mail.subject.trim() || '关于“' + notice.title + '”';
   if (state.mailSessionId) {
-    const child = await tx.one('SELECT * FROM app.sessions WHERE id=$1 FOR UPDATE', [state.mailSessionId]);
-    const edited = await tx.one("SELECT id FROM app.artifacts WHERE session_id=$1 AND provenance='user_revision'", [
-      state.mailSessionId,
-    ]);
-    const sending = await tx.one(
-      "SELECT id FROM app.approvals WHERE session_id=$1 AND state IN ('pending','approved','executing','uncertain','sent')",
-      [state.mailSessionId],
-    );
-    // The owner's own edits and anything already confirmed are never overwritten.
-    if (child && !edited && !sending && child.state === 'ready') {
+    const { child, locked } = await letterLocked(tx, state.mailSessionId, true);
+    if (child && !locked) {
       await tx.exec(
         'UPDATE app.sessions SET title=$2,content=$3,recipient=$4,revision=revision+1,updated_at=now() WHERE id=$1',
         [child.id, subject, mail.body, mail.to],
@@ -281,7 +296,7 @@ export async function executeErrandRun(store: Store, folder: string, identity: R
       ...facts.actions.map((a) => a.action),
       ...state.answers.map((a) => a.answer),
     ].join(' ');
-    citations = steps.includes('retrieve')
+    const retrieved = steps.includes('retrieve')
       ? (
           await store.transaction(async (tx) => {
             await fence(tx, identity);
@@ -294,58 +309,81 @@ export async function executeErrandRun(store: Store, folder: string, identity: R
         .filter((key) => facts[key].value)
         .map((key) => [factLabels[key], facts[key].value]),
     );
-    const plan = await model.json(
-      ModelErrandPlan,
-      PLAN,
-      {
-        ...base,
-        latest: [
-          '已核验的通知要素：' +
-            JSON.stringify({
-              标题: facts.title,
-              ...compactFacts,
-              材料: facts.materials.map((m) => m.name),
-              待确认: facts.unknowns,
-            }),
-          state.answers.length ? '本人补充：\n' + state.answers.map((a, i) => `${i + 1}. ${a.answer}`).join('\n') : '',
-          '通知原文：\n' + bounded(notice.text, 6000),
-        ]
-          .filter(Boolean)
-          .join('\n\n'),
-        previous: state.plan?.summary || '',
-        sources: citations,
-      },
-      { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
-    );
-    const provided = new Set(model.providedSourceIds);
-    // An address the owner typed in an answer also counts; sending still needs exact approval.
-    const answered = state.answers
-      .flatMap((a) => a.answer.normalize('NFKC').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [])
-      .at(-1)
-      ?.toLowerCase();
-    const to = replyTarget(facts, notice.text, notice.origin) ?? answered ?? null;
-    const wantsMail = plan.mail.needed && steps.includes('draft_mail');
-    let questions = steps.includes('ask_user') ? plan.questions : [];
-    // The recipient question goes first so the four-question limit never drops it.
-    if (wantsMail && !to) questions = ['通知中没有写明可回复的邮箱，邮件应发给谁？', ...questions].slice(0, 4);
-    state.warnings =
-      steps.includes('ask_user') || !plan.questions.length
-        ? []
-        : ['流程未包含追问步骤，以下信息需要自行核对：' + plan.questions.join('；')];
-    if (notice.flow?.steps.includes('ehall_prepare'))
-      state.warnings.push('ehall 步骤本轮暂未接入，未准备任何 ehall 表单。');
-    state.plan = {
-      ...plan,
-      checklist: plan.checklist.map((item) => ({
+    const known = [
+      '已核验的通知要素：' +
+        JSON.stringify({
+          标题: facts.title,
+          ...compactFacts,
+          材料: facts.materials.map((m) => m.name),
+          待确认: facts.unknowns,
+        }),
+      state.answers.length ? '本人补充：\n' + state.answers.map((a, i) => `${i + 1}. ${a.answer}`).join('\n') : '',
+      '通知原文：\n' + bounded(notice.text, 6000),
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    // A retry of this same run already paid for the plan; only the unfinished letter is asked for again.
+    if (!state.plan || state.planRunId !== identity.runId) {
+      const plan = await model.json(
+        ModelErrandPlan,
+        PLAN,
+        { ...base, latest: known, previous: state.plan?.summary || '', sources: retrieved },
+        { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
+      );
+      const provided = new Set(model.providedSourceIds);
+      // An address the owner typed in an answer also counts; sending still needs exact approval.
+      const answered = state.answers
+        .flatMap((a) => a.answer.normalize('NFKC').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [])
+        .at(-1)
+        ?.toLowerCase();
+      const to = replyTarget(facts, notice.text, notice.origin) ?? answered ?? null;
+      const wantsMail = plan.mail.needed && steps.includes('draft_mail');
+      let questions = steps.includes('ask_user') ? plan.questions : [];
+      // The recipient question goes first so the four-question limit never drops it.
+      if (wantsMail && !to) questions = ['通知中没有写明可回复的邮箱，邮件应发给谁？', ...questions].slice(0, 4);
+      state.warnings =
+        steps.includes('ask_user') || !plan.questions.length
+          ? []
+          : ['流程未包含追问步骤，以下信息需要自行核对：' + plan.questions.join('；')];
+      if (notice.flow?.steps.includes('ehall_prepare'))
+        state.warnings.push('ehall 步骤本轮暂未接入，未准备任何 ehall 表单。');
+      const checklist = plan.checklist.map((item) => ({
         ...item,
         sourceIds: item.sourceIds.filter((sid) => provided.has(sid)),
-      })),
-      mail: { ...plan.mail, needed: wantsMail, to },
-    };
-    state.questions = questions;
-    citations = model.providedCitations.filter((c) =>
-      state.plan!.checklist.some((item) => item.sourceIds.includes(c.sourceId)),
-    );
+      }));
+      state.plan = {
+        ...plan,
+        checklist,
+        // Keep the previous letter until a new one is written, so nothing blank reaches the draft.
+        mail: { ...plan.mail, needed: wantsMail, to, body: state.plan?.mail.body || '' },
+      };
+      state.planRunId = identity.runId;
+      state.questions = questions;
+      citations = model.providedCitations.filter((c) => checklist.some((item) => item.sourceIds.includes(c.sourceId)));
+      // The checklist is useful on its own: show it while the letter is being written.
+      if (wantsMail && !questions.length) await saveState(store, identity, state);
+    } else
+      citations = retrieved.filter((c) => state.plan!.checklist.some((item) => item.sourceIds.includes(c.sourceId)));
+    const mail = state.plan!.mail;
+    // Write the letter only when nothing is left to ask and the owner has not taken it over.
+    if (mail.needed && mail.to && !state.questions.length && !(await letterTaken(store, state.mailSessionId))) {
+      const letter = await model.json(
+        ModelErrandMail,
+        DRAFT,
+        {
+          ...base,
+          latest: [
+            known,
+            '邮件主题：' + (mail.subject || notice.title),
+            '材料清单：' + state.plan!.checklist.map((item) => `${item.item}（${item.status}）`).join('；'),
+          ].join('\n\n'),
+          previous: '',
+          sources: retrieved,
+        },
+        { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
+      );
+      state.plan!.mail = { ...mail, subject: letter.subject, body: letter.body };
+    }
   } else {
     state.warnings = ['尚未连接模型：通知原文已保存，连接模型后点“重新准备”即可抽取要素和清单。'];
   }

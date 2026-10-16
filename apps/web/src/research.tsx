@@ -4,6 +4,7 @@ import {
   type ResearchCandidate,
   type ResearchDetail,
 } from '../../../packages/contracts/src/research';
+import { useState } from 'react';
 import { useApi, useAction } from './api';
 import { ErrorNotice, Result, Sources } from './ui';
 import { Icon } from './icons';
@@ -162,9 +163,8 @@ function Candidate({ candidate, best }: { candidate: ResearchCandidate; best: nu
   const adopted = candidate.index === best,
     status = adopted ? '当前采用' : candidate.score === null ? '待评阅' : '未采用';
   return (
-    <details className={s.candidate} data-adopted={adopted}>
-      <summary>
-        <span className={s.candidateIndex}>第 {candidate.index + 1} 版</span>
+    <article className={s.candidate} data-adopted={adopted}>
+      <header className={s.candidateHead}>
         <span className={s.candidateStrategy}>
           {shortStrategy(candidate.strategy)}
           {candidate.parent !== null && <small>基于第 {candidate.parent + 1} 版</small>}
@@ -182,7 +182,7 @@ function Candidate({ candidate, best }: { candidate: ResearchCandidate; best: nu
         <span className={s.candidateStatus} data-adopted={adopted}>
           {status}
         </span>
-      </summary>
+      </header>
       <div className={s.candidateBody}>
         <p className={s.muted}>引导策略：{candidate.strategy}</p>
         {candidate.review && (
@@ -239,7 +239,60 @@ function Candidate({ candidate, best }: { candidate: ResearchCandidate; best: nu
         )}
         {candidate.reviewNote && <p className={s.candidateNote}>{candidate.reviewNote}</p>}
       </div>
-    </details>
+    </article>
+  );
+}
+
+/** Versions as page tabs of a lab notebook; the adopted one opens first. Arrow keys move between tabs. */
+function Versions({ state }: { state: ResearchDetail['state'] }) {
+  const [chosen, setChosen] = useState<number | null>(null);
+  const shown = chosen ?? state.best ?? state.candidates.length - 1,
+    candidate = state.candidates[shown] ?? state.candidates.at(-1)!;
+  const move = (step: number) => {
+    const next = (candidate.index + step + state.candidates.length) % state.candidates.length;
+    setChosen(next);
+    document.getElementById('version-tab-' + next)?.focus();
+  };
+  return (
+    <>
+      <div
+        className={s.versionTabs}
+        role="tablist"
+        aria-label="候选版本"
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowRight') move(1);
+          else if (event.key === 'ArrowLeft') move(-1);
+        }}
+      >
+        {state.candidates.map((item) => {
+          const selected = item.index === candidate.index;
+          return (
+            <button
+              key={item.index}
+              id={'version-tab-' + item.index}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              aria-controls="version-panel"
+              tabIndex={selected ? 0 : -1}
+              data-adopted={item.index === state.best}
+              onClick={() => setChosen(item.index)}
+            >
+              <span>第 {item.index + 1} 版</span>
+              <small>{item.index === state.best ? '采用' : item.score === null ? '待评阅' : item.score + ' 分'}</small>
+            </button>
+          );
+        })}
+      </div>
+      <div
+        id="version-panel"
+        role="tabpanel"
+        aria-labelledby={'version-tab-' + candidate.index}
+        className={s.versionPanel}
+      >
+        <Candidate candidate={candidate} best={state.best} key={candidate.index} />
+      </div>
+    </>
   );
 }
 
@@ -343,11 +396,7 @@ export function ResearchProgress({
         <>
           <h3 className={s.timelineTitle}>候选版本与查证（{state.candidates.length}）</h3>
           <p className={s.muted}>评分来自模型，只用于挑选版本；引文仅确认与原文一致，不代表结论必然正确。</p>
-          <div className={s.timeline}>
-            {state.candidates.map((candidate) => (
-              <Candidate candidate={candidate} best={state.best} key={candidate.index} />
-            ))}
-          </div>
+          <Versions state={state} />
         </>
       )}
       {detail.sourceVersions.length > 0 && (

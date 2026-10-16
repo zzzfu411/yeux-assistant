@@ -1,5 +1,10 @@
 import type { Store, Tx } from '../../../storage/src/index.js';
-import { ResearchOptions, type ResearchState, type ResearchDetail } from '../../../contracts/src/research.js';
+import {
+  ResearchOptions,
+  stepRetries,
+  type ResearchState,
+  type ResearchDetail,
+} from '../../../contracts/src/research.js';
 import type { Citation } from '../../../contracts/src/index.js';
 import { AppError, digest, event, id, notify } from '../common.js';
 import { config, modelFor } from '../config.js';
@@ -49,6 +54,46 @@ export async function researchSources(tx: Tx, sources: Snapshot['sources'], quer
   return result.slice(0, 12);
 }
 
+const transient = (error: unknown) =>
+  error instanceof AppError && error.status >= 500 && error.code !== 'model_time_budget';
+
+/**
+ * "重新准备" after a failure continues from the saved candidates of the previous run instead of paying
+ * for the same solve again. Only the same model settings may continue; otherwise the research restarts.
+ */
+async function resumeFrom(
+  tx: Tx,
+  sessionId: string,
+  priorRunId: unknown,
+  fingerprint: string,
+  effort: ResearchState['effort'],
+): Promise<{ snapshot: Snapshot; state: ResearchState } | null> {
+  if (typeof priorRunId !== 'string') return null;
+  const prior = await tx.one(
+    'SELECT w.snapshot,w.state FROM app.research_workspaces w JOIN app.runs r ON r.id=w.run_id WHERE w.run_id=$1 AND r.session_id=$2',
+    [priorRunId, sessionId],
+  );
+  const state = prior?.state as ResearchState | undefined;
+  if (!prior || !state?.candidates.length || state.stopReason === 'accepted' || state.effort !== effort) return null;
+  if ((prior.snapshot as Snapshot).modelFingerprint !== fingerprint) return null;
+  const last = state.candidates.at(-1)!,
+    pending = effort !== 'direct' && !last.review;
+  const reviewed = state.candidates.length - (pending ? 1 : 0);
+  return {
+    snapshot: prior.snapshot as Snapshot,
+    state: {
+      ...state,
+      phase: pending ? 'review' : 'solve',
+      stopReason: null,
+      offset: reviewed,
+      retried: 0,
+      warnings: [
+        `接续上一轮已保存的 ${state.candidates.length} 份候选${pending ? '，先补做未完成的评阅' : ''}；本轮预算单独计算。`,
+      ],
+    },
+  };
+}
+
 async function initialize(
   store: Store,
   folder: string,
@@ -62,6 +107,16 @@ async function initialize(
     const saved = await tx.one('SELECT snapshot,state FROM app.research_workspaces WHERE run_id=$1', [run.id]);
     if (saved) return saved as { snapshot: Snapshot; state: ResearchState };
     const options = ResearchOptions.parse(session.research);
+    const resumed = await resumeFrom(tx, session.id, run.input.resumeFrom, digest(settings), options.effort);
+    if (resumed) {
+      await tx.exec('INSERT INTO app.research_workspaces(run_id,snapshot,state) VALUES($1,$2,$3)', [
+        run.id,
+        JSON.stringify(resumed.snapshot),
+        JSON.stringify(resumed.state),
+      ]);
+      await event(tx, 'research.started', session.id, { runId: run.id, effort: options.effort, resumed: true });
+      return resumed;
+    }
     const sources = await tx.rows(
       `SELECT id,version,digest,title FROM app.sources WHERE archived_at IS NULL AND missing_at IS NULL
       AND (path IS NULL OR path NOT LIKE 'workspace/profile/%')
@@ -146,8 +201,11 @@ export async function executeResearchRun(store: Store, folder: string, identity:
   const model = new ModelGateway(store, folder, identity);
   while (state.phase !== 'finished') {
     const current = await readContext(store, identity);
+    const callsLeft = current.run.max_model_calls - current.run.model_calls;
     if (
-      current.run.model_calls >= current.run.max_model_calls ||
+      callsLeft <= 0 ||
+      // A new version that cannot be reviewed can never be adopted, so the last call is not spent on it.
+      (state.phase === 'solve' && state.effort !== 'direct' && callsLeft < 2) ||
       new Date(current.run.deadline).getTime() - Date.now() <= 5000
     ) {
       state = { ...state, phase: 'finished', stopReason: 'budget' };
@@ -174,6 +232,25 @@ export async function executeResearchRun(store: Store, folder: string, identity:
       state = next;
     } catch (error) {
       if (error instanceof StaleRun || error instanceof RuntimeLimit) throw error;
+      const left = await readContext(store, identity);
+      // A broken stream, a 5xx or a malformed answer repeats this one step while the budget allows it.
+      if (
+        transient(error) &&
+        (state.retried ?? 0) < stepRetries(state.effort) &&
+        // A repeated solve is only worth it if a review can still follow.
+        left.run.max_model_calls - left.run.model_calls >=
+          (state.phase === 'solve' && state.effort !== 'direct' ? 2 : 1) &&
+        new Date(left.run.deadline).getTime() - Date.now() > 60000
+      ) {
+        const step = state.phase === 'review' ? '评阅' : '求解';
+        state = {
+          ...state,
+          retried: (state.retried ?? 0) + 1,
+          warnings: [...state.warnings, `${step}时遇到服务错误，已自动重试这一步：${publicRuntimeError(error)}`],
+        };
+        await saveState(store, identity, state);
+        continue;
+      }
       if (!bestCandidate(state)) throw error;
       state = {
         ...state,

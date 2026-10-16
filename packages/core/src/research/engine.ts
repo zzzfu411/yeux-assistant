@@ -264,7 +264,7 @@ export async function advanceResearch(
   if (satisfied && (state.effort !== 'high' || next.candidates.length >= 2)) {
     next.phase = 'finished';
     next.stopReason = 'accepted';
-  } else if (next.candidates.length >= RESEARCH_BUDGETS[state.effort].candidates) {
+  } else if (next.candidates.length - (next.offset ?? 0) >= RESEARCH_BUDGETS[state.effort].candidates) {
     next.phase = 'finished';
     next.stopReason = 'budget';
   } else next.phase = 'solve';

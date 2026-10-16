@@ -22,7 +22,9 @@ const notice =
 describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (synthetic mailbox and model)', () => {
   let built: Awaited<ReturnType<typeof buildServer>>, folder: string, model: Server, token: string;
   const instructions: string[] = [];
-  let proposalDelay = 0;
+  let proposalDelay = 0,
+    planQuestions: string[] = [],
+    failMail = 0;
   beforeEach(async () => {
     if (!new URL(url!).pathname.endsWith('_runtime_test')) throw new Error('Isolated runtime test DB required');
     const setup = new Store(url!);
@@ -35,6 +37,8 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
     token = (await readFile(join(folder, 'access-token'), 'utf8')).trim();
     instructions.length = 0;
     proposalDelay = 0;
+    planQuestions = [];
+    failMail = 0;
     model = createServer(async (request, response) => {
       let raw = '';
       for await (const chunk of request) raw += chunk;
@@ -42,6 +46,12 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
       instructions.push(system.split('\n')[1] || '');
       if (system.includes('RULE_PROPOSAL') && proposalDelay)
         await new Promise((resolve) => setTimeout(resolve, proposalDelay));
+      if (system.includes('ERRAND_MAIL') && failMail > 0) {
+        failMail--;
+        response.writeHead(500, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'upstream busy' } }));
+        return;
+      }
       const content = system.includes('MAIL_REPLY')
         ? {
             subject: 'Re: 组会报告安排',
@@ -68,16 +78,18 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
             ? {
                 summary: '需要在 11 月 10 日前邮件报名。',
                 checklist: [{ item: '报名表', status: 'missing', note: '资料中没有模板', sourceIds: ['not-provided'] }],
-                questions: [],
-                mail: { needed: true, subject: '展示报名+张同学', body: '老师好：我报名参加课程展示。张同学' },
+                questions: planQuestions,
+                mail: { needed: true, subject: '展示报名+张同学' },
                 todos: [{ title: '填写报名表', due: '2026-11-10' }],
               }
-            : {
-                key: 'Mail Greeting',
-                scope: 'mail',
-                content: '给老师的邮件以“老师好”开头。',
-                rationale: '本人把称呼改为老师好',
-              };
+            : system.includes('ERRAND_MAIL')
+              ? { subject: '展示报名+张同学', body: '老师好：我报名参加课程展示。张同学' }
+              : {
+                  key: 'Mail Greeting',
+                  scope: 'mail',
+                  content: '给老师的邮件以“老师好”开头。',
+                  rationale: '本人把称呼改为老师好',
+                };
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(
         JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) } }], usage: { total_tokens: 10 } }),
@@ -255,6 +267,12 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
       ]),
     ).toEqual({ max_model_calls: 5, max_seconds: 480 });
     await execute(created.sessionId, executeErrandRun);
+    // Nothing to ask: the plan is followed by one separate call for the letter.
+    expect(instructions.filter((line) => line.startsWith('ERRAND'))).toEqual([
+      'ERRAND_EXTRACT',
+      'ERRAND_PLAN',
+      'ERRAND_MAIL',
+    ]);
     const detail = (await api('GET', '/sessions/' + created.sessionId)).json();
     const facts = detail.errand.state.facts;
     expect(facts.eventStart.value).toBeNull();
@@ -295,6 +313,42 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
       await api('POST', `/sessions/${created.sessionId}/errand/archive`, { revision: detail.session.revision })
     ).json();
     expect(replay.commit).toBe(archived.commit);
+  });
+
+  it('asks before writing the letter, writes it once after the answer, and a retry reuses the saved plan', async () => {
+    planQuestions = ['请提供你的学号。'];
+    const created = (await api('POST', '/errands', { text: notice })).json();
+    await execute(created.sessionId, executeErrandRun);
+    let detail = (await api('GET', '/sessions/' + created.sessionId)).json();
+    expect(detail.session.state).toBe('waiting_feedback');
+    expect(detail.errand.state.questions).toEqual(['请提供你的学号。']);
+    // A letter written before the answer would be thrown away: it is not requested yet.
+    expect(instructions.filter((line) => line === 'ERRAND_MAIL')).toHaveLength(0);
+    expect(detail.errand.mailSession).toBeNull();
+
+    planQuestions = [];
+    failMail = 1;
+    const answered = await api('POST', `/sessions/${created.sessionId}/feedback`, {
+      revision: detail.session.revision,
+      answer: '学号 MG00000001',
+    });
+    expect(answered.statusCode).toBe(202);
+    // The letter request fails once; the checklist is already saved for the owner to read.
+    await expect(execute(created.sessionId, executeErrandRun)).rejects.toThrow(/HTTP 500/);
+    detail = (await api('GET', '/sessions/' + created.sessionId)).json();
+    expect(detail.errand.state.plan.checklist[0].item).toBe('报名表');
+    const plans = instructions.filter((line) => line === 'ERRAND_PLAN').length;
+
+    // The retry of that same run asks only for the letter, not for a second plan or extraction.
+    const run = (await built.store.one('SELECT current_run_id FROM app.sessions WHERE id=$1', [created.sessionId]))!;
+    const claim = (await claimRun(built.store, run.current_run_id))!;
+    await executeErrandRun(built.store, folder, { runId: claim.id, generation: claim.generation });
+    expect(instructions.filter((line) => line === 'ERRAND_PLAN')).toHaveLength(plans);
+    expect(instructions.filter((line) => line === 'ERRAND_EXTRACT')).toHaveLength(1);
+    detail = (await api('GET', '/sessions/' + created.sessionId)).json();
+    expect(detail.session.state).toBe('ready');
+    expect(detail.errand.mailSession).toMatchObject({ recipient: 'gse-ta@example.edu', state: 'ready' });
+    expect(detail.errand.state.answers).toHaveLength(1);
   });
 
   it('turns an owner edit into an unconfirmed rule proposal, never straight into Git', async () => {

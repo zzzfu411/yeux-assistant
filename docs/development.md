@@ -16,6 +16,23 @@ tests/              单元、数据库、进程恢复与浏览器测试
 
 业务表位于 PostgreSQL `app` schema，pg-boss 使用 `queue`，LangGraph 使用 `checkpoints`。默认两路学习执行，同目标串行，普通学习单次最多 5 次模型调用、180 秒；研究任务按 `research.effort` 使用 1/4/8 次、150/420/840 秒预算；评阅可走可选的独立评阅模型（`llm.review`）。自动重试共享原预算。同一目标最多一个待反馈步骤。
 
+## 执行内核
+
+四类任务各有一个执行器，由 `packages/core/src/executors.ts` 按会话类型选择：学习（`learning.ts`）、深入研究（`research/service.ts`）、邮件回复（`mail/reply.ts`）、办理通知（`errands/service.ts`）。它们共用同一套运行规则（`runtime-state.ts`）：
+
+- **围栏**：`fence` 在每个事务里核对 run 的代际、状态与截止时间，取消或被替代的旧执行写不进新状态。
+- **步骤回执**：`step(identity, name, { input }, compute, commit)` 在事务外执行 `compute`（模型调用放这里），再把结果、`commit` 的业务写入和 `app.run_steps` 回执放进同一个事务。同一 run 的后台重试直接重放回执；本人“重新准备”产生的新 run 带 `input.resumeFrom`，只有同名且输入摘要（`input_digest`）不变的步骤才沿用上一轮结果，并记下 `reused_from`。有新补充或资料变化时摘要不同，会重新调用。
+- **瞬时错误**：`transient` 判断 5xx、流中断与结构不合格；研究在预算允许时在本轮内重做这一步，其他流程交给 Worker 的整轮重试（最多 3 代，预算不重置）。
+- **调用记录**：每次模型请求在预算事务里写一行 `app.model_calls`（所属步骤、profile、模型、是否用结构化输出），结束后补首字节时间、总耗时、输入 / 输出 / 推理 token 与结果。记录不经围栏，迟到或被取消的调用也会留下。任务页“运行记录”与 `GET /api/v2/sessions/:id/trace` 读取最近 5 轮。
+
+只有学习流程使用 LangGraph：它需要在图中途停下等本人作答，再从检查点恢复（`interrupt` / `Command`）。研究、邮件和办事都是“几步顺序调用 + 业务表”，用步骤回执即可恢复，不需要第二套检查点。学习节点的回执同样存放在 `app.run_steps`（`commitNode`），因此恢复规则只有一处。
+
+### 模型调用配置
+
+每次调用声明一个 profile（`packages/core/src/model-profiles.ts`）：`extract`、`plan`、`draft`、`solve`、`explore`、`review`、`assess`、`lesson`、`default`。默认输出上限仍为 4096，只在温度上区分：抽取与评阅为 0，研究另辟方向为 0.8。`config.llm.profiles.<名称>` 可以覆盖 `model`、`max_tokens`、`temperature`、`reasoning_effort`；地址和密钥始终沿用主模型（独立评阅模型除外），密钥不会随 profile 换地址。设置页的“快速步骤模型”只写 `extract` 与 `draft` 两项的 `model`。
+
+请求默认带 `response_format: json_schema` 并流式返回。服务拒绝（400 / 422）时依次去掉结构化输出、再去掉流式，被拒绝的请求没有生成内容，不计入调用次数；同一执行进程记住被拒绝的形式，之后直接用可用的形式。
+
 ## 本地开发
 
 Node.js 24 LTS、pnpm 9。依赖版本以 lockfile 为准。
@@ -65,6 +82,8 @@ python3 -m unittest discover -s tests -p test_prepare_courses.py
 ## 资料与事件一致性
 
 `Sources` 管理导入查重、版本更新与软归档。资料摘要不携带整份提取页码；详情读取指定版本。Web 管理的文本不被磁盘扫描覆盖，归档和扫描采用相同资料锁串行化。目标编辑保留原来的归档关联，新建关联则拒绝归档资料。
+
+检索（`knowledge.ts` 的 `retrieve`、研究的 `researchSources`）使用迁移 `0017` 的索引列 `app.chunks.lexemes`：`app.search_terms` 先做 NFKC 与小写，英文词两个字符以上整体保留，汉字连续段取两字词与单字；`packages/core/src/search.ts` 是它的 TypeScript 镜像，测试逐份核对两边一致。查询按 IDF 选词（最多 64 个，语料 20 个片段以上时去掉出现在一半以上片段的词），最稀有的几个词经 GIN 索引筛候选（合计不超过 600 个片段），再按 BM25（k1=1.2，b=0.75）排序。GIN 索引关闭 pending list，避免批量导入后检索变慢。`pnpm retrieval:eval` 用固定合成案例对比旧实现，见 [质量检查说明](../quality/README.md#检索基准)。
 
 `events.id` 只代表分配顺序。已提交事件经独立串行发布分配 `stream_id`，SSE 使用该游标，避免长事务晚提交导致事件漏读。数据库恢复后若浏览器游标超出当前流，发送 `stream.reset` 让浏览器重新拉取状态。写入背压时保留连接待发送位置，退出登录会关闭流。
 

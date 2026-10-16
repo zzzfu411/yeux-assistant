@@ -23,6 +23,9 @@ const runStates: Record<string, string> = {
 export function stepLabel(name: string) {
   const research = /^(solve|review):(\d+)$/.exec(name);
   if (research) return (research[1] === 'solve' ? '求解第 ' : '评阅第 ') + (Number(research[2]) + 1) + ' 版';
+  const compared = /^compare:(\d+)-(\d+)$/.exec(name);
+  if (compared) return `比较第 ${Number(compared[1]) + 1} 与第 ${Number(compared[2]) + 1} 版`;
+  if (name === 'roots') return '两个方向并行求解';
   return (
     {
       extract: '抽取通知要素',

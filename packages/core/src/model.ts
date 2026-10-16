@@ -16,7 +16,7 @@ export type ModelContext = {
   notes: string[];
   sources: Citation[];
 };
-export function boundedContext(input: ModelContext, limit = 24000, assessment = false) {
+export function boundedContext(input: ModelContext, limit = 24000, assessment = false, previousLimit = 12000) {
   const mandatory = JSON.stringify({
     task: input.task,
     latestUserInput: input.latest,
@@ -28,7 +28,7 @@ export function boundedContext(input: ModelContext, limit = 24000, assessment = 
   // A grading request needs the actual delivered exercise, including its start.
   // If it cannot fit, omit it rather than quietly grading a partial question.
   let previous = assessment
-    ? input.previous.length <= 12000
+    ? input.previous.length <= previousLimit
       ? input.previous
       : ''
     : input.previous.slice(-Math.min(4000, Math.floor(remaining / 3)));
@@ -272,6 +272,9 @@ export type ModelCallOptions = {
   role?: 'solve' | 'review';
   /** Sampling and model choice for this step; see MODEL_PROFILES. */
   profile?: ModelProfile;
+  /** Characters of context; a comparison carries two complete answers and needs more room. */
+  contextLimit?: number;
+  previousLimit?: number;
 };
 /** One call's result with exactly what was sent, so concurrent calls never share mutable state. */
 export type ModelCall<T> = {
@@ -328,8 +331,9 @@ export class ModelGateway {
     if (!settings?.base_url || !settings?.model) throw new AppError('尚未配置模型。');
     const bounded = boundedContext(
       settings.tools === false ? { ...context, sources: [], previous: '' } : context,
-      24000,
+      Math.min(32000, options.contextLimit ?? 24000),
       Boolean(options.assessment),
+      Math.min(16000, options.previousLimit ?? 12000),
     );
     if (options.requireCompletePrevious && context.previous && !bounded.exerciseComplete)
       throw new AppError('候选答案不能完整放入评阅上下文，请缩短问题或开启资料引用。', 409, 'research_context');

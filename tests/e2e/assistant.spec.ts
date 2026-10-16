@@ -1788,3 +1788,76 @@ test('研究记录展示保留版本、未完整报告的用量和导出', async
   await panel.getByRole('button', { name: '导出研究记录' }).click();
   expect((await download).suggestedFilename()).toBe('research-session-1.json');
 });
+test('第二版研究记录展示两个方向、盲评胜负与搜索路径', async ({ page }, testInfo) => {
+  const state = fixture();
+  state.session.kind = 'work';
+  state.session.goalId = null;
+  state.session.state = 'ready';
+  const scores = (n: number) => ({ coverage: n, evidence: n, challenges: n, usability: n });
+  const candidate = (index: number, parent: number | null, branch: number, strategy: string, score: number) => ({
+    index,
+    strategy,
+    parent,
+    branch,
+    answer: { content: '第 ' + (index + 1) + ' 版答案', citations: [], limitations: [] },
+    citations: [],
+    review: { scores: scores(score), rationale: '依据', issues: [], queries: [], satisfied: false },
+    score: score * 4,
+    accepted: index === 2,
+    reviewNote: '',
+  });
+  state.research = {
+    runId: 'run-1',
+    model: 'fixture',
+    sourceVersions: [],
+    calls: 7,
+    maxCalls: 8,
+    elapsedMs: 4200,
+    usage: { promptTokens: 7000, completionTokens: 3500, totalTokens: 10500, reportedCalls: 7, complete: true },
+    state: {
+      version: 2,
+      effort: 'high',
+      phase: 'finished',
+      stopReason: 'plateau',
+      best: 2,
+      warnings: [],
+      candidates: [
+        candidate(0, null, 0, '直接依据资料回答，明确证据不足之处。', 2),
+        {
+          ...candidate(1, null, 1, '探索另一方向：先提出一个与常见答案不同的解释或方案。', 3),
+          comparison: { against: 0, winner: 'new', order: 'incumbent-first', reasons: ['另一方向补充了反例。'] },
+        },
+        {
+          ...candidate(2, 1, 1, '根据评阅指出的漏洞和补充资料，逐项修改当前较好答案。', 3),
+          comparison: { against: 1, winner: 'new', order: 'new-first', reasons: ['修改版补齐了引用。'] },
+        },
+        {
+          ...candidate(3, 2, 1, '构造最简单的反例或边界情况，验证当前较好答案的关键假设。', 3),
+          comparison: { against: 2, winner: 'tie', order: 'incumbent-first', reasons: ['两份不分高下。'] },
+        },
+      ],
+    },
+  };
+  await setup(page, state);
+  await page.goto('/#/session/session-1');
+  const panel = page.getByRole('region', { name: '研究记录' });
+  await expect(page.getByText('连续两次修改未胜出，提前结束')).toBeVisible();
+  await expect(panel).toContainText('/ 16 万');
+  const tree = panel.getByRole('list', { name: '搜索路径' });
+  await expect(tree).toContainText('第 1 版 · 求解');
+  await expect(tree).toContainText('第 2 版 · 另一方向 胜过第 1 版');
+  await expect(tree).toContainText('第 4 版 · 反例检查 平第 3 版');
+  // The kept version opens first; the other tabs show how each one fared.
+  await expect(panel.getByRole('tab', { name: /^第 3 版/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(panel.getByRole('tab', { name: /^第 4 版/ })).toContainText('平第 3 版');
+  await expect(panel).toContainText('与第 2 版盲评比较：本版胜出');
+  await expect(panel).toContainText('本版为 A（在前）');
+  await panel.getByRole('tab', { name: /^第 4 版/ }).click();
+  await expect(panel).toContainText('不分高下，保留原版');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({
+    path: testInfo.outputPath('research-record-v2.png'),
+    fullPage: true,
+    animations: 'disabled',
+  });
+});

@@ -17,6 +17,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
   let built: Awaited<ReturnType<typeof buildServer>>, folder: string, server: Server, supervisor: RunSupervisor;
   let token: string;
   let calls: number, failing: number[], holdAt: number, reserveBudgetAt: number, release: (() => void) | undefined;
+  let tokensPerCall: number;
   const beforeURL = process.env.DATABASE_URL,
     beforeFolder = process.env.ASSISTANT_DATA;
   beforeEach(async () => {
@@ -36,6 +37,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     failing = [];
     holdAt = 0;
     reserveBudgetAt = 0;
+    tokensPerCall = 50;
     release = undefined;
     process.env.DATABASE_URL = url!;
     process.env.ASSISTANT_DATA = folder;
@@ -51,24 +53,40 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
       const finish = () => {
         const user = JSON.parse(input.messages[1].content.split('\n')[1]);
         const ref = user.originalSources[0];
-        const content = input.messages[0].content.includes('LAB2_SOLVE')
+        const system = input.messages[0].content as string;
+        // The synthetic judge prefers the newer answer, whichever position it is shown in.
+        const shown = system.includes('LAB2_COMPARE') ? JSON.parse(user.generatedConversationContext) : null;
+        const generation = (answer: { content: string }) => Number(/第 (\d+) 次/.exec(answer.content)?.[1] ?? 0);
+        const content = system.includes('LAB2_SOLVE')
           ? {
               content: '第 ' + n + ' 次生成：事务隔离需要结合并发场景。',
               citations: ref ? [{ sourceId: ref.sourceId, version: ref.version, quote: ref.quote.slice(0, 10) }] : [],
               limitations: ['尚需核对适用场景'],
             }
-          : {
-              scores: { coverage: n === 4 ? 1 : 3, evidence: 3, challenges: 2, usability: 3 },
-              issues: ['需要补充反例'],
-              queries: ['并发'],
-              rationale: '候选的边界讨论仍不完整。',
-              satisfied: false,
-            };
+          : shown
+            ? {
+                scores: {
+                  A: { coverage: 3, evidence: 3, challenges: 2, usability: 3 },
+                  B: { coverage: 3, evidence: 3, challenges: 2, usability: 3 },
+                },
+                winner: generation(shown.A) > generation(shown.B) ? 'A' : 'B',
+                reasons: ['较新的版本补充了并发反例。'],
+                issues: ['需要补充反例'],
+                queries: ['并发'],
+                satisfied: false,
+              }
+            : {
+                scores: { coverage: n === 4 ? 1 : 3, evidence: 3, challenges: 2, usability: 3 },
+                issues: ['需要补充反例'],
+                queries: ['并发'],
+                rationale: '候选的边界讨论仍不完整。',
+                satisfied: false,
+              };
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(
           JSON.stringify({
             choices: [{ message: { content: failing.includes(n) ? 'invalid JSON' : JSON.stringify(content) } }],
-            usage: { prompt_tokens: 30, completion_tokens: 20, total_tokens: 50 },
+            usage: { prompt_tokens: tokensPerCall - 20, completion_tokens: 20, total_tokens: tokensPerCall },
           }),
         );
       };
@@ -118,21 +136,41 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     }
     throw new Error('Expected progress not reached');
   }
-  it('creates once, executes eight calls in the child, preserves the best, and exports an authenticated workspace', async () => {
+  it('creates once, runs two roots in parallel then compares and deepens, and exports an authenticated workspace', async () => {
     const item = await create();
     expect(await create()).toEqual(item);
     await supervisor.handle(item.runId);
     const detail = await built.app.session(item.sessionId);
     expect(detail.session.state).toBe('ready');
-    expect(calls).toBe(8);
-    expect(detail.research?.state.best).toBe(0);
+    // Two roots, their comparison, then two revisions each compared with the kept version.
+    expect(calls).toBe(7);
+    expect(detail.research?.state.version).toBe(2);
+    expect(detail.research?.state.best).toBe(3);
     expect(detail.research?.state.candidates).toHaveLength(4);
-    expect(detail.research?.usage).toMatchObject({ totalTokens: 400, complete: true });
+    expect(detail.research?.state.candidates.map((c) => c.parent)).toEqual([null, null, expect.any(Number), 2]);
+    expect(detail.research?.usage).toMatchObject({ totalTokens: 350, complete: true });
+    const steps = await built.store.rows('SELECT name FROM app.run_steps WHERE run_id=$1 ORDER BY finished_at', [
+      item.runId,
+    ]);
+    // Which root wins depends on which parallel answer the server numbered later.
+    expect(steps.map((row) => row.name)).toEqual([
+      'roots',
+      'compare:0-1',
+      'solve:2',
+      expect.stringMatching(/^compare:[01]-2$/),
+      'solve:3',
+      'compare:2-3',
+    ]);
+    const roots = await built.store.rows("SELECT step FROM app.model_calls WHERE run_id=$1 AND step='roots'", [
+      item.runId,
+    ]);
+    expect(roots).toHaveLength(2);
     await supervisor.handle(item.runId);
-    expect(calls).toBe(8);
+    expect(calls).toBe(7);
+    // Each newly adopted version is kept once: the winning root, then each winning revision.
     expect(
       (await built.store.one('SELECT count(*) n FROM app.artifacts WHERE session_id=$1', [item.sessionId]))?.n,
-    ).toBe('1');
+    ).toBe('3');
     expect(
       (await built.server.inject({ url: '/api/v2/sessions/' + item.sessionId + '/research/export' })).statusCode,
     ).toBe(401);
@@ -169,7 +207,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     expect(detail.research?.usage.totalTokens).toBe(200); // malformed paid responses are counted
   });
   it('cancels a running review without publishing its late response or erasing the saved candidate', async () => {
-    const item = await create();
+    const item = await create('low');
     holdAt = 2;
     const pending = supervisor.handle(item.runId);
     await waitFor(() => Boolean(release));
@@ -199,10 +237,10 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     await supervisor.handle(item.runId);
     const detail = await built.app.session(item.sessionId);
     expect(detail.session.state).toBe('ready');
-    // Solve, review, failed solve, its retry, review, solve, review; one call left cannot fund a reviewed version.
-    expect(calls).toBe(7);
+    // Two roots, a malformed comparison and its repeat, then two compared revisions: all eight calls.
+    expect(calls).toBe(8);
     expect(detail.research?.state.retried).toBe(1);
-    expect(detail.research?.state.candidates).toHaveLength(3);
+    expect(detail.research?.state.candidates).toHaveLength(4);
     expect(detail.research?.state.candidates.every((candidate) => candidate.review)).toBe(true);
     expect(detail.research?.state.stopReason).toBe('budget');
     expect(detail.research?.state.warnings.join()).toContain('已自动重试');
@@ -221,7 +259,7 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     await supervisor.handle(retry.runId);
     const detail = await built.app.session(item.sessionId);
     expect(detail.session.state).toBe('ready');
-    // The new run reviews the saved first answer instead of solving it again: review, solve, review.
+    // The new run reviews the saved first answer instead of solving it again: review, solve, compare.
     expect(calls).toBe(6);
     expect(detail.research?.state.candidates[0]?.answer.content).toContain('第 1 次生成');
     expect(detail.research?.state.candidates).toHaveLength(2);
@@ -245,6 +283,17 @@ describe.runIf(Boolean(url))('durable research on PostgreSQL and the real API / 
     expect(new Date(run.finished_at).getTime()).toBeLessThan(new Date(run.deadline).getTime());
     expect(supervisor.children.size).toBe(0);
     release?.();
+  });
+  it('stops before a step that would cross the reported token ceiling', async () => {
+    const item = await create('low');
+    tokensPerCall = 30000;
+    await supervisor.handle(item.runId);
+    const detail = await built.app.session(item.sessionId);
+    // 30k + 30k fits under the 80k ceiling; a third 30k call would not.
+    expect(calls).toBe(2);
+    expect(detail.session.state).toBe('ready');
+    expect(detail.research?.state).toMatchObject({ stopReason: 'budget', best: 0 });
+    expect(detail.research?.state.warnings.join()).toContain('80,000 的上限');
   });
   it('keeps direct solving at one call and refuses invalid source selections', async () => {
     const item = await create('direct');

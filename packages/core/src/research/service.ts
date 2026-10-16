@@ -1,5 +1,6 @@
 import type { Store, Tx, Row } from '../../../storage/src/index.js';
 import {
+  RESEARCH_BUDGETS,
   ResearchOptions,
   stepRetries,
   type ResearchState,
@@ -21,7 +22,7 @@ import {
   publicRuntimeError,
   type RunIdentity,
 } from '../runtime-state.js';
-import { advanceResearch, bestCandidate, initialResearch, summarizeUsage } from './engine.js';
+import { advanceResearch, bestCandidate, initialResearch, researchStepName, summarizeUsage } from './engine.js';
 
 type Snapshot = {
   context: ModelContext;
@@ -119,11 +120,18 @@ async function resumeFrom(
     [priorRunId, sessionId],
   );
   const state = prior?.state as ResearchState | undefined;
-  if (!prior || !state?.candidates.length || state.stopReason === 'accepted' || state.effort !== effort) return null;
+  // Only a record of the current search version continues; an older record is kept for reading.
+  if (
+    !prior ||
+    state?.version !== 2 ||
+    !state.candidates.length ||
+    state.stopReason === 'accepted' ||
+    state.effort !== effort
+  )
+    return null;
   if ((prior.snapshot as Snapshot).modelFingerprint !== fingerprint) return null;
-  const last = state.candidates.at(-1)!,
-    pending = effort !== 'direct' && !last.review;
-  const reviewed = state.candidates.length - (pending ? 1 : 0);
+  const pending = effort === 'direct' ? 0 : state.candidates.filter((candidate) => !candidate.review).length;
+  const reviewed = state.candidates.length - pending;
   return {
     snapshot: prior.snapshot as Snapshot,
     state: {
@@ -260,30 +268,50 @@ export async function executeResearchRun(store: Store, folder: string, identity:
       state = { ...state, phase: 'finished', stopReason: 'budget' };
       break;
     }
+    const name = researchStepName(state, callsLeft);
+    // Reported tokens are a second ceiling: stop before a step that would likely cross it.
+    const usage = summarizeUsage(current.run.usage, current.run.model_calls),
+      largest = Math.max(8000, ...current.run.usage.map((entry: Row) => Number(entry.total_tokens) || 0)),
+      ceiling = RESEARCH_BUDGETS[state.effort].tokens;
+    if (usage.totalTokens + largest * (name === 'roots' ? 2 : 1) > ceiling) {
+      state = {
+        ...state,
+        phase: 'finished',
+        stopReason: 'budget',
+        warnings: [
+          ...state.warnings,
+          `本轮已报告 ${usage.totalTokens.toLocaleString()} token，再调用可能超过 ${ceiling.toLocaleString()} 的上限，提前结束。`,
+        ],
+      };
+      break;
+    }
     // A restart cannot silently switch the model half-way through a comparison.
     if (digest((await config(folder)).llm) !== snapshot.modelFingerprint)
       throw new AppError('模型设置已改变，请查看已保存候选，再重新开始研究。', 409, 'research_model_changed');
     const best = bestCandidate(state),
-      pending = state.candidates.at(-1);
-    const queries = best?.review?.queries || pending?.review?.queries || [];
+      waiting = state.candidates.filter((candidate) => !candidate.review);
+    const queries = best?.review?.queries || [];
     const citations = await store.transaction(async (tx) => {
       await fence(tx, identity);
       return researchSources(
         tx,
         snapshot.sources,
         [snapshot.context.task, ...queries].join('\n'),
-        state.phase === 'review' ? pending?.citations : [],
+        // A review or comparison must see the passages both answers cite.
+        state.phase === 'review'
+          ? [...waiting, ...(best ? [best] : [])].flatMap((candidate) => candidate.citations)
+          : [],
       );
     });
     try {
       // Each solve or review is one step; its workspace state commits with the step receipt.
-      const current = state;
+      const before = state;
       state = await step(
         store,
         identity,
-        `${current.phase}:${current.candidates.length}`,
+        name,
         {},
-        () => advanceResearch(current, model, { ...snapshot.context, sources: citations }),
+        () => advanceResearch(before, model, { ...snapshot.context, sources: citations }, { callsLeft }),
         (tx, next, { run, session }) => writeState(tx, run, session, next),
       );
     } catch (error) {

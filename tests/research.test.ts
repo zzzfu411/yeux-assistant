@@ -5,7 +5,10 @@ import {
   advanceResearch,
   initialResearch,
   ModelResearchAnswer,
+  ModelResearchComparison,
   ModelResearchReview,
+  researchStepName,
+  STRATEGIES,
   summarizeUsage,
   verifyResearchCitations,
   type ResearchModel,
@@ -38,6 +41,38 @@ function review(score: number): Review {
     rationale: '核对每一项要求。',
     satisfied: false,
   };
+}
+type Handler = (instruction: string, ctx: ModelContext, options?: Record<string, unknown>) => unknown;
+/** A scripted model: the handler returns raw JSON, the schema parses it as the gateway would. */
+function scripted(handler: Handler, provided = [source]): ResearchModel {
+  return {
+    async call(schema, instruction, ctx, options) {
+      return { value: schema.parse(await handler(instruction, ctx, options)), providedCitations: provided };
+    },
+  };
+}
+const answer = (content: string) => ({
+  content,
+  citations: [{ sourceId: 's1', version: 1, quote: '不等于可串行化' }],
+  limitations: [],
+});
+/** A judge preferring the answer whose content carries the larger number; the order shown must not matter. */
+function judge(ctx: ModelContext, extra: Record<string, unknown> = {}) {
+  const shown = JSON.parse(ctx.previous) as { A: { content: string }; B: { content: string } };
+  const n = (text: string) => Number(/(\d+)/.exec(text)?.[1] ?? 0);
+  return {
+    scores: { A: review(2).scores, B: review(3).scores },
+    winner: n(shown.A.content) > n(shown.B.content) ? 'A' : 'B',
+    reasons: ['覆盖更完整。'],
+    issues: ['补充反例。'],
+    queries: ['并发反例'],
+    satisfied: false,
+    ...extra,
+  };
+}
+async function run(state: ReturnType<typeof initialResearch>, model: ResearchModel, random = () => 0.9) {
+  while (state.phase !== 'finished') state = await advanceResearch(state, model, context, { random });
+  return state;
 }
 describe('research search and evidence', () => {
   it('requires explicit live evaluation arguments and keeps blind labels separate', () => {
@@ -112,24 +147,19 @@ describe('research search and evidence', () => {
   });
   it('keeps a candidate whose quotations partly fail the check, and tells the reviewer', async () => {
     const latest: string[] = [];
-    const model: ResearchModel = {
-      providedCitations: [source],
-      async json(schema, instruction, ctx) {
-        latest.push(ctx.latest);
-        return schema.parse(
-          instruction.includes('LAB2_SOLVE')
-            ? {
-                content: '候选',
-                citations: [
-                  { sourceId: 's1', version: 1, quote: '不等于可串行化' },
-                  { sourceId: 's1', version: 1, quote: '资料里没有的句子' },
-                ],
-                limitations: [],
-              }
-            : review(3),
-        );
-      },
-    };
+    const model = scripted((instruction, ctx) => {
+      latest.push(ctx.latest);
+      return instruction.includes('LAB2_SOLVE')
+        ? {
+            content: '候选',
+            citations: [
+              { sourceId: 's1', version: 1, quote: '不等于可串行化' },
+              { sourceId: 's1', version: 1, quote: '资料里没有的句子' },
+            ],
+            limitations: [],
+          }
+        : review(3);
+    });
     let state = await advanceResearch(initialResearch('low'), model, context);
     expect(state.candidates[0]).toMatchObject({ droppedCitations: ['资料里没有的句子'] });
     expect(state.candidates[0]!.answer.citations).toEqual([{ sourceId: 's1', version: 1, quote: '不等于可串行化' }]);
@@ -167,24 +197,38 @@ describe('research search and evidence', () => {
     expect(parsed.scores).toEqual({ coverage: 3, evidence: 4, challenges: 0, usability: 4 });
     expect(parsed).toMatchObject({ issues: ['补充反例'], queries: ['a', 'b', 'c'], satisfied: false });
     expect(ModelResearchReview.safeParse({ scores: { coverage: 3 }, rationale: '缺分数' }).success).toBe(false);
+    const compared = ModelResearchComparison.parse({
+      scores: { A: { coverage: '3', evidence: 4.4, challenges: 2, usability: 3 }, B: review(1).scores },
+      winner: ' a ',
+      reasons: ['依据', ''],
+      issues: [],
+      queries: [],
+      satisfied: 'false',
+      note: '多余字段',
+    });
+    expect(compared).toMatchObject({ winner: 'A', reasons: ['依据'], satisfied: false });
+    expect(compared.scores.A).toEqual({ coverage: 3, evidence: 4, challenges: 2, usability: 3 });
+    expect(ModelResearchComparison.parse({ ...compared, winner: '平局' }).winner).toBe('tie');
+    expect(ModelResearchComparison.safeParse({ ...compared, winner: 'C' }).success).toBe(false);
     expect(ModelResearchAnswer.safeParse({ citations: [], limitations: [] }).success).toBe(false);
   });
-  it('sends reviews to the reviewer role and solving to the main model', async () => {
-    const roles: Array<string | undefined> = [];
-    const model: ResearchModel = {
-      providedCitations: [source],
-      async json(schema, instruction, _ctx, options) {
-        roles.push(options?.role);
-        return schema.parse(
-          instruction.includes('LAB2_SOLVE')
-            ? { content: '候选', citations: [{ sourceId: 's1', version: 1, quote: '不等于可串行化' }], limitations: [] }
-            : review(2),
-        );
-      },
-    };
-    let state = await advanceResearch(initialResearch('low'), model, context);
-    state = await advanceResearch(state, model, context);
-    expect(roles).toEqual([undefined, 'review']);
+  it('sends reviews to the reviewer role and solving to the main model, with step profiles', async () => {
+    const roles: Array<[unknown, unknown]> = [];
+    const model = scripted((instruction, ctx, options) => {
+      roles.push([options?.role, options?.profile]);
+      return instruction.includes('LAB2_SOLVE')
+        ? answer('候选 ' + roles.length)
+        : instruction.includes('LAB2_COMPARE')
+          ? judge(ctx)
+          : review(2);
+    });
+    await run(initialResearch('low'), model);
+    expect(roles).toEqual([
+      [undefined, 'solve'],
+      ['review', undefined],
+      [undefined, 'solve'],
+      ['review', undefined],
+    ]);
   });
   it('reads one JSON object wrapped in prose or a code fence', () => {
     expect(parseModelJSON('```json\n{"a":1}\n```')).toEqual({ a: 1 });
@@ -196,90 +240,124 @@ describe('research search and evidence', () => {
     expect(() => parseModelJSON('{"a":')).toThrow();
   });
   it.each([
-    ['direct', 1],
-    ['low', 4],
-    ['high', 8],
-  ] as const)('%s uses an actual bounded solve / review schedule', async (effort, expected) => {
-    let calls = 0;
-    const scores = [3, 1, 4, 2];
-    const instructions: string[] = [];
-    const model: ResearchModel = {
-      providedCitations: [source],
-      async json(schema, instruction) {
-        instructions.push(instruction);
-        calls++;
-        return schema.parse(
-          instruction.includes('LAB2_SOLVE')
-            ? {
-                content: '候选 ' + calls,
-                citations: [{ sourceId: 's1', version: 1, quote: '不等于可串行化' }],
-                limitations: [],
-              }
-            : review(scores[Math.floor(calls / 2) - 1]!),
-        );
-      },
-    };
-    let state = initialResearch(effort);
-    while (state.phase !== 'finished') state = await advanceResearch(state, model, context);
-    expect(calls).toBe(expected);
+    ['direct', 1, 'direct'],
+    ['low', 4, 'budget'],
+    ['high', 7, 'budget'],
+  ] as const)('%s runs its bounded solve / compare schedule', async (effort, expected, stop) => {
+    const seen: Array<{ instruction: string; previous: string }> = [];
+    const model = scripted((instruction, ctx) => {
+      seen.push({ instruction, previous: ctx.previous });
+      if (instruction.includes('LAB2_SOLVE')) return answer('候选 ' + seen.length);
+      return instruction.includes('LAB2_COMPARE') ? judge(ctx) : review(3);
+    });
+    const state = await run(initialResearch(effort), model);
+    expect(seen).toHaveLength(expected);
+    expect(state.stopReason).toBe(stop);
     if (effort === 'high') {
-      expect(state.best).toBe(2);
-      expect(state.candidates.map((c) => c.accepted)).toEqual([true, false, true, false]);
-      expect(instructions[2]).toContain('探索另一方向');
-      expect(instructions[6]).toContain('最简单的反例');
-      expect(state.candidates[2]!.parent).toBe(0);
+      // Two independent roots, neither anchored on an earlier answer, then a comparison of the two.
+      expect(seen.slice(0, 2).map((call) => call.previous)).toEqual(['', '']);
+      expect(seen[0]!.instruction).toContain(STRATEGIES.direct);
+      expect(seen[1]!.instruction).toContain('探索另一方向');
+      expect(seen[2]!.instruction).toContain('LAB2_COMPARE');
+      expect(seen[5]!.instruction).toContain('最简单的反例');
+      expect(state.candidates.map((c) => [c.parent, c.branch])).toEqual([
+        [null, 0],
+        [null, 1],
+        [1, 1],
+        [2, 1],
+      ]);
+      // The newer answer always wins this judge, so each revision replaces the version it improved.
+      expect(state.best).toBe(3);
+      expect(state.candidates.map((c) => c.comparison?.winner ?? null)).toEqual([null, 'new', 'new', 'new']);
     }
   });
-  it('stops high effort after exploring another direction when the retained version already meets the rubric', async () => {
-    const model: ResearchModel = {
-      providedCitations: [source],
-      async json(schema, instruction) {
-        return schema.parse(
-          instruction.includes('LAB2_SOLVE')
-            ? {
-                content: '已满足要求的候选',
-                citations: [{ sourceId: 's1', version: 1, quote: '不等于可串行化' }],
-                limitations: [],
-              }
-            : { ...review(4), issues: [], satisfied: true },
-        );
-      },
-    };
-    let state = initialResearch('high');
-    for (let n = 0; n < 4; n++) state = await advanceResearch(state, model, context);
-    expect(state.phase).toBe('finished');
+  it('shows the two answers in a random order and keeps the incumbent on a tie', async () => {
+    const orders: string[] = [];
+    const model = scripted((instruction, ctx) => {
+      if (instruction.includes('LAB2_SOLVE')) return answer(ctx.previous ? '修改版' : '首版');
+      if (!instruction.includes('LAB2_COMPARE')) return review(3);
+      orders.push(JSON.parse(ctx.previous).A.content);
+      return judge(ctx, { winner: 'tie' });
+    });
+    for (const [random, first] of [
+      [0.1, '修改版'],
+      [0.9, '首版'],
+    ] as const) {
+      const state = await run(initialResearch('low'), model, () => random);
+      expect(state.best).toBe(0);
+      expect(state.candidates[1]!.comparison).toMatchObject({
+        against: 0,
+        winner: 'tie',
+        order: random < 0.5 ? 'new-first' : 'incumbent-first',
+      });
+      expect(orders.at(-1)).toBe(first);
+      expect(state.candidates[1]!.reviewNote).toContain('不分高下');
+    }
+  });
+  it('stops as a plateau when two revisions in a row do not win', async () => {
+    let roots = 5;
+    const model = scripted((instruction, ctx) =>
+      instruction.includes('LAB2_SOLVE')
+        ? answer(ctx.previous ? '修改 0' : '根 ' + roots++)
+        : // The judge prefers the larger number; revisions carry 0 and always lose.
+          judge(ctx),
+    );
+    const state = await run(initialResearch('high'), model);
+    expect(state.stopReason).toBe('plateau');
+    expect(state.candidates.slice(2).map((c) => c.comparison?.winner)).toEqual(['incumbent', 'incumbent']);
+    expect(state.best).toBeLessThan(2);
+  });
+  it('continues with one direction when the other root fails', async () => {
+    const model = scripted((instruction) => {
+      if (instruction.includes('探索另一方向')) throw new Error('合成的流中断');
+      return instruction.includes('LAB2_SOLVE') ? answer('直接 1') : review(3);
+    });
+    const state = await advanceResearch(initialResearch('high'), model, context, { callsLeft: 8 });
+    expect(state.candidates).toHaveLength(1);
+    expect(state.warnings.join()).toContain('另一方向的求解没有完成');
+    expect(researchStepName(state)).toBe('review:0');
+  });
+  it('starts with a single root when the budget cannot pay for comparing two', () => {
+    expect(researchStepName(initialResearch('high'), 8)).toBe('roots');
+    expect(researchStepName(initialResearch('high'), 2)).toBe('solve:0');
+    expect(researchStepName(initialResearch('low'), 4)).toBe('solve:0');
+  });
+  it('accepts high effort early only after the two directions were compared', async () => {
+    let calls = 0;
+    const model = scripted((instruction, ctx) => {
+      calls++;
+      return instruction.includes('LAB2_SOLVE')
+        ? answer('满足要求 ' + calls)
+        : judge(ctx, { issues: [], satisfied: true, scores: { A: review(4).scores, B: review(4).scores } });
+    });
+    const state = await run(initialResearch('high'), model);
+    expect(calls).toBe(3);
     expect(state.stopReason).toBe('accepted');
-    expect(state.best).toBe(0);
-    expect(state.candidates[1]!.accepted).toBe(false);
+    expect(state.candidates).toHaveLength(2);
   });
   it('does not let a self-reported perfect answer without evidence trigger acceptance', async () => {
-    const model: ResearchModel = {
-      providedCitations: [],
-      async json(schema, instruction) {
-        return schema.parse(
-          instruction.includes('LAB2_SOLVE')
-            ? { content: '无证据结论', citations: [], limitations: [] }
-            : { ...review(4), issues: [], satisfied: true },
-        );
-      },
-    };
+    const model = scripted(
+      (instruction, ctx) =>
+        instruction.includes('LAB2_SOLVE')
+          ? { content: '无证据结论 ' + Math.random(), citations: [], limitations: [] }
+          : judge(ctx, { issues: [], satisfied: true, scores: { A: review(4).scores, B: review(4).scores } }),
+      [],
+    );
     let state = initialResearch('high');
-    for (let n = 0; n < 4; n++) state = await advanceResearch(state, model, { ...context, sources: [] });
+    for (let n = 0; n < 2; n++) state = await advanceResearch(state, model, { ...context, sources: [] });
     expect(state.phase).toBe('solve');
-    expect(state.candidates[0]!.score).toBe(13);
+    expect(state.candidates[state.best!]!.score).toBe(13);
   });
-  it('keeps old state immutable and does not replace a good version with an unreviewed one', async () => {
+  it('keeps old state immutable, never adopts an unreviewed version, and does not resume a version-one record', async () => {
     const state = initialResearch('low');
-    const model: ResearchModel = {
-      providedCitations: [source],
-      async json(schema) {
-        return schema.parse({ content: '候选', citations: [], limitations: [] });
-      },
-    };
+    const model = scripted(() => ({ content: '候选', citations: [], limitations: [] }));
     const next = await advanceResearch(state, model, context);
     expect(state.candidates).toEqual([]);
     expect(next.best).toBeNull();
     expect(next.candidates[0]!.review).toBeNull();
+    await expect(advanceResearch({ ...next, version: 1 }, model, context)).rejects.toMatchObject({
+      code: 'research_version',
+    });
   });
   it('reports missing usage instead of claiming zero actual tokens', () => {
     expect(summarizeUsage([{ total_tokens: 10 }, {}], 2)).toMatchObject({

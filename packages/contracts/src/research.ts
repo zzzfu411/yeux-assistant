@@ -3,12 +3,13 @@ import type { Citation } from './index.js';
 
 export const Effort = z.enum(['direct', 'low', 'high']);
 export type Effort = z.infer<typeof Effort>;
-// Wall-clock ceilings leave room for slow providers (real calls took 40–110 s each);
-// the call budget is what bounds cost, and runs still stop early once accepted.
+// Wall-clock ceilings leave room for slow providers (real calls took 40–110 s each). Calls and
+// reported tokens both bound cost (tokens at roughly 20k per call, reasoning included); runs still
+// stop early once accepted or when revisions stop winning.
 export const RESEARCH_BUDGETS = {
-  direct: { calls: 1, seconds: 150, candidates: 1, label: '直接' },
-  low: { calls: 4, seconds: 420, candidates: 2, label: '标准' },
-  high: { calls: 8, seconds: 840, candidates: 4, label: '深入' },
+  direct: { calls: 1, seconds: 150, candidates: 1, tokens: 20000, label: '直接' },
+  low: { calls: 4, seconds: 420, candidates: 2, tokens: 80000, label: '标准' },
+  high: { calls: 8, seconds: 840, candidates: 4, tokens: 160000, label: '深入' },
 } as const;
 export const ResearchOptions = z
   .object({
@@ -58,6 +59,37 @@ export const ResearchReview = z
   })
   .strict();
 export type ResearchReview = z.infer<typeof ResearchReview>;
+const RubricScores = z
+  .object({
+    coverage: z.number().int().min(0).max(4),
+    evidence: z.number().int().min(0).max(4),
+    challenges: z.number().int().min(0).max(4),
+    usability: z.number().int().min(0).max(4),
+  })
+  .strict();
+/**
+ * One blind comparison of two answers shown as A and B. Scores for both come from the same context,
+ * so they are comparable; the verdict, not the score sum, decides which version is kept.
+ */
+export const ResearchComparison = z
+  .object({
+    scores: z.object({ A: RubricScores, B: RubricScores }).strict(),
+    winner: z.enum(['A', 'B', 'tie']),
+    reasons: z.array(z.string().min(1).max(400)).min(1).max(4),
+    issues: z.array(z.string().min(1).max(500)).max(6),
+    queries: z.array(z.string().min(1).max(160)).max(3),
+    satisfied: z.boolean(),
+  })
+  .strict();
+export type ResearchComparison = z.infer<typeof ResearchComparison>;
+/** How a challenger fared against the version it was compared with. */
+export type ComparisonRecord = {
+  against: number;
+  winner: 'new' | 'incumbent' | 'tie';
+  /** Which answer the reviewer saw first; recorded so position bias can be checked later. */
+  order: 'new-first' | 'incumbent-first';
+  reasons: string[];
+};
 export type ResearchCandidate = {
   index: number;
   strategy: string;
@@ -70,14 +102,19 @@ export type ResearchCandidate = {
   reviewNote: string;
   /** Quotations the model claimed but the program could not find in the provided sources. */
   droppedCitations?: string[];
+  /** Version 2: the root direction this candidate descends from (0 direct, 1 another direction). */
+  branch?: number;
+  /** Version 2: the blind comparison in which this candidate was the challenger. */
+  comparison?: ComparisonRecord;
 };
 export type ResearchState = {
-  version: 1;
+  /** Version 1 records (one solve/review chain with absolute scores) stay readable but are not resumed. */
+  version: 1 | 2;
   effort: Effort;
   candidates: ResearchCandidate[];
   best: number | null;
   phase: 'solve' | 'review' | 'finished';
-  stopReason: 'accepted' | 'budget' | 'direct' | 'error' | null;
+  stopReason: 'accepted' | 'budget' | 'direct' | 'error' | 'plateau' | null;
   warnings: string[];
   /** Reviewed candidates carried over from an earlier run of the same research; the new budget counts the rest. */
   offset?: number;

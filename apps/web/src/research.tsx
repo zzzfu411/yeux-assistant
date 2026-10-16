@@ -4,7 +4,7 @@ import {
   type ResearchCandidate,
   type ResearchDetail,
 } from '../../../packages/contracts/src/research';
-import { useState } from 'react';
+import { useState, type ReactElement } from 'react';
 import { useApi, useAction } from './api';
 import { ErrorNotice, Result, Sources } from './ui';
 import { Icon } from './icons';
@@ -12,9 +12,10 @@ import s from './styles.module.css';
 
 const efforts: Array<{ value: Effort; flow: string }> = [
   { value: 'direct', flow: '单次回答，作为基线' },
-  { value: 'low', flow: '求解、评阅、修改' },
-  { value: 'high', flow: '多方向比较，反例查证' },
+  { value: 'low', flow: '求解、评阅，修改后盲评比较' },
+  { value: 'high', flow: '两个方向并行，比较后深入与反例查证' },
 ];
+const tokens = (count: number) => (count >= 10000 ? count / 10000 + ' 万' : count.toLocaleString());
 const minutes = (seconds: number) =>
   seconds % 60
     ? (seconds / 60).toLocaleString('zh-CN', { maximumFractionDigits: 1 }) + ' 分钟'
@@ -60,7 +61,7 @@ export function EffortPicker({
               <span className={s.effortFlow} id={'effort-' + option}>
                 {flow}
                 <small>
-                  ≤ {budget.calls} 次调用 · {minutes(budget.seconds)}
+                  ≤ {budget.calls} 次调用 · {minutes(budget.seconds)} · ≤ {tokens(budget.tokens)} token
                 </small>
               </span>
             </label>
@@ -68,7 +69,7 @@ export function EffortPicker({
         })}
       </div>
       <p className={s.effortNote}>
-        上限不是必然用满：达到评阅标准会提前结束。投入越高，可能消耗更多 API 额度；结论仍需核对。
+        上限不是必然用满：达到评阅标准或修改不再胜出时会提前结束。投入越高，可能消耗更多 API 额度；结论仍需核对。
       </p>
     </fieldset>
   );
@@ -80,6 +81,7 @@ function reasonFor(detail: ResearchDetail, active: boolean) {
   if (state.stopReason === 'accepted') return { text: '已满足模型评阅标准，仍需本人核查', tone: 'success' };
   if (state.stopReason === 'error') return { text: '后续查证未完成，保留此前版本', tone: 'danger' };
   if (state.stopReason === 'budget') return { text: '本轮预算已结束', tone: 'accent' };
+  if (state.stopReason === 'plateau') return { text: '连续两次修改未胜出，提前结束', tone: 'accent' };
   if (active) return { text: state.phase === 'review' ? '正在检查候选答案' : '正在检索与求解', tone: 'info' };
   return { text: '已停止，进度已保留', tone: 'neutral' };
 }
@@ -99,7 +101,8 @@ export function ResearchBanner({ detail, active }: { detail: ResearchDetail; act
         {state.best !== null && (
           <span>
             {' '}
-            · 采用第 {state.best + 1} 版{state.effort === 'direct' ? '' : '（模型比较）'}
+            · 采用第 {state.best + 1} 版
+            {state.effort === 'direct' ? '' : state.version === 2 ? '（盲评比较）' : '（模型比较）'}
           </span>
         )}
       </p>
@@ -121,8 +124,8 @@ function solveLabel(effort: Effort, index: number) {
   return '修改';
 }
 type Step = { label: string; status: 'done' | 'current' | 'idle' | 'missed' | 'skipped' };
-/** The steps that actually ran, then the remaining plan while the run is active. */
-function researchSteps(detail: ResearchDetail, active: boolean): Step[] {
+/** Version-one records: one solve/review chain. */
+function researchStepsV1(detail: ResearchDetail, active: boolean): Step[] {
   const { state } = detail,
     reviewed = state.effort !== 'direct',
     steps: Step[] = [];
@@ -146,6 +149,73 @@ function researchSteps(detail: ResearchDetail, active: boolean): Step[] {
   } else if (state.stopReason === 'accepted' && state.candidates.length < planned)
     steps.push({ label: '提前结束：已满足标准', status: 'skipped' });
   return steps;
+}
+const PLANS: Record<Effort, string[]> = {
+  direct: ['求解'],
+  low: ['求解', '评阅', '修改', '比较'],
+  high: ['求解', '另一方向', '比较', '修改', '比较', '反例检查', '比较'],
+};
+const candidateLabel = (candidate: ResearchCandidate) =>
+  candidate.parent === null
+    ? candidate.branch === 1
+      ? '另一方向'
+      : '求解'
+    : candidate.strategy.startsWith('构造最简单的反例')
+      ? '反例检查'
+      : '修改';
+/** Version two: roots (two in parallel for high effort), then revisions each compared with the kept version. */
+function researchSteps(detail: ResearchDetail, active: boolean): Step[] {
+  const { state } = detail;
+  if (state.version !== 2) return researchStepsV1(detail, active);
+  const steps: Step[] = [],
+    judged = state.effort !== 'direct';
+  const marker = (done: boolean, label: string) =>
+    steps.push({ label, status: done ? 'done' : active && state.phase === 'review' ? 'current' : 'missed' });
+  const roots = state.candidates.filter((candidate) => candidate.parent === null);
+  for (const root of roots) steps.push({ label: candidateLabel(root), status: 'done' });
+  if (judged && roots.length === 2) marker(Boolean(roots[1]!.review), '比较');
+  else if (judged && roots.length === 1) marker(Boolean(roots[0]!.review), '评阅');
+  for (const revision of state.candidates.filter((candidate) => candidate.parent !== null)) {
+    steps.push({ label: candidateLabel(revision), status: 'done' });
+    marker(Boolean(revision.comparison), '比较');
+  }
+  const plan = PLANS[state.effort];
+  if (active) {
+    if (state.phase === 'solve') {
+      const labels = !state.candidates.length && state.effort === 'high' ? ['求解', '另一方向'] : [plan[steps.length]];
+      for (const label of labels) if (label) steps.push({ label, status: 'current' });
+    }
+    for (const label of plan.slice(steps.length)) steps.push({ label, status: 'idle' });
+  } else if (steps.length < plan.length && state.stopReason === 'accepted')
+    steps.push({ label: '提前结束：已满足标准', status: 'skipped' });
+  else if (steps.length < plan.length && state.stopReason === 'plateau')
+    steps.push({ label: '提前结束：修改未再胜出', status: 'skipped' });
+  return steps;
+}
+const verdicts = { new: '胜过', incumbent: '不如', tie: '平' } as const;
+/** The search as a tree: each root direction and the revisions built on it. */
+function SearchTree({ state }: { state: ResearchDetail['state'] }) {
+  const children = (parent: number | null) => state.candidates.filter((candidate) => candidate.parent === parent);
+  const node = (candidate: ResearchCandidate): ReactElement => (
+    <li key={candidate.index} data-adopted={candidate.index === state.best}>
+      <span>
+        第 {candidate.index + 1} 版 · {candidateLabel(candidate)}
+        {candidate.comparison && (
+          <small>
+            {' '}
+            {verdicts[candidate.comparison.winner]}第 {candidate.comparison.against + 1} 版
+          </small>
+        )}
+        {candidate.index === state.best && <small> · 采用</small>}
+      </span>
+      {children(candidate.index).length > 0 && <ol>{children(candidate.index).map(node)}</ol>}
+    </li>
+  );
+  return (
+    <ol className={s.searchTree} aria-label="搜索路径">
+      {children(null).map(node)}
+    </ol>
+  );
 }
 function Meter({ value, max, label }: { value: number; max: number; label: string }) {
   const ratio = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
@@ -185,6 +255,28 @@ function Candidate({ candidate, best }: { candidate: ResearchCandidate; best: nu
       </header>
       <div className={s.candidateBody}>
         <p className={s.muted}>引导策略：{candidate.strategy}</p>
+        {candidate.comparison && (
+          <div className={s.comparison}>
+            <h3>
+              与第 {candidate.comparison.against + 1} 版盲评比较：
+              {candidate.comparison.winner === 'new'
+                ? '本版胜出'
+                : candidate.comparison.winner === 'tie'
+                  ? '不分高下，保留原版'
+                  : '本版未胜出'}
+            </h3>
+            <p className={s.muted}>
+              评阅时两份答案以 A、B 出现，本版为
+              {candidate.comparison.order === 'new-first' ? ' A（在前）' : ' B（在后）'}
+              ；评阅不知道哪一份更新。
+            </p>
+            <ul>
+              {candidate.comparison.reasons.map((reason, i) => (
+                <li key={i}>{reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         {candidate.review && (
           <dl className={s.rubric}>
             {dimensions.map(([key, label]) => (
@@ -279,7 +371,15 @@ function Versions({ state }: { state: ResearchDetail['state'] }) {
               onClick={() => setChosen(item.index)}
             >
               <span>第 {item.index + 1} 版</span>
-              <small>{item.index === state.best ? '采用' : item.score === null ? '待评阅' : item.score + ' 分'}</small>
+              <small>
+                {item.index === state.best
+                  ? '采用'
+                  : item.comparison
+                    ? verdicts[item.comparison.winner] + '第 ' + (item.comparison.against + 1) + ' 版'
+                    : item.score === null
+                      ? '待评阅'
+                      : item.score + ' 分'}
+              </small>
             </button>
           );
         })}
@@ -363,6 +463,7 @@ export function ResearchProgress({
           <strong>
             {usage.reportedCalls ? usage.totalTokens.toLocaleString() : '—'}
             {usage.reportedCalls > 0 && !usage.complete && <small> 不完整</small>}
+            <small> / {tokens(RESEARCH_BUDGETS[state.effort].tokens)}</small>
           </strong>
           <small className={s.statNote}>
             {usage.complete
@@ -395,7 +496,12 @@ export function ResearchProgress({
       {state.candidates.length > 0 && (
         <>
           <h3 className={s.timelineTitle}>候选版本与查证（{state.candidates.length}）</h3>
-          <p className={s.muted}>评分来自模型，只用于挑选版本；引文仅确认与原文一致，不代表结论必然正确。</p>
+          <p className={s.muted}>
+            {state.version === 2
+              ? '是否采用由盲评比较决定：两份答案以 A、B 随机排列，评分只供参考；引文仅确认与原文一致，不代表结论必然正确。'
+              : '评分来自模型，只用于挑选版本；引文仅确认与原文一致，不代表结论必然正确。'}
+          </p>
+          {state.version === 2 && state.candidates.length > 1 && <SearchTree state={state} />}
           <Versions state={state} />
         </>
       )}

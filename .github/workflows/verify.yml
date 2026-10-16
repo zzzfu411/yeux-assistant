@@ -29,6 +29,8 @@ jobs:
           node-version: '24'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # tests/ehall-bridge.test.ts drives a real headless browser against the simulated ehall.
+      - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm verify
 
   browser:

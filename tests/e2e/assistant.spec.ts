@@ -72,6 +72,8 @@ function fixture() {
       updatedAt: string | null;
     },
     draftWrites: [] as Array<{ path: string; body: Record<string, unknown> }>,
+    /** Saved "by another device" at the moment this one saves, so the race is deterministic. */
+    draftCompeting: null as { content: Record<string, unknown>; revision: number } | null,
     runtimeError: false,
     modelConfigured: true,
     workerOnline: true,
@@ -232,6 +234,10 @@ async function setup(page: Page, state = fixture(), login = true) {
         const cleared = body.revision === state.draft.revision;
         if (cleared) state.draft = { content: null, revision: 0, updatedAt: null };
         return json({ cleared });
+      }
+      if (state.draftCompeting) {
+        state.draft = { ...state.draftCompeting, updatedAt: timestamp };
+        state.draftCompeting = null;
       }
       if (body.revision !== state.draft.revision)
         return json({ error: { code: 'draft_conflict', message: '另一台设备刚更新了这份草稿。' } }, 409);
@@ -1757,9 +1763,9 @@ test('今天页草稿在设备间同步，另一台设备的修改不会被静�
   // A new tab or a relaunched phone app finds the unsent entry from the other device.
   await expect(box).toHaveValue('手机上写了一半');
   await expect(page.getByText('并在你的手机和电脑之间同步')).toBeVisible();
-  // Meanwhile the other device saved again. Whether this device learns of it from a refused save or
-  // from a refresh, it offers a choice and never writes over the other version on its own.
-  state.draft = { content: draft('电脑上的另一版'), revision: 5, updatedAt: timestamp };
+  // The other device saves just before this one: this device's save is refused, and because its own
+  // text was edited it offers a choice instead of writing over the other version.
+  state.draftCompeting = { content: draft('电脑上的另一版'), revision: 5 };
   await box.fill('理解事务隔离级别');
   const offer = page.getByRole('alert').filter({ hasText: '另一台设备上保存了不同的草稿' });
   await expect(offer).toBeVisible();

@@ -361,7 +361,9 @@ test('冲突提示允许载入最新版本，不重复确认旧动作', async ({
   state.conflict = true;
   await page.getByRole('button', { name: '确认开灯', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('操作已更新');
-  await page.getByRole('button', { name: '载入最新版本，保留输入', exact: true }).click();
+  // The page's own five-second poll may load the newer version before this click; either way nothing is re-sent.
+  const reload = page.getByRole('button', { name: '载入最新版本，保留输入', exact: true });
+  await reload.click({ timeout: 4000 }).catch(() => expect(reload).toHaveCount(0));
   await expect(page.getByText('已过期', { exact: true })).toBeVisible();
   expect(state.posts.filter((row) => row.path.endsWith('/decision'))).toHaveLength(1);
 });

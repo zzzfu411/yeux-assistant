@@ -63,3 +63,14 @@ RETRIEVAL_NOISE=3000 RUNTIME_TEST_DATABASE_URL=… pnpm retrieval:eval   # 一�
 测试在同一语料上运行旧实现（两字词 `ILIKE`、只取最后 48 个词、按命中词数排序，保留在测试文件里作对照）与当前实现（索引列 `app.chunks.lexemes` + BM25），输出 recall@5、MRR 与平均耗时，并要求当前实现不低于旧实现、recall@5 不低于 0.9。它还逐份核对 TypeScript 与 SQL 两边的切词结果一致。数据库必须是以 `_runtime_test` 结尾的专用测试库。
 
 这只衡量“相关资料是否排在前面”，不衡量模型据此写出的答案是否正确。旧实现在并列分数时按随机 ID 排序，MRR 会在几次运行间小幅波动。
+
+## 办理通知测量
+
+`errand-cases.json` 是一份合成的学术报告会报名通知、一份合成的本人信息（故意缺学号）和一段合成回答。脚本用临时 PostgreSQL 和真实执行器走完“抽取要素 → 计划（追问）→ 回答 → 计划 → 写信”，从运行记录读出每一步的首字节时间、耗时与 token，并对要素和邮件主题做字面核对。
+
+```sh
+pnpm errand:eval                                   # 预演：不读密钥、不联网
+pnpm errand:eval --live --config private/config.json --case seminar --max-calls 6
+```
+
+需要已手动启动的 Docker；`--max-calls` 为 1–10，是整个流程的上限。不发送邮件，不连接实际助手数据库；结果保存在 `private/errand-eval-*/`（`report.json` 与 `letter.md`）。信件是否得体仍需本人阅读。

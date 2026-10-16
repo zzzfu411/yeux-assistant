@@ -73,7 +73,7 @@ python3 -m unittest discover -s tests -p test_prepare_courses.py
 
 ## 自动化与启动诊断
 
-`.github/workflows/verify.yml` 在 PR、main 推送或手动触发时依次运行类型/构建、隔离 PostgreSQL、桌面/手机交互和完整恢复演练；不配置真实模型或邮箱密钥，不上传 private 目录。提交前仍应运行相应本地验证。工作流文件的存在不代表 GitHub 已执行成功，发布后需核对对应 Actions 运行。
+`.github/workflows/verify.yml` 在 PR、main 推送或手动触发时并行运行三个任务，各有自己的时间上限：格式 / 架构 / 类型 / 构建与隔离 PostgreSQL 回归（`pnpm verify`）、桌面与手机交互（按 `--shard` 分两片）、独立 API / Worker 闭环与完整恢复演练（`pnpm verify:e2e`）；不配置真实模型或邮箱密钥，不上传 private 目录。提交前仍应运行相应本地验证。工作流文件的存在不代表 GitHub 已执行成功，发布后需核对对应 Actions 运行。
 
 环境安装遵循 [setup-node](https://github.com/actions/setup-node/tree/v6) 与 [Playwright CI 文档](https://playwright.dev/docs/ci)。项目不依赖宿主 Chrome；Linux CI 安装与 lockfile 对应的 Chromium。
 
@@ -84,6 +84,10 @@ python3 -m unittest discover -s tests -p test_prepare_courses.py
 `Sources` 管理导入查重、版本更新与软归档。资料摘要不携带整份提取页码；详情读取指定版本。Web 管理的文本不被磁盘扫描覆盖，归档和扫描采用相同资料锁串行化。目标编辑保留原来的归档关联，新建关联则拒绝归档资料。
 
 检索（`knowledge.ts` 的 `retrieve`、研究的 `researchSources`）使用迁移 `0017` 的索引列 `app.chunks.lexemes`：`app.search_terms` 先做 NFKC 与小写，英文词两个字符以上整体保留，汉字连续段取两字词与单字；`packages/core/src/search.ts` 是它的 TypeScript 镜像，测试逐份核对两边一致。查询按 IDF 选词（最多 64 个，语料 20 个片段以上时去掉出现在一半以上片段的词），最稀有的几个词经 GIN 索引筛候选（合计不超过 600 个片段），再按 BM25（k1=1.2，b=0.75）排序。GIN 索引关闭 pending list，避免批量导入后检索变慢。`pnpm retrieval:eval` 用固定合成案例对比旧实现，见 [质量检查说明](../quality/README.md#检索基准)。
+
+`event()` 在写入事件的同一事务里发出 `pg_notify('app_events')`，提交后才送达。API 用一条专门的连接 `LISTEN`（`packages/core/src/event-wake.ts`），有事件提交就立即唤醒各 SSE 连接去读；监听正常时每秒只核对登录是否仍有效，每 10 秒兜底读一次；监听断开时退回每秒读一次并自动重连。一页读满 100 条时会接着读，不等下一次唤醒。浏览器按事件类型只刷新受影响的查询（`apps/web/src/live.ts` 的 `affected`），未知类型刷新全部；实时连接正常时各页面不再轮询，只有运行中的任务每 15 秒读一次以更新用时，连接断开时恢复原来的轮询间隔。写操作成功后只刷新相关路径（`refresh(client, …)`）。
+
+“今天”页尚未发出的输入存放在 `app.drafts`（迁移 `0018`）：停止输入 0.8 秒后保存，带上本设备最后见到的版本号，版本不符返回 409。另一台设备保存了不同内容时，若这里没有改过就直接换成那一份，否则提示由本人选择“使用那一份 / 保留这里的”，不会静默覆盖。发出后按版本删除。自动保存不留幂等回执，避免频繁保存堆积记录；浏览器的 sessionStorage 仍是工作副本和离线时的唯一副本。
 
 `events.id` 只代表分配顺序。已提交事件经独立串行发布分配 `stream_id`，SSE 使用该游标，避免长事务晚提交导致事件漏读。数据库恢复后若浏览器游标超出当前流，发送 `stream.reset` 让浏览器重新拉取状态。写入背压时保留连接待发送位置，退出登录会关闭流。
 
@@ -96,6 +100,14 @@ python3 -m unittest discover -s tests -p test_prepare_courses.py
 模型评阅要求完整练习、用户回答原句、实际提供的资料版本与字符锚点。无法核对时保留回答并记为无法判断；这只验证证据可追溯，不证明模型的语义判断正确。自评继续标为本人反馈。结构有效且已应用的模型判定可在学习页的“更多操作 → 内容版本 → 评阅核对记录”查看；结构错误保留失败状态，不算已完成评阅。
 
 学习会话仅在 waiting_feedback 接收新答案；普通工作任务保留结果后的修改反馈。待评阅回答通过交付 artifact 的同会话 prepare 回执绑定原学习步骤，缺失或步骤已移除时保留回答并停止，不能按当前复习索引猜测。每次回答的评阅回执与作答判定、计划修改同事务保存。准备后续练习失败后，手动重试使用已保存的下一步，不把旧回答再次用于新知识点。固定案例与真实模型评测见 `quality/README.md`。
+
+## 内部记录、锁与数据清理
+
+- **固定锁编号**：所有固定的 PostgreSQL advisory lock 编号集中在 `packages/storage/src/locks.ts`，编号属于已部署契约，不重编、不复用。`pnpm check:architecture` 拒绝其他文件出现这类数字，并检查编号不重复；按文本派生的锁（目标、会话、资料路径）用 `hashtextextended`。
+- **`app.settings` 中的小记录**：只能经 `packages/core/src/kv.ts` 读写，每类键（运行规则快照、计划意图、复习位置、评阅回执、邮件水位、隔离邮件、已导入邮件、自动起草计数、清理日期）登记 zod 结构；键名与存储格式沿用旧版本，无需迁移。读到不合结构的记录会停止处理，不覆盖。架构检查拒绝其他模块直接写这张表。
+- **数据清理**（`packages/core/src/retention.ts`）：维护任务每天最多执行一次，只删除派生数据：已发布 30 天以上的实时事件、已结束 180 天以上的运行的模型调用记录。业务表、步骤回执（等待作答的练习仍要用）和学习检查点不删。
+- **日志**：API 使用 Fastify 自带的 JSON 日志，只记录方法、路由模板、状态和耗时，不记录查询参数、请求体、Authorization 与 Cookie；Worker 每轮运行结束输出一行（run、第几次尝试、结果、耗时）。日志只进容器输出，不写入 `private/`。测试中或设置 `ASSISTANT_LOG=off` 时关闭。
+- **响应契约**：`packages/contracts/src/responses.ts` 为今天概览、任务详情（含研究与办事）声明运行时结构，并以对应的 TypeScript 类型约束；数据库测试解析真实 API 响应，浏览器测试的模拟响应也经同一结构检查，接口与模拟数据不一致会直接报错。
 
 ## 扩展
 

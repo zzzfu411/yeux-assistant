@@ -863,12 +863,12 @@ describe.runIf(Boolean(url))('durable learning with PostgreSQL and LangGraph', (
         [first.id],
       ))!;
       if (fault === 'missing_receipt')
-        await store.exec('DELETE FROM app.settings WHERE key=$1', ['runtime:' + delivered.run_id + ':prepare']);
+        await store.exec("DELETE FROM app.run_steps WHERE run_id=$1 AND name='prepare'", [delivered.run_id]);
       if (fault === 'missing_run') await store.exec('UPDATE app.artifacts SET run_id=NULL WHERE id=$1', [delivered.id]);
       if (fault === 'foreign_run') {
         const foreign = await app.addSession('foreign-work', { prompt: '另一个会话', kind: 'work' });
-        await store.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [
-          'runtime:' + foreign.runId + ':prepare',
+        await store.exec("INSERT INTO app.run_steps(run_id,name,output) VALUES($1,'prepare',$2)", [
+          foreign.runId,
           JSON.stringify({ stepId: 'first-step', waits: true, done: false }),
         ]);
         await store.exec('UPDATE app.artifacts SET run_id=$2 WHERE id=$1', [delivered.id, foreign.runId]);
@@ -938,9 +938,9 @@ describe.runIf(Boolean(url))('durable learning with PostgreSQL and LangGraph', (
           "SELECT a.run_id,r.session_id FROM app.artifacts a JOIN app.runs r ON r.id=a.run_id WHERE a.session_id=$1 AND a.kind='lesson' ORDER BY a.created_at DESC,a.id DESC LIMIT 1",
           [fresh.id],
         ))!;
-        const prepared = (await store.one('SELECT value FROM app.settings WHERE key=$1', [
-          'runtime:' + lesson.run_id + ':prepare',
-        ]))!.value;
+        const prepared = (await store.one("SELECT output FROM app.run_steps WHERE run_id=$1 AND name='prepare'", [
+          lesson.run_id,
+        ]))!.output;
         expect(lesson.session_id).toBe(fresh.id);
         expect(prepared).toMatchObject({ stepId: 'first-step', waits: true, done: false });
         expect((await app.goal(created.goalId)).plan!.steps.some((step) => step.id === prepared.stepId)).toBe(true);

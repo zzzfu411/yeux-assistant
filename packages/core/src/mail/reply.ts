@@ -3,7 +3,7 @@ import { ModelMailDraft, SessionMail } from '../../../contracts/src/mail.js';
 import { AppError, event, id, notify } from '../common.js';
 import { retrieve } from '../knowledge.js';
 import { ModelGateway } from '../model.js';
-import { fence, type RunIdentity } from '../runtime-state.js';
+import { fence, step, type RunIdentity } from '../runtime-state.js';
 import { FLOW_CALL_TIMEOUT_MS } from '../sessions.js';
 import { replySubject, subjectKey, withoutQuotedHistory } from './thread.js';
 
@@ -65,28 +65,48 @@ export async function executeMailReplyRun(store: Store, folder: string, identity
   let provided = new Set<string>(),
     providedCitations = ctx.citations;
   if (generated) {
-    draft = await model.json(
-      ModelMailDraft,
-      INSTRUCTION,
+    const context = {
+      task: '回复邮件：' + ctx.thread.subject + '（收件人由本人确认：' + ctx.session.recipient + '）',
+      latest:
+        '往来记录（旧→新）：\n' + history + (ctx.attempt ? '\n\n本人补充或修改要求：\n' + ctx.attempt.answer : ''),
+      previous: ctx.session.content,
+      rules: confirmed.map((m) => m.key + ': ' + m.content),
+      ruleRecords: confirmed.map((m) => ({
+        key: m.key,
+        version: m.version,
+        commitSha: m.commit_sha ?? null,
+        content: m.content,
+      })),
+      notes: ctx.memories.filter((m) => !m.confirmed).map((m) => m.key + ': ' + m.content),
+      sources: ctx.citations,
+    };
+    const written = await step(
+      store,
+      identity,
+      'draft',
       {
-        task: '回复邮件：' + ctx.thread.subject + '（收件人由本人确认：' + ctx.session.recipient + '）',
-        latest:
-          '往来记录（旧→新）：\n' + history + (ctx.attempt ? '\n\n本人补充或修改要求：\n' + ctx.attempt.answer : ''),
-        previous: ctx.session.content,
-        rules: confirmed.map((m) => m.key + ': ' + m.content),
-        ruleRecords: confirmed.map((m) => ({
-          key: m.key,
-          version: m.version,
-          commitSha: m.commit_sha ?? null,
-          content: m.content,
-        })),
-        notes: ctx.memories.filter((m) => !m.confirmed).map((m) => m.key + ': ' + m.content),
-        sources: ctx.citations,
+        input: [
+          INSTRUCTION,
+          context.task,
+          context.latest,
+          context.previous,
+          context.rules,
+          context.notes,
+          ctx.citations.map((c) => [c.sourceId, c.version, c.start, c.end]),
+        ],
       },
-      { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
+      async () => {
+        const call = await model.call(ModelMailDraft, INSTRUCTION, context, {
+          timeoutMs: FLOW_CALL_TIMEOUT_MS,
+          reserveMs: 5000,
+          profile: 'draft',
+        });
+        return { draft: call.value, provided: call.providedCitations };
+      },
     );
-    provided = new Set(model.providedSourceIds);
-    providedCitations = model.providedCitations;
+    draft = written.draft;
+    provided = new Set(written.provided.map((c) => c.sourceId));
+    providedCitations = written.provided;
   } else {
     draft = {
       subject: ctx.thread.subject,

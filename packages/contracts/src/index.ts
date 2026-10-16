@@ -226,6 +226,8 @@ export const ModelSettingsInput = z
     review_base_url: z.string().max(2000).optional(),
     review_model: z.string().max(300).optional(),
     review_api_key: z.string().max(10000).optional(),
+    // Optional model on the same service for extraction and letter writing. Omitted keeps it; empty clears it.
+    fast_model: z.string().max(300).optional(),
   })
   .strict();
 export const ApprovalDecision = z.object({ digest: z.string().length(64), approve: z.boolean() }).strict();
@@ -297,3 +299,4 @@ export * from './devices.js';
 export * from './source-inputs.js';
 
 export * from './pagination.js';
+export * from './trace.js';

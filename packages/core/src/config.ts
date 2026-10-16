@@ -71,6 +71,7 @@ const PublicSettings = z
     review_base_url: z.string().optional(),
     review_model: z.string().optional(),
     has_review_api_key: z.boolean().optional(),
+    fast_model: z.string().optional(),
   })
   .strict();
 export type ModelSettingsSnapshot = z.infer<typeof PublicSettings>;
@@ -129,6 +130,8 @@ export function validateBaseURL(value: string) {
     throw new AppError('模型地址只接受不含账号、查询参数和片段的 HTTP(S) 地址。');
   return value.replace(/\/+$/, '');
 }
+/** Steps the settings page's single "fast model" field applies to (same service and key). */
+export const FAST_PROFILES = ['extract', 'draft'] as const;
 /**
  * Resolve the endpoint for a model role. The reviewer falls back to the main model, and only
  * reuses the main key when it targets the same service, so a key never leaves its provider.
@@ -264,6 +267,7 @@ export class Settings {
       review_base_url: typeof llm.review?.base_url === 'string' ? llm.review.base_url : '',
       review_model: typeof llm.review?.model === 'string' ? llm.review.model : '',
       has_review_api_key: Boolean(llm.review?.api_key),
+      fast_model: typeof llm.profiles?.extract?.model === 'string' ? llm.profiles.extract.model : '',
     };
   }
   private ledger(value: Record<string, any>): ReceiptLedger {
@@ -321,7 +325,20 @@ export class Settings {
               : {}),
         };
     } else if (data.review_api_key && priorReview) review = { ...priorReview, api_key: data.review_api_key };
-    const { review: _previousReview, ...llm } = value.llm || {};
+    const { review: _previousReview, profiles: priorProfiles, ...llm } = value.llm || {};
+    let profiles: Record<string, Record<string, unknown>> = priorProfiles &&
+    typeof priorProfiles === 'object' &&
+    !Array.isArray(priorProfiles)
+      ? { ...priorProfiles }
+      : {};
+    if (data.fast_model !== undefined) {
+      const fast = data.fast_model.trim();
+      for (const name of FAST_PROFILES) {
+        const { model: _model, ...rest } = profiles[name] && typeof profiles[name] === 'object' ? profiles[name] : {};
+        profiles[name] = fast ? { ...rest, model: fast } : rest;
+        if (!Object.keys(profiles[name]).length) delete profiles[name];
+      }
+    }
     value.llm = {
       ...llm,
       base_url: base,
@@ -329,6 +346,7 @@ export class Settings {
       tools: data.tools,
       ...(data.api_key ? { api_key: data.api_key } : {}),
       ...(review ? { review } : {}),
+      ...(Object.keys(profiles).length ? { profiles } : {}),
     };
     const response = this.snapshot(value);
     if (receiptKey) {

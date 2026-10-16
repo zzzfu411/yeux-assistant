@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import type { PgBoss } from 'pg-boss';
 import type { Store, Tx } from '../packages/storage/src/index.js';
 import { Settings, initializeData, config, modelFor } from '../packages/core/src/config.js';
+import { resolveModel } from '../packages/core/src/model-profiles.js';
 import { Application } from '../packages/core/src/application.js';
 
 describe('configuration snapshots and durable acknowledgements', () => {
@@ -130,6 +131,52 @@ describe('configuration snapshots and durable acknowledgements', () => {
     expect(modelFor({ ...llm, review: { base_url: 'https://b.example/v1', model: 'judge' } }, 'solve').model).toBe(
       'solver',
     );
+  });
+  it('saves one fast model for extraction and letters, keeps other profile tuning, and clears it', async () => {
+    let view = await settings.save({ ...(await input()), fast_model: ' quick-model ' }, 'fast-1');
+    expect(view.fast_model).toBe('quick-model');
+    expect((await config(folder)).llm.profiles).toEqual({
+      extract: { model: 'quick-model' },
+      draft: { model: 'quick-model' },
+    });
+    const value = await config(folder);
+    value.llm.profiles.extract.temperature = 0.1;
+    await writeFile(join(folder, 'config.json'), JSON.stringify(value));
+    // Omitting the field keeps the saved profiles untouched.
+    await settings.save(await input(), 'fast-2');
+    expect((await config(folder)).llm.profiles.extract).toEqual({ model: 'quick-model', temperature: 0.1 });
+    view = await settings.save({ ...(await input()), fast_model: '' }, 'fast-3');
+    expect(view.fast_model).toBe('');
+    expect((await config(folder)).llm.profiles).toEqual({ extract: { temperature: 0.1 } });
+  });
+  it('resolves a profile on the same service and key; an independent reviewer keeps its own model', () => {
+    const llm = {
+      base_url: 'https://a.example/v1',
+      model: 'solver',
+      api_key: 'main',
+      profiles: {
+        extract: { model: 'quick', max_tokens: 2048, temperature: 0.05, reasoning_effort: 'low' },
+        review: { model: 'ignored-when-independent', temperature: 0.4 },
+        draft: { max_tokens: 10, temperature: 9, reasoning_effort: 'extreme' },
+      },
+    };
+    expect(resolveModel(llm, 'extract')).toMatchObject({
+      base_url: 'https://a.example/v1',
+      api_key: 'main',
+      model: 'quick',
+      max_tokens: 2048,
+      temperature: 0.05,
+      reasoning_effort: 'low',
+    });
+    // Out-of-range tuning falls back to the profile defaults instead of reaching the provider.
+    const draft = resolveModel(llm, 'draft');
+    expect(draft).toMatchObject({ model: 'solver', max_tokens: 4096, temperature: 0.3 });
+    expect(draft).not.toHaveProperty('reasoning_effort');
+    expect(resolveModel(llm, 'review')).toMatchObject({ model: 'ignored-when-independent', temperature: 0.4 });
+    const judged = resolveModel({ ...llm, review: { base_url: 'https://b.example/v1', model: 'judge' } }, 'review');
+    expect(judged).toMatchObject({ base_url: 'https://b.example/v1', model: 'judge', temperature: 0.4 });
+    expect(judged.api_key).toBeUndefined();
+    expect(resolveModel(llm, 'solve')).toMatchObject({ model: 'solver', temperature: 0.3, max_tokens: 4096 });
   });
   it('still reads acknowledgements stored before the reviewer existed', async () => {
     const request = await input();

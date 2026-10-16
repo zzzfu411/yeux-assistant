@@ -6,7 +6,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Store } from '../packages/storage/src/index.js';
 import { buildServer } from '../apps/api/src/server.js';
-import { claimRun } from '../packages/core/src/runtime-state.js';
+import { claimRun, failRun } from '../packages/core/src/runtime-state.js';
 import { executeMailReplyRun } from '../packages/core/src/mail/reply.js';
 import { executeErrandRun } from '../packages/core/src/errands/service.js';
 import { SimulatedMailbox, compose } from '../packages/core/src/mail/mailbox.js';
@@ -349,6 +349,58 @@ describe.runIf(Boolean(url))('mail threads, reply drafts and notice handling (sy
     expect(detail.session.state).toBe('ready');
     expect(detail.errand.mailSession).toMatchObject({ recipient: 'gse-ta@example.edu', state: 'ready' });
     expect(detail.errand.state.answers).toHaveLength(1);
+  });
+
+  it('an owner retry after a failed letter reuses the unchanged plan of the failed run', async () => {
+    failMail = 1;
+    const created = (await api('POST', '/errands', { text: notice })).json();
+    await expect(execute(created.sessionId, executeErrandRun)).rejects.toThrow(/HTTP 500/);
+    const failed = (await built.store.one('SELECT current_run_id FROM app.sessions WHERE id=$1', [created.sessionId]))!;
+    const generation = (await built.store.one('SELECT generation FROM app.runs WHERE id=$1', [failed.current_run_id]))!;
+    await failRun(built.store, { runId: failed.current_run_id, generation: generation.generation }, '合成失败', true);
+    const counts = () => ({
+      extract: instructions.filter((line) => line === 'ERRAND_EXTRACT').length,
+      plan: instructions.filter((line) => line === 'ERRAND_PLAN').length,
+      mail: instructions.filter((line) => line === 'ERRAND_MAIL').length,
+    });
+    const before = counts();
+    const session = (await api('GET', '/sessions/' + created.sessionId)).json().session;
+    expect((await api('POST', `/sessions/${created.sessionId}/retry`, { revision: session.revision })).statusCode).toBe(
+      200,
+    );
+    await execute(created.sessionId, executeErrandRun);
+    // Facts were saved, the plan's inputs did not change, so only the letter is asked for again.
+    expect(counts()).toEqual({ ...before, mail: before.mail + 1 });
+    const retried = (await built.store.one('SELECT current_run_id FROM app.sessions WHERE id=$1', [
+      created.sessionId,
+    ]))!;
+    expect(
+      await built.store.rows('SELECT name,reused_from FROM app.run_steps WHERE run_id=$1 ORDER BY name', [
+        retried.current_run_id,
+      ]),
+    ).toEqual([
+      { name: 'mail', reused_from: null },
+      { name: 'plan', reused_from: failed.current_run_id },
+    ]);
+    const detail = (await api('GET', '/sessions/' + created.sessionId)).json();
+    expect(detail.session.state).toBe('ready');
+    expect(detail.errand.mailSession).toMatchObject({ recipient: 'gse-ta@example.edu' });
+    // The trace shows both runs: the failed letter, then the restart that reused the plan.
+    const trace = (await api('GET', `/sessions/${created.sessionId}/trace`)).json();
+    expect(trace.runs.map((run: any) => [run.state, run.resumeFrom])).toEqual([
+      ['succeeded', failed.current_run_id],
+      ['failed', null],
+    ]);
+    expect(trace.runs[0].calls.map((call: any) => [call.step, call.profile, call.outcome])).toEqual([
+      ['mail', 'draft', 'ok'],
+    ]);
+    expect(trace.runs[1].calls.map((call: any) => [call.step, call.profile, call.outcome])).toEqual([
+      ['extract', 'extract', 'ok'],
+      ['plan', 'plan', 'ok'],
+      ['mail', 'draft', 'http_error'],
+    ]);
+    expect(trace.runs[0].steps.find((item: any) => item.name === 'plan').reusedFrom).toBe(failed.current_run_id);
+    expect((await api('GET', '/sessions/missing-session/trace')).statusCode).toBe(404);
   });
 
   it('turns an owner edit into an unconfirmed rule proposal, never straight into Git', async () => {

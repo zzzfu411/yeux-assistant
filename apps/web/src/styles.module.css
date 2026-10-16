@@ -259,6 +259,17 @@ a.row:hover strong{color:var(--accent)}
 .disclosure[open]>summary{margin-bottom:14px}
 .disclosure>p{font-size:14px;color:var(--muted)}
 .disclosure>summary{display:inline-flex;align-items:center;min-height:36px}
+.traceRun{margin:0 0 18px}
+.traceHead{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;margin:0 0 8px;font-size:13px;color:var(--muted)}
+.traceHead>strong{color:var(--ink);font-family:var(--display)}
+.traceScroll{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.traceTable{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+.traceTable th,.traceTable td{padding:7px 12px;text-align:left;border-bottom:1px dashed var(--line);white-space:nowrap}
+.traceTable thead th{font-size:12px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--line)}
+.traceTable tbody th{font-weight:600}
+.traceTable tbody th small{font-weight:400;color:var(--muted)}
+.traceTable tr:last-child>*{border-bottom:0}
+.traceTable tr[data-outcome=invalid] td:nth-child(2),.traceTable tr[data-outcome=http_error] td:nth-child(2),.traceTable tr[data-outcome=unavailable] td:nth-child(2){color:var(--danger)}
 .metadata{margin:13px 0;font-size:14px}
 .metadata>div{display:grid;grid-template-columns:80px minmax(0,1fr);gap:12px;margin:12px 0}
 .metadata dt{color:var(--muted);font-size:13px}

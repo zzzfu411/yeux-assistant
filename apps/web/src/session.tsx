@@ -12,6 +12,7 @@ import { date, ErrorNotice, Heading, QueryState, Result, Sources, Status } from 
 import { MemoryEditor } from './memory-editor';
 import { ErrandPanel } from './errand';
 import { ResearchBanner, ResearchProgress } from './research';
+import { RunTrace } from './trace';
 import s from './styles.module.css';
 import { Icon } from './icons';
 
@@ -374,6 +375,7 @@ function SessionContent({
           ))}
         </details>
       )}
+      {session.currentRunId && <RunTrace sessionId={session.id} />}
       {attempts.map((attempt) => (
         <section className={s.conversation} key={attempt.id}>
           <div className={s.userAnswer}>

@@ -7,7 +7,7 @@ import { ASSESSMENT_INSTRUCTION, guardAssessment } from './assessment.js';
 import { AppError, digest, event, id, notify } from './common.js';
 import { citationFromRow, retrieve } from './knowledge.js';
 import { ModelGateway, type ModelContext } from './model.js';
-import { commitNode, fence, nodeReceipt, readContext, type RunIdentity } from './runtime-state.js';
+import { commitNode, fence, nodeReceipt, readContext, traced, type RunIdentity } from './runtime-state.js';
 
 type Step = { id: string; title: string; objective: string; state: 'pending' | 'practicing' | 'practiced' };
 const LearningState = Annotation.Root({
@@ -48,8 +48,8 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
       // review. Grade the step that produced this session's delivered exercise.
       const prepared = delivered?.run_id
         ? await tx.one(
-            `SELECT s.value FROM app.settings s JOIN app.runs r ON s.key='runtime:' || r.id || ':prepare'
-        WHERE r.id=$1 AND r.session_id=$2`,
+            `SELECT st.output AS value FROM app.run_steps st JOIN app.runs r ON r.id=st.run_id
+        WHERE st.name='prepare' AND r.id=$1 AND r.session_id=$2`,
             [delivered.run_id, context.session.id],
           )
         : undefined;
@@ -180,129 +180,134 @@ export function nextReview(stage: number, intervals: number[], verdict: string, 
 export function buildLearningGraph(store: Store, folder: string, saver: PostgresSaver, identity: RunIdentity) {
   const model = new ModelGateway(store, folder, identity);
   const graph = new StateGraph(LearningState)
-    .addNode('plan', async () => {
-      const saved = await nodeReceipt<Partial<State>>(store, identity, 'plan');
-      if (saved) return saved;
-      const ctx = await contextFor(store, identity, null);
-      let proposed: { steps: { title: string; objective: string }[]; rationale: string } | undefined;
-      if (ctx.goal && (!ctx.plan || (ctx.savedIntent && ctx.savedIntent !== ctx.intent))) {
-        proposed = (await model.configured())
-          ? await model.json(
-              ModelPlan,
-              '把学习目标拆成 1–6 个有顺序、可以练习验证的知识点。只准备学习计划，不声称用户已掌握。根据现有原始资料安排，不编造课程要求。',
-              ctx.modelContext,
-            )
-          : {
-              steps: [{ title: ctx.goal.title, objective: ctx.goal.outcome || '阅读资料，用自己的话解释并举例。' }],
-              rationale: '尚未配置模型，先从一个可自评的学习步骤开始。',
-            };
-      }
-      return commitNode(store, identity, 'plan', async (tx, current) => {
-        let steps = ctx.steps;
-        if (proposed && current.goal) {
-          const version =
-            Number(
-              (await tx.one('SELECT coalesce(max(version),0) n FROM app.plans WHERE goal_id=$1', [current.goal.id]))!.n,
-            ) + 1;
-          steps = proposed.steps.map((s) => ({ ...s, id: id(), state: 'pending' as const }));
-          await tx.exec(
-            'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
-            [id(), current.goal.id, version, JSON.stringify(steps), proposed.rationale, current.goal.revision],
-          );
-          await tx.exec(
-            'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-            ['plan-intent:' + current.goal.id, JSON.stringify(ctx.intent)],
-          );
-          await event(tx, 'plan.updated', current.goal.id, { version });
+    .addNode('plan', () =>
+      traced('plan', async () => {
+        const saved = await nodeReceipt<Partial<State>>(store, identity, 'plan');
+        if (saved) return saved;
+        const ctx = await contextFor(store, identity, null);
+        let proposed: { steps: { title: string; objective: string }[]; rationale: string } | undefined;
+        if (ctx.goal && (!ctx.plan || (ctx.savedIntent && ctx.savedIntent !== ctx.intent))) {
+          proposed = (await model.configured())
+            ? await model.json(
+                ModelPlan,
+                '把学习目标拆成 1–6 个有顺序、可以练习验证的知识点。只准备学习计划，不声称用户已掌握。根据现有原始资料安排，不编造课程要求。',
+                ctx.modelContext,
+              )
+            : {
+                steps: [{ title: ctx.goal.title, objective: ctx.goal.outcome || '阅读资料，用自己的话解释并举例。' }],
+                rationale: '尚未配置模型，先从一个可自评的学习步骤开始。',
+              };
         }
-        return {
-          stepId: (steps.find((s) => s.state !== 'practiced') || steps[ctx.reviewIndex % steps.length])?.id || null,
-          done: false,
-          waits: current.session.kind === 'study',
-        };
-      });
-    })
-    .addNode('prepare', async (state) => {
-      const saved = await nodeReceipt<Partial<State>>(store, identity, 'prepare');
-      if (saved) return saved;
-      const ctx = await contextFor(store, identity, state.stepId);
-      const study = ctx.session.kind === 'study';
-      const feedback = ctx.attempt && ctx.attempt.verdict !== 'pending' ? ctx.attempt.feedback : '';
-      const enabled = await model.configured();
-      const result = enabled
-        ? await model.json(
-            ModelLesson,
-            study
-              ? '准备当前知识点的一小段讲解和一个可回答的练习；若已有评阅反馈，针对薄弱点调整，若上一点已通过则进入下一点。保留原始来源，引用只用给定的 sourceId。不要自行作答或宣布用户学完。'
-              : '按用户最新请求生成可直接使用的草稿或分析。结合最新反馈与先前交付内容；对外发送、提交和真实执行都未发生，不能声称已完成。引用只用给定的 sourceId。',
-            { ...ctx.modelContext, task: ctx.modelContext.task + (feedback ? '\n最近反馈：' + feedback : '') },
-          )
-        : {
-            content: study
-              ? localLesson(ctx.step?.title || ctx.session.title, ctx.citations, feedback)
-              : [
-                  '尚未配置模型，已保存这项请求。',
-                  ctx.modelContext.latest,
-                  ...ctx.citations.slice(0, 3).map((c) => `资料：${c.title}\n\n${c.quote}`),
-                ].join('\n\n'),
-            sourceIds: ctx.citations.map((c) => c.sourceId),
-          };
-      const provided = new Set(enabled ? model.providedSourceIds : ctx.citations.map((c) => c.sourceId));
-      if (result.sourceIds.some((source) => !provided.has(source)))
-        throw new AppError('模型引用了未提供的资料，已保留进度并重新核对。', 503, 'model_invalid_citation');
-      const citations = (enabled ? model.providedCitations : ctx.citations).filter((c) =>
-        result.sourceIds.includes(c.sourceId),
-      );
-      return commitNode(store, identity, 'prepare', async (tx, current) => {
-        if (ctx.plan && ctx.step && ctx.step.state !== 'practiced') {
-          const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [
-            ctx.goal!.id,
-          ]);
-          if (latest && latest.version === ctx.plan.version && ctx.step.state === 'pending') {
-            const steps = (latest.steps as Step[]).map((s) =>
-              s.id === ctx.step!.id ? { ...s, state: 'practicing' } : s,
-            );
+        return commitNode(store, identity, 'plan', async (tx, current) => {
+          let steps = ctx.steps;
+          if (proposed && current.goal) {
+            const version =
+              Number(
+                (await tx.one('SELECT coalesce(max(version),0) n FROM app.plans WHERE goal_id=$1', [current.goal.id]))!
+                  .n,
+              ) + 1;
+            steps = proposed.steps.map((s) => ({ ...s, id: id(), state: 'pending' as const }));
             await tx.exec(
               'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
-              [
-                id(),
-                current.goal!.id,
-                latest.version + 1,
-                JSON.stringify(steps),
-                '开始准备下一步练习。',
-                current.goal!.revision,
-              ],
+              [id(), current.goal.id, version, JSON.stringify(steps), proposed.rationale, current.goal.revision],
             );
-            await event(tx, 'plan.updated', current.goal!.id, { version: latest.version + 1 });
+            await tx.exec(
+              'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+              ['plan-intent:' + current.goal.id, JSON.stringify(ctx.intent)],
+            );
+            await event(tx, 'plan.updated', current.goal.id, { version });
           }
-        }
-        await tx.exec(
-          'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
-          [
-            id(),
-            current.session.id,
-            current.run.id,
-            study ? 'lesson' : 'response',
-            result.content,
-            enabled ? 'model_generated' : 'local_guidance',
-            JSON.stringify(citations),
-            `lesson:${current.run.id}`,
-          ],
+          return {
+            stepId: (steps.find((s) => s.state !== 'practiced') || steps[ctx.reviewIndex % steps.length])?.id || null,
+            done: false,
+            waits: current.session.kind === 'study',
+          };
+        });
+      }),
+    )
+    .addNode('prepare', (state) =>
+      traced('prepare', async () => {
+        const saved = await nodeReceipt<Partial<State>>(store, identity, 'prepare');
+        if (saved) return saved;
+        const ctx = await contextFor(store, identity, state.stepId);
+        const study = ctx.session.kind === 'study';
+        const feedback = ctx.attempt && ctx.attempt.verdict !== 'pending' ? ctx.attempt.feedback : '';
+        const enabled = await model.configured();
+        const result = enabled
+          ? await model.json(
+              ModelLesson,
+              study
+                ? '准备当前知识点的一小段讲解和一个可回答的练习；若已有评阅反馈，针对薄弱点调整，若上一点已通过则进入下一点。保留原始来源，引用只用给定的 sourceId。不要自行作答或宣布用户学完。'
+                : '按用户最新请求生成可直接使用的草稿或分析。结合最新反馈与先前交付内容；对外发送、提交和真实执行都未发生，不能声称已完成。引用只用给定的 sourceId。',
+              { ...ctx.modelContext, task: ctx.modelContext.task + (feedback ? '\n最近反馈：' + feedback : '') },
+            )
+          : {
+              content: study
+                ? localLesson(ctx.step?.title || ctx.session.title, ctx.citations, feedback)
+                : [
+                    '尚未配置模型，已保存这项请求。',
+                    ctx.modelContext.latest,
+                    ...ctx.citations.slice(0, 3).map((c) => `资料：${c.title}\n\n${c.quote}`),
+                  ].join('\n\n'),
+              sourceIds: ctx.citations.map((c) => c.sourceId),
+            };
+        const provided = new Set(enabled ? model.providedSourceIds : ctx.citations.map((c) => c.sourceId));
+        if (result.sourceIds.some((source) => !provided.has(source)))
+          throw new AppError('模型引用了未提供的资料，已保留进度并重新核对。', 503, 'model_invalid_citation');
+        const citations = (enabled ? model.providedCitations : ctx.citations).filter((c) =>
+          result.sourceIds.includes(c.sourceId),
         );
-        // Publish an actionable state only after the synchronous graph checkpoint commits.
-        await tx.exec(
-          "UPDATE app.sessions SET content=$2,citations=$3,state='running',error='',revision=revision+1,updated_at=now() WHERE id=$1",
-          [current.session.id, result.content, JSON.stringify(citations)],
-        );
-        if (!study && ctx.attempt?.verdict === 'pending')
+        return commitNode(store, identity, 'prepare', async (tx, current) => {
+          if (ctx.plan && ctx.step && ctx.step.state !== 'practiced') {
+            const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [
+              ctx.goal!.id,
+            ]);
+            if (latest && latest.version === ctx.plan.version && ctx.step.state === 'pending') {
+              const steps = (latest.steps as Step[]).map((s) =>
+                s.id === ctx.step!.id ? { ...s, state: 'practicing' } : s,
+              );
+              await tx.exec(
+                'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
+                [
+                  id(),
+                  current.goal!.id,
+                  latest.version + 1,
+                  JSON.stringify(steps),
+                  '开始准备下一步练习。',
+                  current.goal!.revision,
+                ],
+              );
+              await event(tx, 'plan.updated', current.goal!.id, { version: latest.version + 1 });
+            }
+          }
           await tx.exec(
-            "UPDATE app.attempts SET verdict='unclear',feedback='已作为后续请求处理；这不是学习掌握评估。',evidence=answer WHERE id=$1",
-            [ctx.attempt.id],
+            'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
+            [
+              id(),
+              current.session.id,
+              current.run.id,
+              study ? 'lesson' : 'response',
+              result.content,
+              enabled ? 'model_generated' : 'local_guidance',
+              JSON.stringify(citations),
+              `lesson:${current.run.id}`,
+            ],
           );
-        await event(tx, 'session.updated', current.session.id, { runId: current.run.id });
-        return { stepId: ctx.step?.id || null, waits: study, done: !study };
-      });
-    })
+          // Publish an actionable state only after the synchronous graph checkpoint commits.
+          await tx.exec(
+            "UPDATE app.sessions SET content=$2,citations=$3,state='running',error='',revision=revision+1,updated_at=now() WHERE id=$1",
+            [current.session.id, result.content, JSON.stringify(citations)],
+          );
+          if (!study && ctx.attempt?.verdict === 'pending')
+            await tx.exec(
+              "UPDATE app.attempts SET verdict='unclear',feedback='已作为后续请求处理；这不是学习掌握评估。',evidence=answer WHERE id=$1",
+              [ctx.attempt.id],
+            );
+          await event(tx, 'session.updated', current.session.id, { runId: current.run.id });
+          return { stepId: ctx.step?.id || null, waits: study, done: !study };
+        });
+      }),
+    )
     .addNode('answer', () => {
       const answer = interrupt<unknown, { attemptId: string }>({
         kind: 'learning_feedback',
@@ -310,206 +315,208 @@ export function buildLearningGraph(store: Store, folder: string, saver: Postgres
       });
       return { attemptId: answer.attemptId };
     })
-    .addNode('assess', async (state) => {
-      const saved = await nodeReceipt<Partial<State>>(store, identity, 'assess');
-      if (saved) return saved;
-      const ctx = await contextFor(store, identity, state.stepId, true);
-      if (!ctx.attempt || ctx.attempt.id !== state.attemptId)
-        throw new AppError('没有找到这次回答，当前进度已保留。', 409, 'attempt_missing');
-      // A manual retry starts a new graph thread. The old answer must resume its
-      // committed continuation, never be reassessed against a newly selected step.
-      if (ctx.attempt.verdict !== 'pending')
-        return store.transaction(async (tx) => {
-          await fence(tx, identity);
-          const receipt =
-            (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['assessment:' + ctx.attempt!.id])) ??
-            (await tx.one(
-              `SELECT s.value FROM app.settings s JOIN app.runs r ON s.key='runtime:' || r.id || ':assess'
-            WHERE r.session_id=$1 AND r.input->>'attemptId'=$2 ORDER BY r.created_at LIMIT 1`,
-              [ctx.session.id, ctx.attempt!.id],
-            ));
-          if (!receipt)
-            throw new AppError(
-              '这次回答已评阅，但缺少恢复记录。已有判定已保留，请重新开始练习。',
-              409,
-              'assessment_receipt_missing',
-            );
-          return { stepId: receipt.value.stepId, done: receipt.value.done };
-        });
-      const self = ctx.attempt.self_report;
-      const enabled = await model.configured();
-      const proposed: ModelAssessment = self
-        ? {
-            verdict: self === 'understood' ? 'pass' : 'retry',
-            feedback:
-              self === 'understood'
-                ? '已记录你的自评：理解了这个知识点。后续会安排复习。'
-                : '已记录你的自评：还需要练习。继续巩固当前知识点。',
-            evidence: ctx.attempt.answer,
-            answerQuotes: [],
-            citationRefs: [],
-          }
-        : enabled
-          ? await model.json(ModelAssessment, ASSESSMENT_INSTRUCTION, ctx.modelContext, { assessment: true })
-          : {
-              verdict: 'unclear',
-              feedback: '回答已保存。尚未配置模型，因此没有自动评阅；可以继续练习，或提交“已理解 / 需要练习”的自评。',
+    .addNode('assess', (state) =>
+      traced('assess', async () => {
+        const saved = await nodeReceipt<Partial<State>>(store, identity, 'assess');
+        if (saved) return saved;
+        const ctx = await contextFor(store, identity, state.stepId, true);
+        if (!ctx.attempt || ctx.attempt.id !== state.attemptId)
+          throw new AppError('没有找到这次回答，当前进度已保留。', 409, 'attempt_missing');
+        // A manual retry starts a new graph thread. The old answer must resume its
+        // committed continuation, never be reassessed against a newly selected step.
+        if (ctx.attempt.verdict !== 'pending')
+          return store.transaction(async (tx) => {
+            await fence(tx, identity);
+            const receipt =
+              (await tx.one('SELECT value FROM app.settings WHERE key=$1', ['assessment:' + ctx.attempt!.id])) ??
+              (await tx.one(
+                `SELECT st.output AS value FROM app.run_steps st JOIN app.runs r ON r.id=st.run_id
+            WHERE st.name='assess' AND r.session_id=$1 AND r.input->>'attemptId'=$2 ORDER BY r.created_at LIMIT 1`,
+                [ctx.session.id, ctx.attempt!.id],
+              ));
+            if (!receipt)
+              throw new AppError(
+                '这次回答已评阅，但缺少恢复记录。已有判定已保留，请重新开始练习。',
+                409,
+                'assessment_receipt_missing',
+              );
+            return { stepId: receipt.value.stepId, done: receipt.value.done };
+          });
+        const self = ctx.attempt.self_report;
+        const enabled = await model.configured();
+        const proposed: ModelAssessment = self
+          ? {
+              verdict: self === 'understood' ? 'pass' : 'retry',
+              feedback:
+                self === 'understood'
+                  ? '已记录你的自评：理解了这个知识点。后续会安排复习。'
+                  : '已记录你的自评：还需要练习。继续巩固当前知识点。',
               evidence: ctx.attempt.answer,
               answerQuotes: [],
               citationRefs: [],
-            };
-      const guarded =
-        !self && enabled
-          ? guardAssessment(proposed, {
-              answer: ctx.attempt.answer,
-              exerciseComplete: model.exerciseComplete,
+            }
+          : enabled
+            ? await model.json(ModelAssessment, ASSESSMENT_INSTRUCTION, ctx.modelContext, { assessment: true })
+            : {
+                verdict: 'unclear',
+                feedback: '回答已保存。尚未配置模型，因此没有自动评阅；可以继续练习，或提交“已理解 / 需要练习”的自评。',
+                evidence: ctx.attempt.answer,
+                answerQuotes: [],
+                citationRefs: [],
+              };
+        const guarded =
+          !self && enabled
+            ? guardAssessment(proposed, {
+                answer: ctx.attempt.answer,
+                exerciseComplete: model.exerciseComplete,
+                providedCitations: model.providedCitations,
+              })
+            : null;
+        const assessment = guarded?.assessment ?? proposed;
+        const audit = guarded
+          ? {
+              version: 1,
+              attemptId: ctx.attempt.id,
+              stepId: ctx.step?.id ?? null,
+              modelResponse: model.lastResponse,
+              accepted: assessment,
+              reasons: guarded.reasons,
+              downgraded: guarded.downgraded,
+              exercise: {
+                artifactId: ctx.delivered?.id ?? null,
+                digest: digest(ctx.modelContext.previous),
+                characters: ctx.modelContext.previous.length,
+                complete: model.exerciseComplete,
+              },
               providedCitations: model.providedCitations,
-            })
+              scope: '仅保存结构有效且应用到本次回答的模型回复；证据可追溯性检查不代表语义判定已经验证。',
+            }
           : null;
-      const assessment = guarded?.assessment ?? proposed;
-      const audit = guarded
-        ? {
-            version: 1,
-            attemptId: ctx.attempt.id,
-            stepId: ctx.step?.id ?? null,
-            modelResponse: model.lastResponse,
-            accepted: assessment,
-            reasons: guarded.reasons,
-            downgraded: guarded.downgraded,
-            exercise: {
-              artifactId: ctx.delivered?.id ?? null,
-              digest: digest(ctx.modelContext.previous),
-              characters: ctx.modelContext.previous.length,
-              complete: model.exerciseComplete,
-            },
-            providedCitations: model.providedCitations,
-            scope: '仅保存结构有效且应用到本次回答的模型回复；证据可追溯性检查不代表语义判定已经验证。',
-          }
-        : null;
-      const source = self ? 'user_report' : enabled ? 'model_estimate' : 'ungraded';
-      return commitNode(store, identity, 'assess', async (tx, current) => {
-        await tx.exec(
-          'UPDATE app.attempts SET verdict=$2,feedback=$3,evidence=$4,source=$5 WHERE id=$1 AND session_id=$6',
-          [ctx.attempt!.id, assessment.verdict, assessment.feedback, assessment.evidence, source, current.session.id],
-        );
-        await tx.exec(
-          'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(dedupe_key) DO NOTHING',
-          [
-            id(),
-            current.session.id,
-            current.run.id,
-            'feedback',
-            assessment.feedback,
-            source,
-            `feedback:${ctx.attempt!.id}`,
-          ],
-        );
-        if (audit)
+        const source = self ? 'user_report' : enabled ? 'model_estimate' : 'ungraded';
+        return commitNode(store, identity, 'assess', async (tx, current) => {
           await tx.exec(
-            'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
+            'UPDATE app.attempts SET verdict=$2,feedback=$3,evidence=$4,source=$5 WHERE id=$1 AND session_id=$6',
+            [ctx.attempt!.id, assessment.verdict, assessment.feedback, assessment.evidence, source, current.session.id],
+          );
+          await tx.exec(
+            'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(dedupe_key) DO NOTHING',
             [
               id(),
               current.session.id,
               current.run.id,
-              'assessment_audit',
-              JSON.stringify(audit, null, 2),
-              'model_estimate',
-              JSON.stringify(model.providedCitations),
-              `assessment-audit:${ctx.attempt!.id}`,
+              'feedback',
+              assessment.feedback,
+              source,
+              `feedback:${ctx.attempt!.id}`,
             ],
           );
-        let nextStep = ctx.step?.id || null,
-          done = assessment.verdict === 'pass' && !current.goal;
-        if (current.goal) {
-          const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [
-            current.goal.id,
-          ]);
-          const steps = (latest?.steps || []) as Step[];
-          if (
-            assessment.verdict === 'retry' &&
-            ctx.step &&
-            steps.some((s) => s.id === ctx.step!.id && s.state === 'practiced')
-          ) {
-            const changed = steps.map((s) => (s.id === ctx.step!.id ? { ...s, state: 'practicing' as const } : s));
+          if (audit)
             await tx.exec(
-              'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
+              'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
               [
                 id(),
-                current.goal.id,
-                latest!.version + 1,
-                JSON.stringify(changed),
-                '复习中需要继续练习，保留此前的作答记录。',
-                current.goal.revision,
+                current.session.id,
+                current.run.id,
+                'assessment_audit',
+                JSON.stringify(audit, null, 2),
+                'model_estimate',
+                JSON.stringify(model.providedCitations),
+                `assessment-audit:${ctx.attempt!.id}`,
               ],
             );
-            await event(tx, 'plan.updated', current.goal.id, { version: latest!.version + 1 });
+          let nextStep = ctx.step?.id || null,
+            done = assessment.verdict === 'pass' && !current.goal;
+          if (current.goal) {
+            const latest = await tx.one('SELECT * FROM app.plans WHERE goal_id=$1 ORDER BY version DESC LIMIT 1', [
+              current.goal.id,
+            ]);
+            const steps = (latest?.steps || []) as Step[];
+            if (
+              assessment.verdict === 'retry' &&
+              ctx.step &&
+              steps.some((s) => s.id === ctx.step!.id && s.state === 'practiced')
+            ) {
+              const changed = steps.map((s) => (s.id === ctx.step!.id ? { ...s, state: 'practicing' as const } : s));
+              await tx.exec(
+                'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
+                [
+                  id(),
+                  current.goal.id,
+                  latest!.version + 1,
+                  JSON.stringify(changed),
+                  '复习中需要继续练习，保留此前的作答记录。',
+                  current.goal.revision,
+                ],
+              );
+              await event(tx, 'plan.updated', current.goal.id, { version: latest!.version + 1 });
+            }
+            if (assessment.verdict === 'pass' && ctx.step && steps.some((s) => s.id === ctx.step!.id)) {
+              const changed = steps.map((s) => (s.id === ctx.step!.id ? { ...s, state: 'practiced' as const } : s));
+              await tx.exec(
+                'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
+                [
+                  id(),
+                  current.goal.id,
+                  latest!.version + 1,
+                  JSON.stringify(changed),
+                  assessment.feedback,
+                  current.goal.revision,
+                ],
+              );
+              const pending = changed.find((s) => s.state !== 'practiced');
+              nextStep = pending?.id || null;
+              done = !pending;
+              await tx.exec(
+                'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                [
+                  'review-index:' + current.goal.id,
+                  JSON.stringify((changed.findIndex((s) => s.id === ctx.step!.id) + 1) % changed.length),
+                ],
+              );
+              await event(tx, 'plan.updated', current.goal.id, { version: latest!.version + 1 });
+            }
+            const review =
+              assessment.verdict === 'pass' && !done
+                ? { stage: current.goal.review_stage, at: new Date(Date.now() + current.goal.intervals[0] * 1000) }
+                : nextReview(current.goal.review_stage, current.goal.intervals, assessment.verdict);
+            await tx.exec('UPDATE app.goals SET review_stage=$2,next_review=$3,updated_at=now() WHERE id=$1', [
+              current.goal.id,
+              review.stage,
+              review.at,
+            ]);
+            await event(tx, 'goal.updated', current.goal.id);
           }
-          if (assessment.verdict === 'pass' && ctx.step && steps.some((s) => s.id === ctx.step!.id)) {
-            const changed = steps.map((s) => (s.id === ctx.step!.id ? { ...s, state: 'practiced' as const } : s));
+          if (done) {
+            const content =
+              assessment.feedback +
+              (current.goal
+                ? '\n\n这轮练习已完成。目标仍保持进行中，复习会按计划准备；是否完成整个目标由你确认。'
+                : '\n\n这轮练习已完成。');
             await tx.exec(
-              'INSERT INTO app.plans(id,goal_id,version,steps,rationale,goal_revision) VALUES($1,$2,$3,$4,$5,$6)',
-              [
-                id(),
-                current.goal.id,
-                latest!.version + 1,
-                JSON.stringify(changed),
-                assessment.feedback,
-                current.goal.revision,
-              ],
+              "UPDATE app.sessions SET content=$2,state='running',revision=revision+1,updated_at=now() WHERE id=$1",
+              [current.session.id, content],
             );
-            const pending = changed.find((s) => s.state !== 'practiced');
-            nextStep = pending?.id || null;
-            done = !pending;
-            await tx.exec(
-              'INSERT INTO app.settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-              [
-                'review-index:' + current.goal.id,
-                JSON.stringify((changed.findIndex((s) => s.id === ctx.step!.id) + 1) % changed.length),
-              ],
-            );
-            await event(tx, 'plan.updated', current.goal.id, { version: latest!.version + 1 });
           }
-          const review =
-            assessment.verdict === 'pass' && !done
-              ? { stage: current.goal.review_stage, at: new Date(Date.now() + current.goal.intervals[0] * 1000) }
-              : nextReview(current.goal.review_stage, current.goal.intervals, assessment.verdict);
-          await tx.exec('UPDATE app.goals SET review_stage=$2,next_review=$3,updated_at=now() WHERE id=$1', [
-            current.goal.id,
-            review.stage,
-            review.at,
-          ]);
-          await event(tx, 'goal.updated', current.goal.id);
-        }
-        if (done) {
-          const content =
-            assessment.feedback +
-            (current.goal
-              ? '\n\n这轮练习已完成。目标仍保持进行中，复习会按计划准备；是否完成整个目标由你确认。'
-              : '\n\n这轮练习已完成。');
-          await tx.exec(
-            "UPDATE app.sessions SET content=$2,state='running',revision=revision+1,updated_at=now() WHERE id=$1",
-            [current.session.id, content],
-          );
-        }
-        await event(tx, 'attempt.assessed', current.session.id, {
-          attemptId: ctx.attempt!.id,
-          verdict: assessment.verdict,
-          source,
-        });
-        await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [
-          'assessment:' + ctx.attempt!.id,
-          JSON.stringify({
+          await event(tx, 'attempt.assessed', current.session.id, {
             attemptId: ctx.attempt!.id,
-            assessedStepId: ctx.step?.id ?? null,
-            artifactId: ctx.delivered?.id ?? null,
             verdict: assessment.verdict,
-            stepId: nextStep,
-            done,
-          }),
-        ]);
-        return { stepId: nextStep, done };
-      });
-    })
+            source,
+          });
+          await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [
+            'assessment:' + ctx.attempt!.id,
+            JSON.stringify({
+              attemptId: ctx.attempt!.id,
+              assessedStepId: ctx.step?.id ?? null,
+              artifactId: ctx.delivered?.id ?? null,
+              verdict: assessment.verdict,
+              stepId: nextStep,
+              done,
+            }),
+          ]);
+          return { stepId: nextStep, done };
+        });
+      }),
+    )
     .addEdge(START, 'plan')
     .addConditionalEdges('plan', (state) => (state.attemptId && state.waits ? 'assess' : 'prepare'), [
       'assess',

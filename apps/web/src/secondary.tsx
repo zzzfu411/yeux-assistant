@@ -31,6 +31,7 @@ type ModelSettings = {
   review_base_url?: string;
   review_model?: string;
   has_review_api_key?: boolean;
+  fast_model?: string;
 };
 type Notification = {
   id: string;
@@ -428,6 +429,7 @@ function SettingsForm({
     revision: string;
     review_base_url?: string;
     review_model?: string;
+    fast_model?: string;
   }>('model', {
     base_url: settings.base_url,
     model: settings.model,
@@ -435,12 +437,14 @@ function SettingsForm({
     revision: settings.revision,
     review_base_url: settings.review_base_url || '',
     review_model: settings.review_model || '',
+    fast_model: settings.fast_model || '',
   });
   const [apiKey, setApiKey] = useState(''),
     [reviewKey, setReviewKey] = useState('');
   // Drafts saved before the reviewer existed fall back to the stored values.
   const reviewBase = draft.review_base_url ?? settings.review_base_url ?? '',
-    reviewModel = draft.review_model ?? settings.review_model ?? '';
+    reviewModel = draft.review_model ?? settings.review_model ?? '',
+    fastModel = draft.fast_model ?? settings.fast_model ?? '';
   const save = (e: FormEvent) => {
     e.preventDefault();
     const submittedKey = apiKey,
@@ -454,6 +458,7 @@ function SettingsForm({
             api_key: apiKey,
             review_base_url: reviewBase,
             review_model: reviewModel,
+            fast_model: fastModel,
             ...(reviewKey ? { review_api_key: reviewKey } : {}),
           }),
           'PATCH',
@@ -504,6 +509,19 @@ function SettingsForm({
             autoComplete="off"
           />
         </label>
+        <label>
+          快速步骤模型（可选）
+          <input
+            value={fastModel}
+            maxLength={300}
+            onChange={(e) => setDraft({ ...draft, fast_model: e.target.value })}
+            placeholder="留空沿用上面的模型"
+            autoComplete="off"
+          />
+        </label>
+        <p className={s.muted}>
+          用于抽取通知要素和撰写邮件，须与上面的模型在同一服务地址；计划、研究与评阅仍用主模型。
+        </p>
         <label>
           API 密钥
           <input

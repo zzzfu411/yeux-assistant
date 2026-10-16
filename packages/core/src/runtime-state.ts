@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Store, Tx, Row } from '../../storage/src/index.js';
-import { AppError, event, notify } from './common.js';
+import { AppError, digest, event, notify } from './common.js';
 import { lockSession } from './sessions.js';
 
 export class StaleRun extends Error {
@@ -33,20 +34,28 @@ export async function readContext(store: Store, identity: RunIdentity) {
   return store.transaction((tx) => fence(tx, identity));
 }
 
+type Fenced = Awaited<ReturnType<typeof fence>>;
+/** The step a model request belongs to, so every call in the trace has a name. */
+export const currentStep = new AsyncLocalStorage<{ name: string }>();
+export const traced = <T>(name: string, work: () => Promise<T>) => currentStep.run({ name }, work);
+
 /** A receipt and all business effects commit together; replay returns that receipt. */
 export async function commitNode<T>(
   store: Store,
   identity: RunIdentity,
   node: string,
-  work: (tx: Tx, context: Awaited<ReturnType<typeof fence>>) => Promise<T>,
+  work: (tx: Tx, context: Fenced) => Promise<T>,
 ): Promise<T> {
   return store.transaction(async (tx) => {
-    const context = await fence(tx, identity),
-      key = `runtime:${identity.runId}:${node}`;
-    const saved = await tx.one('SELECT value FROM app.settings WHERE key=$1', [key]);
-    if (saved) return saved.value as T;
+    const context = await fence(tx, identity);
+    const saved = await tx.one('SELECT output FROM app.run_steps WHERE run_id=$1 AND name=$2', [identity.runId, node]);
+    if (saved) return saved.output as T;
     const result = await work(tx, context);
-    await tx.exec('INSERT INTO app.settings(key,value) VALUES($1,$2)', [key, JSON.stringify(result)]);
+    await tx.exec('INSERT INTO app.run_steps(run_id,name,output) VALUES($1,$2,$3)', [
+      identity.runId,
+      node,
+      JSON.stringify(result ?? null),
+    ]);
     return result;
   });
 }
@@ -54,10 +63,66 @@ export async function commitNode<T>(
 export async function nodeReceipt<T>(store: Store, identity: RunIdentity, node: string): Promise<T | undefined> {
   return store.transaction(async (tx) => {
     await fence(tx, identity);
-    return (await tx.one('SELECT value FROM app.settings WHERE key=$1', [`runtime:${identity.runId}:${node}`]))
-      ?.value as T | undefined;
+    return (await tx.one('SELECT output FROM app.run_steps WHERE run_id=$1 AND name=$2', [identity.runId, node]))
+      ?.output as T | undefined;
   });
 }
+
+/**
+ * One step of any flow. The work runs outside a transaction (model calls belong there); its result
+ * and `commit` effects then land in one fenced transaction with the receipt. A retry of the same run
+ * replays the receipt. A run the owner restarted (`input.resumeFrom`) reuses the earlier run's
+ * receipt only when the step's input digest is unchanged, so new answers always get fresh work.
+ */
+export async function step<T>(
+  store: Store,
+  identity: RunIdentity,
+  name: string,
+  options: { input?: unknown },
+  compute: () => Promise<T>,
+  commit?: (tx: Tx, value: T, context: Fenced) => Promise<void>,
+): Promise<T> {
+  const inputDigest = options.input === undefined ? '' : digest(options.input);
+  const found = await store.transaction(async (tx) => {
+    const context = await fence(tx, identity);
+    const own = await tx.one('SELECT output FROM app.run_steps WHERE run_id=$1 AND name=$2', [identity.runId, name]);
+    if (own) return { value: own.output as T };
+    const prior = typeof context.run.input?.resumeFrom === 'string' ? context.run.input.resumeFrom : null;
+    if (!prior || !inputDigest) return null;
+    const earlier = await tx.one(
+      `SELECT st.output FROM app.run_steps st JOIN app.runs r ON r.id=st.run_id
+      WHERE st.run_id=$1 AND st.name=$2 AND st.input_digest=$3 AND r.session_id=$4`,
+      [prior, name, inputDigest, context.session.id],
+    );
+    if (!earlier) return null;
+    await tx.exec(
+      'INSERT INTO app.run_steps(run_id,name,input_digest,output,reused_from,started_at) VALUES($1,$2,$3,$4,$5,now())',
+      [identity.runId, name, inputDigest, JSON.stringify(earlier.output), prior],
+    );
+    await commit?.(tx, earlier.output as T, context);
+    return { value: earlier.output as T };
+  });
+  if (found) return found.value;
+  const started = new Date();
+  // A receipt is JSON; the live value takes the same shape so replay and first run behave alike.
+  const value = JSON.parse(JSON.stringify((await traced(name, compute)) ?? null)) as T;
+  return store.transaction(async (tx) => {
+    const context = await fence(tx, identity);
+    const inserted = await tx.one(
+      'INSERT INTO app.run_steps(run_id,name,input_digest,output,started_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(run_id,name) DO NOTHING RETURNING name',
+      [identity.runId, name, inputDigest, JSON.stringify(value), started],
+    );
+    if (!inserted)
+      return (await tx.one('SELECT output FROM app.run_steps WHERE run_id=$1 AND name=$2', [identity.runId, name]))!
+        .output as T;
+    await commit?.(tx, value, context);
+    return value;
+  });
+}
+
+/** A provider-side failure that may succeed when the same step is asked again. */
+export const transient = (error: unknown) =>
+  error instanceof AppError && error.status >= 500 && error.code !== 'model_time_budget';
 
 export async function claimRun(store: Store, runId: string): Promise<Row | null> {
   return store.transaction(async (tx) => {

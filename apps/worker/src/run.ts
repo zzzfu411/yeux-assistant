@@ -1,9 +1,7 @@
-import { executeResearchRun } from '../../../packages/core/src/research/service.js';
-import { executeMailReplyRun } from '../../../packages/core/src/mail/reply.js';
-import { executeErrandRun } from '../../../packages/core/src/errands/service.js';
+import { EXECUTORS, executorKind } from '../../../packages/core/src/executors.js';
 import { Store } from '../../../packages/storage/src/index.js';
 import { dataFolder } from '../../../packages/core/src/config.js';
-import { executeLearningRun, openCheckpoints } from '../../../packages/core/src/learning.js';
+import { openCheckpoints } from '../../../packages/core/src/learning.js';
 import { AppError } from '../../../packages/core/src/common.js';
 import { publicRuntimeError, RuntimeLimit, StaleRun } from '../../../packages/core/src/runtime-state.js';
 
@@ -26,10 +24,7 @@ try {
     [runId],
   );
   // Each session kind has one executor; all share the fenced run identity and its budget.
-  if (session?.research) await executeResearchRun(store, dataFolder(), { runId, generation });
-  else if (session?.flow === 'mail-reply') await executeMailReplyRun(store, dataFolder(), { runId, generation });
-  else if (session?.flow === 'errand') await executeErrandRun(store, dataFolder(), { runId, generation });
-  else await executeLearningRun(store, dataFolder(), { runId, generation }, saver);
+  await EXECUTORS[executorKind(session ?? {})](store, dataFolder(), { runId, generation }, saver);
   result = { ok: true };
 } catch (error) {
   result = {

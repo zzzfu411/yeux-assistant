@@ -1,4 +1,5 @@
 import { researchDetail } from './research/service.js';
+import { sessionTrace } from './trace.js';
 import { archiveErrand, createErrand, errandCalendar, errandDetail, flowSuggestion } from './errands/service.js';
 import { CreateErrandInput, ErrandActionInput } from '../../contracts/src/errands.js';
 import { proposeRule } from './proposals.js';
@@ -466,6 +467,12 @@ export class Application {
         )?.payload || null,
     }));
   }
+  async trace(sessionId: string) {
+    return this.store.snapshot(async (tx) => {
+      await requireRow(tx, 'SELECT id FROM app.sessions WHERE id=$1', [sessionId]);
+      return sessionTrace(tx, sessionId);
+    });
+  }
   async feedback(key: string, sessionId: string, input: unknown) {
     const data = Feedback.parse(input);
     return this.command(key, 'session.feedback:' + sessionId, data, async (tx) => {
@@ -558,8 +565,9 @@ export class Application {
         answer: prior?.input.answer || '',
         attemptId: prior?.input.attemptId || null,
         freshThread: true,
-        // Research continues from the candidates the failed run already saved.
-        ...(session.research && prior ? { resumeFrom: prior.id } : {}),
+        // Every flow may reuse the failed run's finished steps whose inputs are unchanged;
+        // research also continues from the candidates that run saved.
+        ...(prior ? { resumeFrom: prior.id } : {}),
       });
       return { sessionId, runId };
     });

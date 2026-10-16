@@ -180,6 +180,7 @@ export interface ResearchModel {
       timeoutMs?: number;
       reserveMs?: number;
       role?: 'solve' | 'review';
+      profile?: import('../model-profiles.js').ModelProfile;
     },
   ): Promise<T>;
 }
@@ -205,7 +206,14 @@ export async function advanceResearch(
         previous: best?.answer.content || context.previous,
         latest: context.latest + (best?.review ? '\n已有候选的评阅（待核实）：' + JSON.stringify(best.review) : ''),
       },
-      { assessment: true, requireCompletePrevious: true, timeoutMs: 180000, reserveMs: 5000 },
+      {
+        assessment: true,
+        requireCompletePrevious: true,
+        timeoutMs: 180000,
+        reserveMs: 5000,
+        // The branch meant to try another direction samples more widely than ordinary revisions.
+        profile: next.effort === 'high' && next.candidates.length === 1 ? 'explore' : 'solve',
+      },
     );
     const { citations, verified, dropped } = verifyResearchCitations(answer, model.providedCitations);
     const index = next.candidates.length;

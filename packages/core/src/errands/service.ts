@@ -13,7 +13,7 @@ import { AppError, checkVersion, digest, event, id, notify, once } from '../comm
 import { createRun, FLOW_CALL_TIMEOUT_MS, lockSession } from '../sessions.js';
 import { putSource, retrieve } from '../knowledge.js';
 import { ModelGateway, type ModelContext } from '../model.js';
-import { fence, type RunIdentity } from '../runtime-state.js';
+import { fence, step, type RunIdentity } from '../runtime-state.js';
 import { WorkspaceRepo, WORKSPACE_LOCK } from '../workspace/repo.js';
 import { replyContext, replySubject } from '../mail/thread.js';
 import { factLabels, replyTarget, verifyFacts } from './facts.js';
@@ -163,15 +163,25 @@ async function rulesFor(tx: Tx, notice: ErrandNotice) {
   return { rules, ruleRecords };
 }
 
+async function writeState(tx: Tx, sessionId: string, state: ErrandState) {
+  await tx.exec('UPDATE app.errands SET state=$2,revision=revision+1,updated_at=now() WHERE session_id=$1', [
+    sessionId,
+    JSON.stringify(state),
+  ]);
+  await event(tx, 'errand.progress', sessionId, { facts: Boolean(state.facts) });
+}
 async function saveState(store: Store, identity: RunIdentity, state: ErrandState) {
-  await store.transaction(async (tx) => {
-    const { session } = await fence(tx, identity);
-    await tx.exec('UPDATE app.errands SET state=$2,revision=revision+1,updated_at=now() WHERE session_id=$1', [
-      session.id,
-      JSON.stringify(state),
-    ]);
-    await event(tx, 'errand.progress', session.id, { facts: Boolean(state.facts) });
-  });
+  await store.transaction(async (tx) => writeState(tx, (await fence(tx, identity)).session.id, state));
+}
+/** Facts are always re-verified against the notice, so better checks apply to saved extractions too. */
+function withFacts(
+  state: ErrandState,
+  extracted: ErrandState['extracted'],
+  text: string,
+  steps: string[],
+): ErrandState {
+  const facts = verifyFacts(extracted!, text);
+  return { ...state, extracted, facts, calendar: steps.includes('calendar') ? calendarEvents(facts) : [] };
 }
 
 /** The owner's own edits and anything already confirmed are never overwritten. */
@@ -275,16 +285,23 @@ export async function executeErrandRun(store: Store, folder: string, identity: R
   let citations: Citation[] = [];
   if (await model.configured()) {
     if (!state.facts) {
-      const raw = await model.json(
-        ModelNoticeFacts,
-        EXTRACT,
-        { ...base, latest: '通知原文：\n' + bounded(notice.text, 12000), sources: [] },
-        { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
+      const latest = '通知原文：\n' + bounded(notice.text, 12000);
+      const raw = await step(
+        store,
+        identity,
+        'extract',
+        { input: [EXTRACT, latest, base.rules] },
+        () =>
+          model.json(
+            ModelNoticeFacts,
+            EXTRACT,
+            { ...base, latest, sources: [] },
+            { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000, profile: 'extract' },
+          ),
+        // The facts and the receipt commit together, so a replay never extracts twice.
+        (tx, value, { session }) => writeState(tx, session.id, withFacts(state, value, notice.text, steps)),
       );
-      state.extracted = raw;
-      state.facts = verifyFacts(raw, notice.text);
-      state.calendar = steps.includes('calendar') ? calendarEvents(state.facts) : [];
-      await saveState(store, identity, state);
+      state = withFacts(state, raw, notice.text, steps);
     } else if (state.extracted) {
       state.facts = verifyFacts(state.extracted, notice.text);
       state.calendar = steps.includes('calendar') ? calendarEvents(state.facts) : [];
@@ -322,65 +339,75 @@ export async function executeErrandRun(store: Store, folder: string, identity: R
     ]
       .filter(Boolean)
       .join('\n\n');
-    // A retry of this same run already paid for the plan; only the unfinished letter is asked for again.
-    if (!state.plan || state.planRunId !== identity.runId) {
-      const plan = await model.json(
-        ModelErrandPlan,
-        PLAN,
-        { ...base, latest: known, previous: state.plan?.summary || '', sources: retrieved },
-        { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
-      );
-      const provided = new Set(model.providedSourceIds);
-      // An address the owner typed in an answer also counts; sending still needs exact approval.
-      const answered = state.answers
-        .flatMap((a) => a.answer.normalize('NFKC').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [])
-        .at(-1)
-        ?.toLowerCase();
-      const to = replyTarget(facts, notice.text, notice.origin) ?? answered ?? null;
-      const wantsMail = plan.mail.needed && steps.includes('draft_mail');
-      let questions = steps.includes('ask_user') ? plan.questions : [];
-      // The recipient question goes first so the four-question limit never drops it.
-      if (wantsMail && !to) questions = ['通知中没有写明可回复的邮箱，邮件应发给谁？', ...questions].slice(0, 4);
-      state.warnings =
-        steps.includes('ask_user') || !plan.questions.length
-          ? []
-          : ['流程未包含追问步骤，以下信息需要自行核对：' + plan.questions.join('；')];
-      if (notice.flow?.steps.includes('ehall_prepare'))
-        state.warnings.push('ehall 步骤本轮暂未接入，未准备任何 ehall 表单。');
-      const checklist = plan.checklist.map((item) => ({
-        ...item,
-        sourceIds: item.sourceIds.filter((sid) => provided.has(sid)),
-      }));
-      state.plan = {
-        ...plan,
-        checklist,
-        // Keep the previous letter until a new one is written, so nothing blank reaches the draft.
-        mail: { ...plan.mail, needed: wantsMail, to, body: state.plan?.mail.body || '' },
-      };
-      state.planRunId = identity.runId;
-      state.questions = questions;
-      citations = model.providedCitations.filter((c) => checklist.some((item) => item.sourceIds.includes(c.sourceId)));
-      // The checklist is useful on its own: show it while the letter is being written.
-      if (wantsMail && !questions.length) await saveState(store, identity, state);
-    } else
-      citations = retrieved.filter((c) => state.plan!.checklist.some((item) => item.sourceIds.includes(c.sourceId)));
+    // The plan depends on the verified facts, answers, retrieved material and rules. A retry of the
+    // same run replays its receipt; a restarted run reuses it only while those inputs are unchanged.
+    const drafted = await step(
+      store,
+      identity,
+      'plan',
+      { input: [PLAN, known, retrieved.map((c) => [c.sourceId, c.version, c.start, c.end]), base.rules, steps] },
+      async () => {
+        const call = await model.call(
+          ModelErrandPlan,
+          PLAN,
+          { ...base, latest: known, previous: state.plan?.summary || '', sources: retrieved },
+          { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000, profile: 'plan' },
+        );
+        return { plan: call.value, provided: call.providedCitations };
+      },
+    );
+    const plan = drafted.plan;
+    const provided = new Set(drafted.provided.map((c) => c.sourceId));
+    // An address the owner typed in an answer also counts; sending still needs exact approval.
+    const answered = state.answers
+      .flatMap((a) => a.answer.normalize('NFKC').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [])
+      .at(-1)
+      ?.toLowerCase();
+    const to = replyTarget(facts, notice.text, notice.origin) ?? answered ?? null;
+    const wantsMail = plan.mail.needed && steps.includes('draft_mail');
+    let questions = steps.includes('ask_user') ? plan.questions : [];
+    // The recipient question goes first so the four-question limit never drops it.
+    if (wantsMail && !to) questions = ['通知中没有写明可回复的邮箱，邮件应发给谁？', ...questions].slice(0, 4);
+    state.warnings =
+      steps.includes('ask_user') || !plan.questions.length
+        ? []
+        : ['流程未包含追问步骤，以下信息需要自行核对：' + plan.questions.join('；')];
+    if (notice.flow?.steps.includes('ehall_prepare'))
+      state.warnings.push('ehall 步骤本轮暂未接入，未准备任何 ehall 表单。');
+    const checklist = plan.checklist.map((item) => ({
+      ...item,
+      sourceIds: item.sourceIds.filter((sid) => provided.has(sid)),
+    }));
+    state.plan = {
+      ...plan,
+      checklist,
+      // Keep the previous letter until a new one is written, so nothing blank reaches the draft.
+      mail: { ...plan.mail, needed: wantsMail, to, body: state.plan?.mail.body || '' },
+    };
+    state.questions = questions;
+    citations = drafted.provided.filter((c) => checklist.some((item) => item.sourceIds.includes(c.sourceId)));
+    // The checklist is useful on its own: show it while the letter is being written.
+    if (wantsMail && !questions.length) await saveState(store, identity, state);
     const mail = state.plan!.mail;
     // Write the letter only when nothing is left to ask and the owner has not taken it over.
     if (mail.needed && mail.to && !state.questions.length && !(await letterTaken(store, state.mailSessionId))) {
-      const letter = await model.json(
-        ModelErrandMail,
-        DRAFT,
-        {
-          ...base,
-          latest: [
-            known,
-            '邮件主题：' + (mail.subject || notice.title),
-            '材料清单：' + state.plan!.checklist.map((item) => `${item.item}（${item.status}）`).join('；'),
-          ].join('\n\n'),
-          previous: '',
-          sources: retrieved,
-        },
-        { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000 },
+      const latest = [
+        known,
+        '邮件主题：' + (mail.subject || notice.title),
+        '材料清单：' + state.plan!.checklist.map((item) => `${item.item}（${item.status}）`).join('；'),
+      ].join('\n\n');
+      const letter = await step(
+        store,
+        identity,
+        'mail',
+        { input: [DRAFT, latest, retrieved.map((c) => [c.sourceId, c.version, c.start, c.end]), base.rules] },
+        () =>
+          model.json(
+            ModelErrandMail,
+            DRAFT,
+            { ...base, latest, previous: '', sources: retrieved },
+            { timeoutMs: FLOW_CALL_TIMEOUT_MS, reserveMs: 5000, profile: 'draft' },
+          ),
       );
       state.plan!.mail = { ...mail, subject: letter.subject, body: letter.body };
     }

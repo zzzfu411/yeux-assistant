@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { Store } from '../packages/storage/src/index.js';
 import { claimRun, failRun } from '../packages/core/src/runtime-state.js';
-import { boundedContext, ModelGateway, type ModelContext } from '../packages/core/src/model.js';
+import { boundedContext, forgetRefusals, ModelGateway, type ModelContext } from '../packages/core/src/model.js';
+import { traced } from '../packages/core/src/runtime-state.js';
 
 const context: ModelContext = {
   task: '合成题',
@@ -71,6 +72,7 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
   beforeEach(async () => {
     if (!new URL(url!).pathname.endsWith('_runtime_test'))
       throw new Error('Model tests require an isolated *_runtime_test database');
+    forgetRefusals();
     store = new Store(url!);
     await store.exec('DROP SCHEMA IF EXISTS app CASCADE');
     await store.migrate();
@@ -141,7 +143,7 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
     vi.stubGlobal('fetch', request);
     return { started, request, timeout };
   }
-  it('streams by default and asks once more plainly when a provider rejects streaming fields', async () => {
+  it('asks for structured streaming output, then drops each field a provider rejects, and remembers it', async () => {
     const { runId, gateway } = await run();
     const bodies: Array<Record<string, unknown>> = [];
     const answer = JSON.stringify({ result: 'plain' });
@@ -150,6 +152,7 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
       vi.fn(async (_url: unknown, init: RequestInit) => {
         const body = JSON.parse(String(init.body));
         bodies.push(body);
+        if (body.response_format) return new Response('{"error":"response_format unsupported"}', { status: 400 });
         if (body.stream) return new Response('{"error":"stream unsupported"}', { status: 400 });
         return new Response(
           JSON.stringify({ choices: [{ message: { content: answer } }], usage: { total_tokens: 4 } }),
@@ -160,13 +163,64 @@ describe.runIf(Boolean(url))('model request timeouts share persisted PostgreSQL 
       }),
     );
     await expect(gateway.json(schema, '返回结构化结果', context)).resolves.toEqual({ result: 'plain' });
-    expect(bodies.map((body) => body.stream)).toEqual([true, undefined]);
+    expect(bodies.map((body) => [body.stream, Boolean(body.response_format)])).toEqual([
+      [true, true],
+      [true, false],
+      [undefined, false],
+    ]);
     expect(bodies[0]!.stream_options).toEqual({ include_usage: true });
-    // The rejected attempt generated nothing; the run is charged one call.
+    expect((bodies[0]!.response_format as any).json_schema.schema.properties.result).toBeTruthy();
+    // The rejected attempts generated nothing; the run is charged one call.
     expect((await store.one('SELECT model_calls,usage FROM app.runs WHERE id=$1', [runId]))!).toEqual({
       model_calls: 1,
       usage: [{ total_tokens: 4 }],
     });
+    // The same process does not ask again in a form this provider already refused.
+    await gateway.json(schema, '返回结构化结果', context);
+    expect(bodies.slice(3).map((body) => [body.stream, Boolean(body.response_format)])).toEqual([[undefined, false]]);
+  });
+  it('traces every call with its step, profile, timing, reasoning tokens and outcome', async () => {
+    const { runId, gateway } = await run();
+    let call = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init: RequestInit) => {
+        const body = JSON.parse(String(init.body));
+        call++;
+        expect(body.temperature).toBe(0);
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: call === 1 ? JSON.stringify({ result: 'ok' }) : 'not json' } }],
+            usage: {
+              prompt_tokens: 11,
+              completion_tokens: 7,
+              total_tokens: 18,
+              completion_tokens_details: { reasoning_tokens: 5 },
+            },
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+      }),
+    );
+    await traced('extract', () => gateway.json(schema, '抽取', context, { profile: 'extract' }));
+    await expect(
+      traced('extract', () => gateway.json(schema, '抽取', context, { profile: 'extract' })),
+    ).rejects.toMatchObject({ code: 'model_invalid' });
+    const rows = await store.rows('SELECT * FROM app.model_calls WHERE run_id=$1 ORDER BY id', [runId]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      step: 'extract',
+      profile: 'extract',
+      model: 'synthetic-budget-test',
+      structured: 'json_schema',
+      prompt_tokens: 11,
+      completion_tokens: 7,
+      reasoning_tokens: 5,
+      outcome: 'ok',
+    });
+    expect(rows[0]!.latency_ms).toBeGreaterThanOrEqual(0);
+    expect(rows[0]!.first_byte_ms).toBeGreaterThanOrEqual(0);
+    expect(rows[1]).toMatchObject({ outcome: 'invalid', error_code: 'model_invalid' });
   });
   it('accepts a 60-second response within the original 180-second run deadline', async () => {
     const { runId, claimed, gateway } = await run(),

@@ -523,7 +523,9 @@ test('设备总览刷新失败保留记录并禁用确认，恢复后需要本�
   await expect(confirm).toBeDisabled();
   await expect(page.getByRole('heading', { name: '演示台灯', exact: true })).toBeVisible();
   state.overviewFailure = false;
-  await page.getByRole('button', { name: '重新载入', exact: true }).click();
+  // The page's own five-second poll may recover before this click; either way nothing is confirmed for the owner.
+  const reload = page.getByRole('button', { name: '重新载入', exact: true });
+  await reload.click({ timeout: 4000 }).catch(() => expect(reload).toHaveCount(0));
   await expect(confirm).toBeEnabled();
   expect(state.posts).toHaveLength(0);
 });

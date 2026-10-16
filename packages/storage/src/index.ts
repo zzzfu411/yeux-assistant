@@ -21,6 +21,7 @@ const migrations = [
   { version: 13, file: 'packages/storage/migrations/0013.sql' },
   { version: 14, file: 'packages/storage/migrations/0014.sql' },
   { version: 15, file: 'packages/storage/migrations/0015.sql' },
+  { version: 16, file: 'packages/storage/migrations/0016.sql' },
 ] as const;
 
 export type Row = Record<string, any>;

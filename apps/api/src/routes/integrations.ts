@@ -3,6 +3,7 @@ import type { MailActions } from '../../../../packages/core/src/mail.js';
 import { config, modelFor } from '../../../../packages/core/src/config.js';
 import { AppError } from '../../../../packages/core/src/common.js';
 import { modelEndpoint, readModelResponse } from '../../../../packages/core/src/model-http.js';
+import { resolveModel } from '../../../../packages/core/src/model-profiles.js';
 import { ModelSettingsInput, ApprovalDecision, ApprovalResolution } from '../../../../packages/contracts/src/index.js';
 import { type ApiServer, key, params, revisionBody } from './shared.js';
 export function registerIntegrationRoutes(server: ApiServer, app: Application, mail: MailActions, folder: string) {
@@ -12,10 +13,18 @@ export function registerIntegrationRoutes(server: ApiServer, app: Application, m
     const current = (await config(folder)).llm;
     if (!current?.base_url || !current?.model) throw new AppError('请先保存模型地址与名称。');
     await probe(current, '模型');
+    const fast = resolveModel(current, 'extract'),
+      checked = ['主模型'];
+    if (fast.model !== current.model) {
+      await probe(fast, '快速步骤模型');
+      checked.push('快速步骤模型');
+    }
     const reviewer = modelFor(current, 'review');
-    if (!reviewer.independent) return { ok: true, message: '连接成功。' };
-    await probe(reviewer, '评阅模型');
-    return { ok: true, message: '主模型与评阅模型均连接成功。' };
+    if (reviewer.independent) {
+      await probe(reviewer, '评阅模型');
+      checked.push('评阅模型');
+    }
+    return { ok: true, message: checked.length > 1 ? checked.join('、') + '均连接成功。' : '连接成功。' };
   });
   server.post('/sessions/:id/approval', { schema: { params, body: revisionBody } }, (r) =>
     mail.request(key(r), r.params.id, r.body),

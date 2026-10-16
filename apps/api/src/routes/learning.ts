@@ -7,6 +7,7 @@ import {
   DraftInput,
 } from '../../../../packages/contracts/src/index.js';
 import { GoalListQuery, SessionListQuery, AttemptListQuery } from '../../../../packages/contracts/src/pagination.js';
+import { SessionTrace } from '../../../../packages/contracts/src/trace.js';
 import { type ApiServer, key, params, pageQuery, revisionBody } from './shared.js';
 export function registerLearningRoutes(server: ApiServer, app: Application) {
   server.get('/today', async () => app.today());
@@ -28,6 +29,9 @@ export function registerLearningRoutes(server: ApiServer, app: Application) {
   server.get('/sessions', { schema: { querystring: pageQuery } }, (r) => app.history(r.query.page));
   server.get('/sessions/list', { schema: { querystring: SessionListQuery } }, (r) => app.sessionList(r.query));
   server.get('/sessions/:id', { schema: { params } }, (r) => app.session(r.params.id));
+  server.get('/sessions/:id/trace', { schema: { params, response: { 200: SessionTrace } } }, (r) =>
+    app.trace(r.params.id),
+  );
   server.get('/sessions/:id/research/export', { schema: { params } }, async (r, p) => {
     const detail = await app.session(r.params.id);
     p.header('Content-Disposition', `attachment; filename="research-${encodeURIComponent(r.params.id)}.json"`);

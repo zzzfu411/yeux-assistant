@@ -104,7 +104,7 @@ export type ErrandState = {
         mail: { needed: boolean; subject: string; body: string; to: string | null };
       })
     | null;
-  /** The run that produced `plan`; a retry of that same run reuses it instead of asking the model again. */
+  /** Written by round-four records only; plan reuse now comes from the run's step receipts. */
   planRunId?: string;
   questions: string[];
   answers: Array<{ answer: string; at: string; attemptId?: string }>;

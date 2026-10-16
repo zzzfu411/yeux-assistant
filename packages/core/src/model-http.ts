@@ -7,8 +7,10 @@ export function modelEndpoint(base: string) {
 }
 
 // Both the connection probe and actual learning calls have the same response bound.
-export async function readModelResponse(response: Response) {
-  if ((response.headers.get('content-type') || '').includes('text/event-stream')) return readModelStream(response);
+// `onFirstByte` lets the caller time how long the provider took before it started answering.
+export async function readModelResponse(response: Response, onFirstByte?: () => void) {
+  if ((response.headers.get('content-type') || '').includes('text/event-stream'))
+    return readModelStream(response, onFirstByte);
   const reader = response.body?.getReader();
   if (!reader) throw new AppError('模型返回了空响应。', 503, 'model_invalid');
   const pieces: Uint8Array[] = [];
@@ -17,6 +19,7 @@ export async function readModelResponse(response: Response) {
     for (;;) {
       const item = await reader.read();
       if (item.done) break;
+      if (!total) onFirstByte?.();
       total += item.value.byteLength;
       if (total > 256000) {
         await reader.cancel();
@@ -47,7 +50,7 @@ export async function readModelResponse(response: Response) {
  * over 100 s (HTTP 524); streaming sends bytes as soon as the model starts, so long answers survive.
  * Only `delta.content` is kept: reasoning text, if a provider streams it, is not part of the answer.
  */
-async function readModelStream(response: Response) {
+async function readModelStream(response: Response, onFirstByte?: () => void) {
   const reader = response.body?.getReader();
   if (!reader) throw new AppError('模型返回了空响应。', 503, 'model_invalid');
   const decoder = new TextDecoder();
@@ -76,6 +79,7 @@ async function readModelStream(response: Response) {
     while (!finished) {
       const item = await reader.read();
       if (item.done) break;
+      if (!total) onFirstByte?.();
       total += item.value.byteLength;
       // Each streamed token carries an envelope, so the byte bound is wider than the content bound.
       if (total > 4_000_000) throw new AppError('模型响应过大，已停止读取。', 400, 'model_invalid');

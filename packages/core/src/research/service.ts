@@ -1,4 +1,4 @@
-import type { Store, Tx } from '../../../storage/src/index.js';
+import type { Store, Tx, Row } from '../../../storage/src/index.js';
 import {
   ResearchOptions,
   stepRetries,
@@ -10,7 +10,16 @@ import { AppError, digest, event, id, notify } from '../common.js';
 import { config, modelFor } from '../config.js';
 import { citationFromRow, terms } from '../knowledge.js';
 import { ModelGateway, type ModelContext } from '../model.js';
-import { fence, readContext, StaleRun, RuntimeLimit, publicRuntimeError, type RunIdentity } from '../runtime-state.js';
+import {
+  fence,
+  readContext,
+  step,
+  transient,
+  StaleRun,
+  RuntimeLimit,
+  publicRuntimeError,
+  type RunIdentity,
+} from '../runtime-state.js';
 import { advanceResearch, bestCandidate, initialResearch, summarizeUsage } from './engine.js';
 
 type Snapshot = {
@@ -53,9 +62,6 @@ export async function researchSources(tx: Tx, sources: Snapshot['sources'], quer
   }
   return result.slice(0, 12);
 }
-
-const transient = (error: unknown) =>
-  error instanceof AppError && error.status >= 500 && error.code !== 'model_time_budget';
 
 /**
  * "重新准备" after a failure continues from the saved candidates of the previous run instead of paying
@@ -161,36 +167,40 @@ async function initialize(
 async function saveState(store: Store, identity: RunIdentity, state: ResearchState) {
   await store.transaction(async (tx) => {
     const { run, session } = await fence(tx, identity);
-    await tx.exec('UPDATE app.research_workspaces SET state=$2,updated_at=now() WHERE run_id=$1', [
-      run.id,
-      JSON.stringify(state),
+    await writeState(tx, run, session, state);
+  });
+}
+async function writeState(tx: Tx, run: Row, session: Row, state: ResearchState) {
+  await tx.exec('UPDATE app.research_workspaces SET state=$2,updated_at=now() WHERE run_id=$1', [
+    run.id,
+    JSON.stringify(state),
+  ]);
+  const best = bestCandidate(state);
+  if (best) {
+    await tx.exec('UPDATE app.sessions SET content=$2,citations=$3,revision=revision+1,updated_at=now() WHERE id=$1', [
+      session.id,
+      best.answer.content,
+      JSON.stringify(best.citations),
     ]);
-    const best = bestCandidate(state);
-    if (best) {
-      await tx.exec(
-        'UPDATE app.sessions SET content=$2,citations=$3,revision=revision+1,updated_at=now() WHERE id=$1',
-        [session.id, best.answer.content, JSON.stringify(best.citations)],
-      );
-      await tx.exec(
-        'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
-        [
-          id(),
-          session.id,
-          run.id,
-          'research_candidate',
-          best.answer.content,
-          'model_generated',
-          JSON.stringify(best.citations),
-          `research:${run.id}:${best.index}`,
-        ],
-      );
-    }
-    await event(tx, 'research.progress', session.id, {
-      runId: run.id,
-      phase: state.phase,
-      candidates: state.candidates.length,
-      best: state.best,
-    });
+    await tx.exec(
+      'INSERT INTO app.artifacts(id,session_id,run_id,kind,content,provenance,citations,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(dedupe_key) DO NOTHING',
+      [
+        id(),
+        session.id,
+        run.id,
+        'research_candidate',
+        best.answer.content,
+        'model_generated',
+        JSON.stringify(best.citations),
+        `research:${run.id}:${best.index}`,
+      ],
+    );
+  }
+  await event(tx, 'research.progress', session.id, {
+    runId: run.id,
+    phase: state.phase,
+    candidates: state.candidates.length,
+    best: state.best,
   });
 }
 
@@ -227,9 +237,16 @@ export async function executeResearchRun(store: Store, folder: string, identity:
       );
     });
     try {
-      const next = await advanceResearch(state, model, { ...snapshot.context, sources: citations });
-      await saveState(store, identity, next);
-      state = next;
+      // Each solve or review is one step; its workspace state commits with the step receipt.
+      const current = state;
+      state = await step(
+        store,
+        identity,
+        `${current.phase}:${current.candidates.length}`,
+        {},
+        () => advanceResearch(current, model, { ...snapshot.context, sources: citations }),
+        (tx, next, { run, session }) => writeState(tx, run, session, next),
+      );
     } catch (error) {
       if (error instanceof StaleRun || error instanceof RuntimeLimit) throw error;
       const left = await readContext(store, identity);

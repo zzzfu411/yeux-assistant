@@ -81,7 +81,7 @@ describe.skipIf(!url)('versioned original-source metadata with PostgreSQL', () =
     expect(after).toEqual({ ...before, metadata: null, title: '原始讲义' });
     expect(await store.one("SELECT * FROM app.goals WHERE id='legacy-goal'")).toEqual(goalBefore);
     expect((await store.rows('SELECT version FROM app.migrations ORDER BY version')).map((row) => row.version)).toEqual(
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     );
     expect((await app.source('legacy-source')).metadata).toBeNull();
   });

@@ -40,7 +40,8 @@
     "format": "prettier --write \"apps/**/*.{ts,tsx}\" \"packages/**/*.ts\" \"scripts/**/*.{ts,mjs}\" \"tests/**/*.ts\"",
     "workspace:import-rules": "tsx scripts/workspace-import-rules.ts",
     "ehall:simulate": "tsx scripts/ehall-simulator.ts",
-    "research:eval": "node --import tsx scripts/evaluate-research.ts"
+    "research:eval": "node --import tsx scripts/evaluate-research.ts",
+    "retrieval:eval": "vitest run tests/retrieval-quality.test.ts --reporter=verbose"
   },
   "dependencies": {
     "@fastify/static": "^8.3.0",

@@ -5,7 +5,7 @@ import { ModelLesson, ModelPlan, Citation } from '../../contracts/src/index.js';
 import { ModelAssessment } from '../../contracts/src/assessment.js';
 import { ASSESSMENT_INSTRUCTION, guardAssessment } from './assessment.js';
 import { AppError, digest, event, id, notify } from './common.js';
-import { citationFromRow, retrieve } from './knowledge.js';
+import { CHUNK_COLUMNS, citationFromRow, retrieve } from './knowledge.js';
 import { ModelGateway, type ModelContext } from './model.js';
 import { commitNode, fence, nodeReceipt, readContext, traced, type RunIdentity } from './runtime-state.js';
 
@@ -84,7 +84,7 @@ async function contextFor(store: Store, identity: RunIdentity, stepId: string | 
     if (!assessment && !citations.length && context.goal?.source_ids?.length) {
       citations = (
         await tx.rows(
-          `SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
+          `SELECT ${CHUNK_COLUMNS},v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
         JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
         WHERE s.id=ANY($1::text[]) AND s.archived_at IS NULL AND s.missing_at IS NULL AND (s.path IS NULL OR s.path NOT LIKE 'workspace/profile/%') ORDER BY c.source_id,c.start_offset LIMIT 6`,
           [context.goal.source_ids],

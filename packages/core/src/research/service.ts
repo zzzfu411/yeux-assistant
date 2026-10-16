@@ -8,7 +8,8 @@ import {
 import type { Citation } from '../../../contracts/src/index.js';
 import { AppError, digest, event, id, notify } from '../common.js';
 import { config, modelFor } from '../config.js';
-import { citationFromRow, terms } from '../knowledge.js';
+import { CHUNK_COLUMNS, citationFromRow } from '../knowledge.js';
+import { rankBM25, searchTerms, selectTerms, candidateTerms, type TermStats } from '../search.js';
 import { ModelGateway, type ModelContext } from '../model.js';
 import {
   fence,
@@ -31,24 +32,62 @@ type Snapshot = {
   modelFingerprint: string;
 };
 
-/** Search frozen source versions, including older versions after the user edits a document. */
+const PINNED = `FROM app.chunks c
+  JOIN jsonb_to_recordset($1::jsonb) AS pinned(id text,version integer) ON pinned.id=c.source_id AND pinned.version=c.version`;
+/**
+ * Search frozen source versions, including older versions after the user edits a document. BM25
+ * statistics come from the pinned versions only. Passages alternate between sources so one long
+ * document cannot fill the context, and each source's opening passages fill any space left.
+ */
 export async function researchSources(tx: Tx, sources: Snapshot['sources'], query: string, required: Citation[] = []) {
   if (!sources.length) return [];
-  const patterns = terms(query).map((word) => '%' + word.replace(/[\\%_]/g, '\\$&') + '%');
-  const rows = await tx.rows(
-    `WITH ranked AS (
-      SELECT c.*,v.title,v.digest,v.metadata,
-        row_number() OVER(PARTITION BY c.source_id ORDER BY
-          (c.content ILIKE ANY($2::text[])) DESC,word_similarity($3,c.content) DESC,c.start_offset) AS position,
-        (c.content ILIKE ANY($2::text[])) AS matched
-      FROM app.chunks c
-      JOIN jsonb_to_recordset($1::jsonb) AS pinned(id text,version integer) ON pinned.id=c.source_id AND pinned.version=c.version
-      JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version)
-      SELECT * FROM ranked ORDER BY matched DESC,position,source_id,start_offset LIMIT 12`,
-    [JSON.stringify(sources), patterns, query.slice(-500)],
+  const pinned = JSON.stringify(sources),
+    wanted = searchTerms(query, true).slice(0, 256);
+  const totals = (await tx.one(
+    `SELECT count(*)::int AS n,coalesce(avg(char_length(c.content)),1)::float AS average ${PINNED}`,
+    [pinned],
+  ))!;
+  const frequency = await tx.rows(
+    `SELECT t.term,(SELECT count(*)::int ${PINNED} WHERE c.lexemes @> ARRAY[t.term]) AS df FROM unnest($2::text[]) AS t(term)`,
+    [pinned, wanted],
+  );
+  const stats: TermStats = {
+    documents: totals.n,
+    averageLength: totals.average,
+    frequency: new Map(frequency.map((row) => [row.term as string, row.df as number])),
+  };
+  const selected = selectTerms(stats, wanted);
+  const matched = selected.length
+    ? rankBM25(
+        await tx.rows(
+          `SELECT ${CHUNK_COLUMNS},v.title,v.digest,v.metadata ${PINNED}
+          JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
+          WHERE c.lexemes && $2::text[] LIMIT 2000`,
+          [pinned, candidateTerms(stats, selected)],
+        ),
+        stats,
+        selected,
+      ).map(({ row }) => row)
+    : [];
+  // Round robin: every source's best passage first, then every source's second, and so on.
+  const rank = new Map<string, number>();
+  const interleaved = matched
+    .map((row, order) => {
+      const position = (rank.get(row.source_id) ?? 0) + 1;
+      rank.set(row.source_id, position);
+      return { row, position, order };
+    })
+    .sort((a, b) => a.position - b.position || a.order - b.order)
+    .map((item) => item.row);
+  const opening = await tx.rows(
+    `SELECT * FROM (SELECT ${CHUNK_COLUMNS},v.title,v.digest,v.metadata,
+      row_number() OVER(PARTITION BY c.source_id ORDER BY c.start_offset) AS position ${PINNED}
+      JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version) AS ranked
+    WHERE position<=12 ORDER BY position,source_id LIMIT 24`,
+    [pinned],
   );
   const result: Citation[] = [];
-  for (const citation of [...required, ...rows.map(citationFromRow)]) {
+  for (const citation of [...required, ...[...interleaved, ...opening].map(citationFromRow)]) {
     if (
       !result.some(
         (c) =>

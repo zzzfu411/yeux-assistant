@@ -5,6 +5,7 @@ import { AppError, canonical, digest, id, event, notify, iso } from './common.js
 import type { Store, Tx, Row } from '../../storage/src/index.js';
 import { SourceMetadata, type Citation } from '../../contracts/src/index.js';
 import type { SourceImportResult } from '../../contracts/src/source-inputs.js';
+import { candidateTerms, rankBM25, searchTerms, selectTerms, type TermStats } from './search.js';
 
 export function chunks(content: string, size = 1800, overlap = 200) {
   if (size < 2 || overlap < 0 || overlap >= size - 1) throw new Error('Invalid chunk size/overlap');
@@ -24,15 +25,6 @@ export function chunks(content: string, size = 1800, overlap = 200) {
     start = Math.max(start + 1, next);
   }
   return result;
-}
-export function terms(query: string) {
-  const result: string[] = [];
-  for (const token of query.toLowerCase().match(/[a-z0-9_]{2,}|[\p{Script=Han}]+/gu) || []) {
-    if (/\p{Script=Han}/u.test(token) && token.length > 2) {
-      for (let i = 0; i < token.length - 1; i++) result.push(token.slice(i, i + 2));
-    } else result.push(token);
-  }
-  return [...new Set(result)].slice(-48);
 }
 export function validateSourceText(content: string) {
   if (Buffer.byteLength(content) > 2_000_000) throw new AppError('资料超过 2 MB，请拆成较小的文本。');
@@ -89,11 +81,20 @@ export async function putSource(
     'INSERT INTO app.source_versions(source_id,version,title,content,digest,metadata) VALUES($1,$2,$3,$4,$5,$6)',
     [input.id, version, input.title, input.content, hash, metadata === null ? null : JSON.stringify(metadata)],
   );
-  for (const piece of chunks(input.content))
-    await tx.exec(
-      'INSERT INTO app.chunks(id,source_id,version,start_offset,end_offset,content) VALUES($1,$2,$3,$4,$5,$6)',
-      [id(), input.id, version, piece.start, piece.end, piece.content],
-    );
+  const pieces = chunks(input.content);
+  // One statement for all chunks; each still gets its own ID and indexed terms.
+  await tx.exec(
+    `INSERT INTO app.chunks(id,source_id,version,start_offset,end_offset,content)
+    SELECT unnest($1::text[]),$2,$3,unnest($4::int[]),unnest($5::int[]),unnest($6::text[])`,
+    [
+      pieces.map(() => id()),
+      input.id,
+      version,
+      pieces.map((piece) => piece.start),
+      pieces.map((piece) => piece.end),
+      pieces.map((piece) => piece.content),
+    ],
+  );
   await event(tx, 'source.updated', input.id, { version });
   return { id: input.id, version };
 }
@@ -124,28 +125,51 @@ export function citationFromRow(row: Row): Citation {
   }
   return citation;
 }
+/** The chunk columns a citation needs; the indexed term array stays in the database. */
+export const CHUNK_COLUMNS = 'c.id,c.source_id,c.version,c.start_offset,c.end_offset,c.content';
+const CURRENT = `FROM app.chunks c JOIN app.sources s ON s.id=c.source_id AND s.version=c.version
+  WHERE s.archived_at IS NULL AND s.missing_at IS NULL`;
+/** Chunk count, average length and per-term chunk frequency over all current material (through the index). */
+async function currentStats(tx: Pick<Tx, 'one' | 'rows'>, terms: string[]): Promise<TermStats> {
+  const totals = (await tx.one(
+    `SELECT count(*)::int AS n,coalesce(avg(char_length(c.content)),1)::float AS average ${CURRENT}`,
+  ))!;
+  const frequency = await tx.rows(
+    `SELECT t.term,(SELECT count(*)::int ${CURRENT} AND c.lexemes @> ARRAY[t.term]) AS df FROM unnest($1::text[]) AS t(term)`,
+    [terms],
+  );
+  return {
+    documents: totals.n,
+    averageLength: totals.average,
+    frequency: new Map(frequency.map((row) => [row.term as string, row.df as number])),
+  };
+}
+/**
+ * Ranked passages from current material. Rare terms pick candidates through the GIN index on
+ * app.chunks.lexemes; BM25 over all informative query terms orders them.
+ */
 export async function retrieve(
-  tx: Tx,
+  tx: Pick<Tx, 'one' | 'rows'>,
   query: string,
   sourceIds: string[] = [],
   limit = 6,
   course?: string,
   scope?: 'mail' | 'errand',
 ): Promise<Citation[]> {
-  const words = terms(query);
-  if (!words.length) return [];
-  const patterns = words.map((t) => '%' + t.replace(/[\\%_]/g, '\\$&') + '%');
+  const wanted = searchTerms(query, true).slice(0, 256);
+  if (!wanted.length) return [];
+  const stats = await currentStats(tx, wanted),
+    selected = selectTerms(stats, wanted);
+  if (!selected.length) return [];
   const rows = await tx.rows(
-    `SELECT c.*,v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
+    `SELECT ${CHUNK_COLUMNS},v.title,v.digest,v.metadata FROM app.chunks c JOIN app.sources s ON c.source_id=s.id AND c.version=s.version
     JOIN app.source_versions v ON v.source_id=c.source_id AND v.version=c.version
-    WHERE s.archived_at IS NULL AND s.missing_at IS NULL AND ($5::boolean OR s.path IS NULL OR s.path NOT LIKE 'workspace/profile/%') AND (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.content ILIKE ANY($2::text[])
-    AND ($4::text IS NULL OR ($4='unclassified' AND coalesce(v.metadata->>'course','')='') OR ($4<>'unclassified' AND v.metadata->>'course'=$4))
-    ORDER BY word_similarity($3,c.content) DESC,c.id LIMIT 80`,
-    [sourceIds, patterns, query.slice(-300), course || null, Boolean(scope)],
+    WHERE s.archived_at IS NULL AND s.missing_at IS NULL AND ($4::boolean OR s.path IS NULL OR s.path NOT LIKE 'workspace/profile/%') AND (cardinality($1::text[])=0 OR s.id=ANY($1::text[])) AND c.lexemes && $2::text[]
+    AND ($3::text IS NULL OR ($3='unclassified' AND coalesce(v.metadata->>'course','')='') OR ($3<>'unclassified' AND v.metadata->>'course'=$3))
+    LIMIT 2000`,
+    [sourceIds, candidateTerms(stats, selected), course || null, Boolean(scope)],
   );
-  return rows
-    .map((row) => ({ row, score: words.reduce((n, t) => n + Number(row.content.toLowerCase().includes(t)), 0) }))
-    .sort((a, b) => b.score - a.score)
+  return rankBM25(rows, stats, selected)
     .slice(0, limit)
     .map(({ row }) => citationFromRow(row));
 }
@@ -232,6 +256,14 @@ export class Knowledge {
         else throw error;
       }
       const present = new Set<string>();
+      // One read per root instead of one per file; the indexing transaction below re-checks under lock.
+      const known = new Map(
+        (
+          await this.store.rows('SELECT path,managed,archived_at,missing_at FROM app.sources WHERE path LIKE $1', [
+            root.prefix.replace(/[\\%_]/g, '\\$&') + '%',
+          ])
+        ).map((row) => [row.path as string, row]),
+      );
       const visit = async (directory: string): Promise<void> => {
         for (const entry of await readdir(directory, { withFileTypes: true })) {
           const file = join(directory, entry.name);
@@ -246,10 +278,7 @@ export class Knowledge {
             info = await lstat(file),
             stamp = info.mtimeMs + ':' + info.size;
           present.add(name);
-          const observed = await this.store.one(
-            'SELECT managed,archived_at,missing_at FROM app.sources WHERE path=$1',
-            [name],
-          );
+          const observed = known.get(name);
           if (observed?.managed || observed?.archived_at) continue;
           if (this.seen.get(name) === stamp && !observed?.missing_at) continue;
           try {

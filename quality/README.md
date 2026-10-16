@@ -50,3 +50,16 @@ pnpm quality --live --config /绝对路径/config.json --case gse-correct --case
 ## 案例修订与结果保留
 
 2026-10-03 的首轮完整真实评测为 12/15 自动一致、1 项超时；独立 Agent 复核发现一次自然语言表达被过度要求格式，以及 `se-partial` 原句“把需求列出来就行。”与 unclear 标签有歧义。现将该回答澄清为“我先把需求列出来。”，仍要求补充测试、结果及用途。通用评阅允许同义表述和操作已建立的场景条件，避免要求重复固定小标题。原始报告、原案例与提示词单独留存，不重算旧分数；两项修订诊断均返回预设判定，并核对了反馈与原文引用；这不代表新案例集或新提示词已完成全量验收。
+
+## 检索基准
+
+`retrieval-cases.json` 是 30 份自行编写的合成资料（数据库、软件工程、本课程、个人资料与办事记录、通知）和 22 条查询，每条查询标注一份最相关的资料。测试另按固定种子生成 400 份由常见课程词汇拼成的干扰笔记，模拟大量共享常用词的课程资料；它们永远不是正确答案。
+
+```sh
+RUNTIME_TEST_DATABASE_URL=postgres://…/assistant_runtime_test pnpm retrieval:eval
+RETRIEVAL_NOISE=3000 RUNTIME_TEST_DATABASE_URL=… pnpm retrieval:eval   # 一次性的延迟测量
+```
+
+测试在同一语料上运行旧实现（两字词 `ILIKE`、只取最后 48 个词、按命中词数排序，保留在测试文件里作对照）与当前实现（索引列 `app.chunks.lexemes` + BM25），输出 recall@5、MRR 与平均耗时，并要求当前实现不低于旧实现、recall@5 不低于 0.9。它还逐份核对 TypeScript 与 SQL 两边的切词结果一致。数据库必须是以 `_runtime_test` 结尾的专用测试库。
+
+这只衡量“相关资料是否排在前面”，不衡量模型据此写出的答案是否正确。旧实现在并列分数时按随机 ID 排序，MRR 会在几次运行间小幅波动。

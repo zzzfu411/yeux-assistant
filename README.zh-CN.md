@@ -1,4 +1,4 @@
-# yeux-assitant
+# yeux-assistant
 
 基于 React、Fastify、LangGraph.js 与 PostgreSQL 构建的自托管个人学习与事务数字助手：围绕学习目标管理版本化资料、组织练习评阅与复习排程，并支持多分支深入研究、通知办事拆解与人工确认的邮件拟稿，可通过电脑或手机浏览器使用。
 
@@ -17,8 +17,8 @@
 环境要求：**Node.js 24 LTS**、**pnpm 9** 与 **Docker Compose**（macOS 可使用 Colima 或 Docker Desktop）。
 
 ```bash
-git clone https://github.com/zzzfu411/yeux-assitant.git
-cd yeux-assitant
+git clone https://github.com/zzzfu411/yeux-assistant.git
+cd yeux-assistant
 pnpm install --frozen-lockfile
 pnpm start
 docker compose --env-file private/runtime.env exec api node dist/scripts/setup-admin.js

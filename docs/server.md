@@ -18,7 +18,7 @@ flowchart TD
 
 使用已有 Linux VPS，准备 Node.js 24+、Docker Engine 和 Compose 插件。仓库依赖与构建在 Node 24 容器内完成，宿主机不必安装 pnpm。先在 VPS 项目目录执行 `node scripts/server-probe.mjs`，核对系统、磁盘与 Docker。不要直接在容器里安装 Hermes、挂载 Docker socket 或开放数据库端口。
 
-本机执行 `pnpm server:pack`，生成 `private/server-release/yeux-assitant-server-<版本>.tar.gz`。包内只有代码、公开文档和 SHA-256 清单，没有账号、模型密钥、学习资料、数据库或备份。核对包的 SHA-256 后上传到自己 VPS 的项目目录，解压并核对 `release-manifest.json`；不要覆盖现有数据目录。
+本机执行 `pnpm server:pack`，生成 `private/server-release/yeux-assistant-server-<版本>.tar.gz`。包内只有代码、公开文档和 SHA-256 清单，没有账号、模型密钥、学习资料、数据库或备份。核对包的 SHA-256 后上传到自己 VPS 的项目目录，解压并核对 `release-manifest.json`；不要覆盖现有数据目录。
 
 ## 建立独立实例
 

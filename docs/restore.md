@@ -50,7 +50,7 @@ for (const entry of manifest.files) {
   }
 }
 await writeFile(join(target, 'runtime.env'), `POSTGRES_PASSWORD=${randomBytes(32).toString('hex')}\n`, { mode: 0o600, flag: 'wx' });
-const recoveryImage = `yeux-assitant-recovery:${process.env.TASK_RESTORE_ID}`;
+const recoveryImage = `yeux-assistant-recovery:${process.env.TASK_RESTORE_ID}`;
 await writeFile(join(target, 'recovery.compose.yaml'), JSON.stringify({ services: {
   api: { image: recoveryImage }, worker: { image: recoveryImage },
 } }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });

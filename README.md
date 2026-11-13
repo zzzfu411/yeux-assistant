@@ -1,4 +1,4 @@
-# yeux-assitant
+# yeux-assistant
 
 A self-hosted personal learning and workflow assistant built with React, Fastify, LangGraph.js, and PostgreSQL—organizing versioned study materials, checkpointed practice and review, iterative deep research, notice errands, and human-confirmed email drafting across desktop and mobile browsers.
 
@@ -17,8 +17,8 @@ English · [简体中文](README.zh-CN.md)
 Requires **Node.js 24 LTS**, **pnpm 9**, and **Docker Compose** (e.g., Colima or Docker Desktop on macOS).
 
 ```bash
-git clone https://github.com/zzzfu411/yeux-assitant.git
-cd yeux-assitant
+git clone https://github.com/zzzfu411/yeux-assistant.git
+cd yeux-assistant
 pnpm install --frozen-lockfile
 pnpm start
 docker compose --env-file private/runtime.env exec api node dist/scripts/setup-admin.js

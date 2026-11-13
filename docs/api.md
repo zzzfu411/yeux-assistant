@@ -1,6 +1,6 @@
 # HTTP API & Runtime Architecture
 
-Reference for the `/api/v2` HTTP/SSE interface, background execution topology, and runtime boundaries of `yeux-assitant`.
+Reference for the `/api/v2` HTTP/SSE interface, background execution topology, and runtime boundaries of `yeux-assistant`.
 
 ## Authentication & Request Conventions
 

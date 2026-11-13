@@ -107,7 +107,7 @@ flowchart LR
 
 ### P0.2 课程仓快照（cloud-3be）
 
-- `gse/lab/lab1/README.md`、`SPEC.md`、`AGENTS.md` 中指向 `/Users/zfu/Documents/develop/yeux-assitant/...` 的绝对路径，改为 `https://github.com/zzzfu411/yeux-assitant/blob/main/...`，这样在 Windows 和 GitHub 上都能打开。
+- `gse/lab/lab1/README.md`、`SPEC.md`、`AGENTS.md` 中指向 `/Users/zfu/Documents/develop/yeux-assistant/...` 的绝对路径，改为 `https://github.com/zzzfu411/yeux-assistant/blob/main/...`，这样在 Windows 和 GitHub 上都能打开。
 - `gse/lab/lab1/` 的实现目前全部未跟踪。本人要求同步课程仓时，按课程仓根目录 `AGENTS.md` 的流程，只暂存 `gse/lab/lab1` 下未被忽略的文件，以 `study: archive GSE lab1 early implementation` 提交。`private/`、`dist/`、`node_modules/` 已被 `gse/.gitignore` 忽略。
 - 不改 `学习清单.md`，Lab1 进度由本人勾选。
 

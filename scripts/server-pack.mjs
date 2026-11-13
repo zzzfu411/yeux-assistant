@@ -15,6 +15,7 @@ const roots = [
   'tests',
   'quality',
   'README.md',
+  'README.zh-CN.md',
   'SPEC.md',
   'AGENTS.md',
   'Dockerfile',
